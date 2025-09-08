@@ -9,11 +9,12 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "1.9"
+__version__ = "2.0"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v2.0: Reworked argument parsing to correctly handle --version flag before other required arguments.
 v1.9: Display full version history with --version flag.
 v1.8: Added -q/--quiet flag to suppress FFmpeg warnings and progress.
 v1.7: Made transcoding more robust by explicitly mapping desired streams.
@@ -33,6 +34,12 @@ def main():
     """
     Parses arguments and either displays media info or runs FFmpeg for transcoding.
     """
+    # --- Manually check for --version flag BEFORE argparse, to override required args ---
+    if '-v' in sys.argv or '--version' in sys.argv:
+        print(VERSION_HISTORY)
+        sys.exit(0)
+
+    # --- Set up the Argument Parser ---
     parser = argparse.ArgumentParser(
         description="Transcodes a video to HEVC (QSV) or displays media info.",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -49,21 +56,20 @@ Examples:
     parser.add_argument("-o", "--output", help="Output MKV file. If omitted, script will display info about the input file.")
     parser.add_argument("-s", "--subs", help="(Optional) Subtitle file to embed. Only used for transcoding.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg warnings and progress updates (quieter output).")
+    # We keep this definition so that --help and autocomplete are aware of it.
     parser.add_argument("-v", "--version", action="store_true", help="Show the version history and exit.")
     
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
     
-    # Handle --version flag manually to show full history
-    if args.version:
-        print(VERSION_HISTORY)
-        sys.exit(0)
+    # The old manual check `if args.version:` is no longer needed here.
 
     # Print version header for every run (except --version/--help)
     print(f"--- hvec Transcoder v{__version__} ---")
     
     # --- MODE 1: Info-only (if no output file is specified) ---
     if not args.output:
+        # ...(Info-mode is unchanged)...
         if not os.path.exists(args.input):
             print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
             sys.exit(1)
@@ -80,6 +86,7 @@ Examples:
         sys.exit(0)
 
     # --- MODE 2: Transcoding (if output file is specified) ---
+    # ...(Transcoding-mode is unchanged)...
     if not os.path.exists(args.input):
         print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
         sys.exit(1)
@@ -106,7 +113,7 @@ Examples:
     run_ffmpeg_command(ffmpeg_cmd)
 
 def estimate_transcode_time(input_file):
-    # ...(function is unchanged from v1.8)...
+    # ...(function is unchanged)...
     print("\n--- Transcode Estimate (for this hardware) ---")
     ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_file]
     try:
@@ -138,7 +145,7 @@ def estimate_transcode_time(input_file):
         print(f"Could not analyze video to provide an estimate: {e}")
 
 def run_ffmpeg_command(cmd):
-    # ...(function is unchanged from v1.8)...
+    # ...(function is unchanged)...
     print("\nExecuting FFmpeg command:")
     print(' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd))
     print("\n------------------------- FFmpeg Output -------------------------")
