@@ -9,16 +9,17 @@ import math
 import argcomplete
 
 # --- Version History ---
-# 1.6: Moved version print to run before argument parsing.
-# 1.7: Made transcoding command more robust by explicitly mapping only desired video/audio streams.
-#      This prevents errors from incompatible embedded subtitle or data tracks.
-__version__ = "1.7"
+# 1.7: Made transcoding command more robust by explicitly mapping streams.
+# 1.8: Added a -q/--quiet flag to suppress warnings and progress output from FFmpeg.
+__version__ = "1.8"
 
 # --- PERFORMANCE CONSTANT ---
 ESTIMATED_FPS = 85
 
 def main():
-    # ... (parser setup is the same as v1.6) ...
+    """
+    Parses arguments and either displays media info or runs FFmpeg for transcoding.
+    """
     parser = argparse.ArgumentParser(
         description="Transcodes a video to HEVC (QSV) or displays media info.",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -27,21 +28,25 @@ Examples:
   # Get info and estimated transcode time for a video
   ,hvec.py -i movie.mp4
 
-  # Transcode a video
+  # Transcode a video verbosely (default)
   ,hvec.py -i movie.mp4 -o movie.mkv
+
+  # Transcode a video quietly (hides progress and warnings)
+  ,hvec.py -i movie.mp4 -o movie.mkv --quiet
 """
     )
     parser.add_argument("-i", "--input", required=True, help="Input video file")
     parser.add_argument("-o", "--output", help="Output MKV file. If omitted, script will display info about the input file.")
     parser.add_argument("-s", "--subs", help="(Optional) Subtitle file to embed. Only used for transcoding.")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg warnings and progress updates (quieter output).")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     
     argcomplete.autocomplete(parser)
-    print(f"--- hvec Transcoder v{__version__} ---") # Moved here for consistency
+    print(f"--- hvec Transcoder v{__version__} ---")
     args = parser.parse_args()
     
-    # ... (info-mode is the same as v1.6) ...
     if not args.output:
+        # ...(Info-mode is unchanged)...
         if not os.path.exists(args.input):
             print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
             sys.exit(1)
@@ -65,24 +70,21 @@ Examples:
         print(f"Error: Subtitle file not found at '{args.subs}'", file=sys.stderr)
         sys.exit(1)
 
-    # --- MODIFIED PART ---
-    ffmpeg_cmd = ['ffmpeg', '-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input]
+    # --- Build the FFmpeg command ---
+    ffmpeg_cmd = ['ffmpeg']
     
-    encoding_params = [
-        '-c:v', 'hevc_qsv',
-        '-preset', 'medium',
-        '-global_quality', '24',
-        '-c:a', 'copy'
-    ]
+    # Add the -loglevel error flag if --quiet is used
+    if args.quiet:
+        ffmpeg_cmd.extend(['-loglevel', 'error'])
+        
+    ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input])
+    
+    encoding_params = ['-c:v', 'hevc_qsv', '-preset', 'medium', '-global_quality', '24', '-c:a', 'copy']
     
     if args.subs:
-        print("Subtitle file provided. Building command to embed subtitles...")
-        ffmpeg_cmd.extend(['-i', args.subs])
-        # Map main video, all audio from input 0, and all subs from input 1
-        ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a', '-map', '1:s'])
+        ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a', '-map', '1:s'])
         ffmpeg_cmd.extend(['-c:s', 'copy', '-metadata:s:s:0', 'language=eng'])
     else:
-        # Map only main video and all audio from input 0. Ignore other tracks.
         ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
 
     ffmpeg_cmd.extend(encoding_params)
@@ -90,8 +92,8 @@ Examples:
     
     run_ffmpeg_command(ffmpeg_cmd)
 
+# ...(The rest of the functions: estimate_transcode_time and run_ffmpeg_command are unchanged)...
 def estimate_transcode_time(input_file):
-    # ... (function is the same as v1.6) ...
     print("\n--- Transcode Estimate (for this hardware) ---")
     ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_file]
     try:
@@ -123,7 +125,6 @@ def estimate_transcode_time(input_file):
         print(f"Could not analyze video to provide an estimate: {e}")
 
 def run_ffmpeg_command(cmd):
-    # ... (function is the same as v1.6) ...
     print("\nExecuting FFmpeg command:")
     print(' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd))
     print("\n------------------------- FFmpeg Output -------------------------")
