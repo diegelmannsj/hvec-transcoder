@@ -9,12 +9,13 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "2.1"
+__version__ = "2.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v2.1: Added --less-noise flag for periodic progress updates instead of constant.
+v2.2: Added -r/--remux mode for lossless stream copying.
+v2.1: Added --less-noise flag for periodic progress updates.
 v2.0: Reworked argument parsing to correctly handle --version flag.
 v1.9: Display full version history with --version flag.
 v1.8: Added -q/--quiet flag to suppress FFmpeg warnings and progress.
@@ -33,7 +34,7 @@ ESTIMATED_FPS = 85
 
 def main():
     """
-    Parses arguments and either displays media info or runs FFmpeg for transcoding.
+    Parses arguments and performs media operations: info, transcode, or remux.
     """
     # --- Manually check for --version flag BEFORE argparse ---
     if '-v' in sys.argv or '--version' in sys.argv:
@@ -42,23 +43,24 @@ def main():
 
     # --- Set up the Argument Parser ---
     parser = argparse.ArgumentParser(
-        description="Transcodes a video to HEVC (QSV) or displays media info.",
+        description="A tool to transcode, remux, or inspect video files.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
   # Get info and estimated transcode time
   ,hvec.py -i movie.mp4
 
-  # Transcode verbosely (default)
-  ,hvec.py -i movie.mp4 -o movie.mkv
+  # Transcode a video using QSV hardware acceleration
+  ,hvec.py -i movie.mp4 -o movie_new.mkv
 
-  # Transcode with less noise (progress every 30s)
-  ,hvec.py -i movie.mp4 -o movie.mkv --less-noise
+  # Losslessly remux a video and subtitle file into an MKV
+  ,hvec.py -i movie.mp4 -s subs.srt -o movie_new.mkv --remux
 """
     )
     parser.add_argument("-i", "--input", required=True, help="Input video file")
     parser.add_argument("-o", "--output", help="Output MKV file. If omitted, script will display info about the input file.")
-    parser.add_argument("-s", "--subs", help="(Optional) Subtitle file to embed. Only used for transcoding.")
+    parser.add_argument("-s", "--subs", help="(Optional) Subtitle file to embed.")
+    parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux (stream copy) instead of transcoding.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress all warnings and progress. Overrides --less-noise.")
     parser.add_argument("--less-noise", action="store_true", help="Show progress updates only every 30 seconds.")
     parser.add_argument("-v", "--version", action="store_true", help="Show the version history and exit.")
@@ -68,12 +70,13 @@ Examples:
     
     print(f"--- hvec Transcoder v{__version__} ---")
     
+    if not os.path.exists(args.input):
+        print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
+        sys.exit(1)
+
     # --- MODE 1: Info-only (if no output file is specified) ---
     if not args.output:
         # ...(Info-mode is unchanged)...
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
-            sys.exit(1)
         print(f"\n--- Media Information for: {os.path.basename(args.input)} ---\n")
         try:
             subprocess.run(['ffprobe', '-hide_banner', args.input], check=True)
@@ -86,34 +89,41 @@ Examples:
             sys.exit(1)
         sys.exit(0)
 
-    # --- MODE 2: Transcoding (if output file is specified) ---
-    if not os.path.exists(args.input):
-        print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
-        sys.exit(1)
+    # --- MODE 2: Output Mode (if -o was provided) ---
     if args.subs and not os.path.exists(args.subs):
         print(f"Error: Subtitle file not found at '{args.subs}'", file=sys.stderr)
         sys.exit(1)
-
-    ffmpeg_cmd = ['ffmpeg']
     
-    if args.quiet:
-        ffmpeg_cmd.extend(['-loglevel', 'error'])
-    elif args.less_noise:
-        ffmpeg_cmd.extend(['-stats_period', '30'])
+    if args.remux:
+        # --- SUB-MODE: Remux ---
+        print("\nMode: Lossless Remux")
+        ffmpeg_cmd = ['ffmpeg', '-i', args.input]
+        if args.subs:
+            print("Subtitle file provided. Mapping all streams...")
+            ffmpeg_cmd.extend(['-i', args.subs, '-map', '0', '-map', '1', '-metadata:s:s:0', 'language=eng'])
+        else:
+            ffmpeg_cmd.extend(['-map', '0'])
         
-    ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input])
-    
-    encoding_params = ['-c:v', 'hevc_qsv', '-preset', 'medium', '-global_quality', '24', '-c:a', 'copy']
-    
-    if args.subs:
-        ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a', '-map', '1:s'])
-        ffmpeg_cmd.extend(['-c:s', 'copy', '-metadata:s:s:0', 'language=eng'])
+        ffmpeg_cmd.extend(['-c', 'copy', args.output])
     else:
-        ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
+        # --- SUB-MODE: Transcode ---
+        print("\nMode: QSV Transcode")
+        ffmpeg_cmd = ['ffmpeg']
+        if args.quiet:
+            ffmpeg_cmd.extend(['-loglevel', 'error'])
+        elif args.less_noise:
+            ffmpeg_cmd.extend(['-stats_period', '30'])
+        
+        ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input])
+        encoding_params = ['-c:v', 'hevc_qsv', '-preset', 'medium', '-global_quality', '24', '-c:a', 'copy']
+        if args.subs:
+            ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a', '-map', '1:s'])
+            ffmpeg_cmd.extend(['-c:s', 'copy', '-metadata:s:s:0', 'language=eng'])
+        else:
+            ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
+        ffmpeg_cmd.extend(encoding_params)
+        ffmpeg_cmd.append(args.output)
 
-    ffmpeg_cmd.extend(encoding_params)
-    ffmpeg_cmd.append(args.output)
-    
     run_ffmpeg_command(ffmpeg_cmd)
 
 def estimate_transcode_time(input_file):
@@ -140,7 +150,7 @@ def estimate_transcode_time(input_file):
         if total_frames > 0 and ESTIMATED_FPS > 0:
             estimated_seconds = total_frames / ESTIMATED_FPS
             mins, secs = divmod(estimated_seconds, 60)
-            hours, mins = divod(mins, 60)
+            hours, mins = divmod(mins, 60)
             print(f"Estimated time to transcode: {int(hours):02d}:{int(mins):02d}:{int(secs):02d}")
             print(f"(Based on an estimated {ESTIMATED_FPS} FPS for QSV HEVC encoding on this hardware)")
         else:
