@@ -9,21 +9,16 @@ import math
 import argcomplete
 
 # --- Version History ---
-# 1.5: Always print version number on execution for easier debugging.
-# 1.6: Moved version print to run before argument parsing to ensure it always displays.
-__version__ = "1.6"
+# 1.6: Moved version print to run before argument parsing.
+# 1.7: Made transcoding command more robust by explicitly mapping only desired video/audio streams.
+#      This prevents errors from incompatible embedded subtitle or data tracks.
+__version__ = "1.7"
 
 # --- PERFORMANCE CONSTANT ---
 ESTIMATED_FPS = 85
 
 def main():
-    """
-    Parses arguments and either displays media info or runs FFmpeg for transcoding.
-    """
-    # --- Print version header first, regardless of arguments ---
-    print(f"--- hvec Transcoder v{__version__} ---")
-
-    # --- Set up the Argument Parser ---
+    # ... (parser setup is the same as v1.6) ...
     parser = argparse.ArgumentParser(
         description="Transcodes a video to HEVC (QSV) or displays media info.",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -42,11 +37,10 @@ Examples:
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     
     argcomplete.autocomplete(parser)
+    print(f"--- hvec Transcoder v{__version__} ---") # Moved here for consistency
     args = parser.parse_args()
     
-    # --- The rest of the script is unchanged ---
-    
-    # --- MODE 1: Info-only (if no output file is specified) ---
+    # ... (info-mode is the same as v1.6) ...
     if not args.output:
         if not os.path.exists(args.input):
             print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
@@ -71,14 +65,33 @@ Examples:
         print(f"Error: Subtitle file not found at '{args.subs}'", file=sys.stderr)
         sys.exit(1)
 
+    # --- MODIFIED PART ---
     ffmpeg_cmd = ['ffmpeg', '-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input]
+    
+    encoding_params = [
+        '-c:v', 'hevc_qsv',
+        '-preset', 'medium',
+        '-global_quality', '24',
+        '-c:a', 'copy'
+    ]
+    
     if args.subs:
-        ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a', '-map', '1:s:0', '-metadata:s:s:0', 'language=eng'])
-    ffmpeg_cmd.extend(['-c:v', 'hevc_qsv', '-preset', 'medium', '-global_quality', '24', '-c:a', 'copy', '-c:s', 'copy', args.output])
+        print("Subtitle file provided. Building command to embed subtitles...")
+        ffmpeg_cmd.extend(['-i', args.subs])
+        # Map main video, all audio from input 0, and all subs from input 1
+        ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a', '-map', '1:s'])
+        ffmpeg_cmd.extend(['-c:s', 'copy', '-metadata:s:s:0', 'language=eng'])
+    else:
+        # Map only main video and all audio from input 0. Ignore other tracks.
+        ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
+
+    ffmpeg_cmd.extend(encoding_params)
+    ffmpeg_cmd.append(args.output)
     
     run_ffmpeg_command(ffmpeg_cmd)
 
 def estimate_transcode_time(input_file):
+    # ... (function is the same as v1.6) ...
     print("\n--- Transcode Estimate (for this hardware) ---")
     ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_file]
     try:
@@ -110,6 +123,7 @@ def estimate_transcode_time(input_file):
         print(f"Could not analyze video to provide an estimate: {e}")
 
 def run_ffmpeg_command(cmd):
+    # ... (function is the same as v1.6) ...
     print("\nExecuting FFmpeg command:")
     print(' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd))
     print("\n------------------------- FFmpeg Output -------------------------")
@@ -124,6 +138,7 @@ def run_ffmpeg_command(cmd):
         print("-----------------------------------------------------------------")
         print(f"\nError: FFmpeg failed with exit code {e.returncode}.", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
