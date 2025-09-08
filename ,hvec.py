@@ -9,11 +9,12 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "2.2"
+__version__ = "2.3"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v2.3: Improved --remux mode to intelligently ignore incompatible embedded subtitle/data tracks.
 v2.2: Added -r/--remux mode for lossless stream copying.
 v2.1: Added --less-noise flag for periodic progress updates.
 v2.0: Reworked argument parsing to correctly handle --version flag.
@@ -36,6 +37,7 @@ def main():
     """
     Parses arguments and performs media operations: info, transcode, or remux.
     """
+    # ... (parser setup is unchanged from v2.2) ...
     # --- Manually check for --version flag BEFORE argparse ---
     if '-v' in sys.argv or '--version' in sys.argv:
         print(VERSION_HISTORY)
@@ -74,7 +76,7 @@ Examples:
         print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
         sys.exit(1)
 
-    # --- MODE 1: Info-only (if no output file is specified) ---
+    # --- MODE 1: Info-only ---
     if not args.output:
         # ...(Info-mode is unchanged)...
         print(f"\n--- Media Information for: {os.path.basename(args.input)} ---\n")
@@ -89,7 +91,7 @@ Examples:
             sys.exit(1)
         sys.exit(0)
 
-    # --- MODE 2: Output Mode (if -o was provided) ---
+    # --- MODE 2: Output Mode ---
     if args.subs and not os.path.exists(args.subs):
         print(f"Error: Subtitle file not found at '{args.subs}'", file=sys.stderr)
         sys.exit(1)
@@ -102,16 +104,18 @@ Examples:
             print("Subtitle file provided. Mapping all streams...")
             ffmpeg_cmd.extend(['-i', args.subs, '-map', '0', '-map', '1', '-metadata:s:s:0', 'language=eng'])
         else:
-            ffmpeg_cmd.extend(['-map', '0'])
+            # MODIFIED: Map only main video and all audio. Ignore other tracks.
+            ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
         
         ffmpeg_cmd.extend(['-c', 'copy', args.output])
     else:
         # --- SUB-MODE: Transcode ---
+        # ...(Transcode logic is unchanged)...
         print("\nMode: QSV Transcode")
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error'])
-        elif args.less_noise:
+        elif args.less-noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
         
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input])
@@ -126,8 +130,8 @@ Examples:
 
     run_ffmpeg_command(ffmpeg_cmd)
 
+# ... (estimate_transcode_time and run_ffmpeg_command functions are unchanged) ...
 def estimate_transcode_time(input_file):
-    # ...(function is unchanged)...
     print("\n--- Transcode Estimate (for this hardware) ---")
     ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_file]
     try:
@@ -159,7 +163,6 @@ def estimate_transcode_time(input_file):
         print(f"Could not analyze video to provide an estimate: {e}")
 
 def run_ffmpeg_command(cmd):
-    # ...(function is unchanged)...
     print("\nExecuting FFmpeg command:")
     print(' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd))
     print("\n------------------------- FFmpeg Output -------------------------")
