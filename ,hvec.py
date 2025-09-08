@@ -9,12 +9,13 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "2.3"
+__version__ = "2.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v2.3: Improved --remux mode to intelligently ignore incompatible embedded subtitle/data tracks.
+v2.4: Added --convert-subs flag to handle incompatible embedded subtitles.
+v2.3: Improved --remux mode to intelligently ignore incompatible tracks.
 v2.2: Added -r/--remux mode for lossless stream copying.
 v2.1: Added --less-noise flag for periodic progress updates.
 v2.0: Reworked argument parsing to correctly handle --version flag.
@@ -37,7 +38,6 @@ def main():
     """
     Parses arguments and performs media operations: info, transcode, or remux.
     """
-    # ... (parser setup is unchanged from v2.2) ...
     # --- Manually check for --version flag BEFORE argparse ---
     if '-v' in sys.argv or '--version' in sys.argv:
         print(VERSION_HISTORY)
@@ -49,14 +49,14 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
-  # Get info and estimated transcode time
+  # Get info on a video
   ,hvec.py -i movie.mp4
 
   # Transcode a video using QSV hardware acceleration
   ,hvec.py -i movie.mp4 -o movie_new.mkv
 
-  # Losslessly remux a video and subtitle file into an MKV
-  ,hvec.py -i movie.mp4 -s subs.srt -o movie_new.mkv --remux
+  # Remux a video, converting its incompatible subtitles
+  ,hvec.py -i movie.m4v -o movie_new.mkv --remux --convert-subs
 """
     )
     parser.add_argument("-i", "--input", required=True, help="Input video file")
@@ -65,6 +65,7 @@ Examples:
     parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux (stream copy) instead of transcoding.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress all warnings and progress. Overrides --less-noise.")
     parser.add_argument("--less-noise", action="store_true", help="Show progress updates only every 30 seconds.")
+    parser.add_argument("--convert-subs", action="store_true", help="Convert subtitle tracks to a compatible format (srt) instead of copying.")
     parser.add_argument("-v", "--version", action="store_true", help="Show the version history and exit.")
     
     argcomplete.autocomplete(parser)
@@ -96,35 +97,39 @@ Examples:
         print(f"Error: Subtitle file not found at '{args.subs}'", file=sys.stderr)
         sys.exit(1)
     
+    subtitle_codec = 'srt' if args.convert_subs else 'copy'
+    
     if args.remux:
         # --- SUB-MODE: Remux ---
         print("\nMode: Lossless Remux")
         ffmpeg_cmd = ['ffmpeg', '-i', args.input]
         if args.subs:
-            print("Subtitle file provided. Mapping all streams...")
             ffmpeg_cmd.extend(['-i', args.subs, '-map', '0', '-map', '1', '-metadata:s:s:0', 'language=eng'])
+            ffmpeg_cmd.extend(['-c', 'copy', '-c:s', subtitle_codec])
         else:
-            # MODIFIED: Map only main video and all audio. Ignore other tracks.
-            ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
+            ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
+            ffmpeg_cmd.extend(['-c:v', 'copy', '-c:a', 'copy', '-c:s', subtitle_codec])
         
-        ffmpeg_cmd.extend(['-c', 'copy', args.output])
+        ffmpeg_cmd.append(args.output)
     else:
         # --- SUB-MODE: Transcode ---
-        # ...(Transcode logic is unchanged)...
         print("\nMode: QSV Transcode")
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error'])
-        elif args.less-noise:
+        elif args.less_noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
         
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input])
         encoding_params = ['-c:v', 'hevc_qsv', '-preset', 'medium', '-global_quality', '24', '-c:a', 'copy']
+        
         if args.subs:
             ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a', '-map', '1:s'])
-            ffmpeg_cmd.extend(['-c:s', 'copy', '-metadata:s:s:0', 'language=eng'])
+            ffmpeg_cmd.extend(['-c:s', subtitle_codec, '-metadata:s:s:0', 'language=eng'])
         else:
-            ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
+            ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
+            ffmpeg_cmd.extend(['-c:s', subtitle_codec])
+
         ffmpeg_cmd.extend(encoding_params)
         ffmpeg_cmd.append(args.output)
 
