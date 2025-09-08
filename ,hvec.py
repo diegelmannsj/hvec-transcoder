@@ -6,18 +6,24 @@ import sys
 import os
 import json
 import math
-import argcomplete  # <-- NEW: Import the library
+import argcomplete
 
 # --- Version History ---
-# 1.3: Added transcode time estimation.
-# 1.4: Added argcomplete hook for shell autocompletion.
-__version__ = "1.4"
+# 1.5: Always print version number on execution for easier debugging.
+# 1.6: Moved version print to run before argument parsing to ensure it always displays.
+__version__ = "1.6"
 
 # --- PERFORMANCE CONSTANT ---
 ESTIMATED_FPS = 85
 
 def main():
-    # ... (The main function is the same, but with one new line)
+    """
+    Parses arguments and either displays media info or runs FFmpeg for transcoding.
+    """
+    # --- Print version header first, regardless of arguments ---
+    print(f"--- hvec Transcoder v{__version__} ---")
+
+    # --- Set up the Argument Parser ---
     parser = argparse.ArgumentParser(
         description="Transcodes a video to HEVC (QSV) or displays media info.",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -35,17 +41,13 @@ Examples:
     parser.add_argument("-s", "--subs", help="(Optional) Subtitle file to embed. Only used for transcoding.")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     
-    argcomplete.autocomplete(parser)  # <-- NEW: This is the hook that makes it all work.
-
+    argcomplete.autocomplete(parser)
     args = parser.parse_args()
     
     # --- The rest of the script is unchanged ---
-    # ... (The logic for info-mode and transcode-mode is the same as before) ...
-    # (The full script from the previous turn is included here for completeness)
     
     # --- MODE 1: Info-only (if no output file is specified) ---
     if not args.output:
-        # ...(same as v1.3)...
         if not os.path.exists(args.input):
             print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
             sys.exit(1)
@@ -77,7 +79,6 @@ Examples:
     run_ffmpeg_command(ffmpeg_cmd)
 
 def estimate_transcode_time(input_file):
-    # ...(same as v1.3)...
     print("\n--- Transcode Estimate (for this hardware) ---")
     ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_file]
     try:
@@ -109,7 +110,6 @@ def estimate_transcode_time(input_file):
         print(f"Could not analyze video to provide an estimate: {e}")
 
 def run_ffmpeg_command(cmd):
-    # ...(same as v1.3)...
     print("\nExecuting FFmpeg command:")
     print(' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd))
     print("\n------------------------- FFmpeg Output -------------------------")
@@ -124,7 +124,6 @@ def run_ffmpeg_command(cmd):
         print("-----------------------------------------------------------------")
         print(f"\nError: FFmpeg failed with exit code {e.returncode}.", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
