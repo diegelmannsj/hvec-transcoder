@@ -9,11 +9,12 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "2.4"
+__version__ = "2.5"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v2.5: Changed subtitle handling to automatically convert to SRT when the output container is MKV, improving remux compatibility.
 v2.4: Added --convert-subs flag to handle incompatible embedded subtitles.
 v2.3: Improved --remux mode to intelligently ignore incompatible tracks.
 v2.2: Added -r/--remux mode for lossless stream copying.
@@ -56,7 +57,7 @@ Examples:
   ,hvec.py -i movie.mp4 -o movie_new.mkv
 
   # Remux a video, converting its incompatible subtitles
-  ,hvec.py -i movie.m4v -o movie_new.mkv --remux --convert-subs
+  ,hvec.py -i movie.m4v -o movie_new.mkv --remux
 """
     )
     parser.add_argument("-i", "--input", required=True, help="Input video file")
@@ -97,7 +98,10 @@ Examples:
         print(f"Error: Subtitle file not found at '{args.subs}'", file=sys.stderr)
         sys.exit(1)
     
-    subtitle_codec = 'srt' if args.convert_subs else 'copy'
+    # ** THE FIX IS HERE **
+    # Default to 'copy' unless the user asks to convert OR the output is MKV,
+    # in which case 'srt' is a much safer and more compatible default.
+    subtitle_codec = 'srt' if args.convert_subs or args.output.lower().endswith('.mkv') else 'copy'
     
     if args.remux:
         # --- SUB-MODE: Remux ---
