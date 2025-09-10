@@ -9,12 +9,14 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "2.6"
+__version__ = "2.7"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v2.6: Changed behavior to default the output filename if -o is not specified, replacing the previous "info-only" mode for a faster workflow.
+v2.7: Fixed subtitle embedding (--subs) to correctly map streams, preventing conflicts with existing/incompatible subtitle tracks in the source file.
+v2.6: Changed behavior to default the output filename if -o is not specified,
+      replacing the previous "info-only" mode for a faster workflow.
 v2.5: Changed subtitle handling to automatically convert to SRT when the
       output container is MKV, improving remux compatibility.
 v2.4: Added --convert-subs flag to handle incompatible embedded subtitles.
@@ -58,8 +60,8 @@ Examples:
   # Remux a video, converting subtitles, with automatic output name
   ,hvec.py -i movie.m4v --remux
 
-  # Transcode with an explicit output name
-  ,hvec.py -i movie.mp4 -o movie_new.mkv
+  # Remux a movie while replacing its subtitles with an external SRT file
+  ,hvec.py -i movie.mkv -o movie_new.mkv --subs new.srt --remux
 """
     )
     parser.add_argument("-i", "--input", required=True, help="Input video file")
@@ -80,10 +82,8 @@ Examples:
         print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
         sys.exit(1)
 
-    # ** THE FIX IS HERE **
     # Check for output file and create a default if not provided
     if not args.output:
-        # Generate a default output filename by replacing the extension with .mkv
         base_name, _ = os.path.splitext(args.input)
         args.output = base_name + ".mkv"
         print(f"\nInfo: No output file specified. Defaulting to '{args.output}'")
@@ -93,17 +93,19 @@ Examples:
         print(f"Error: Subtitle file not found at '{args.subs}'", file=sys.stderr)
         sys.exit(1)
     
-    # Determine the subtitle codec based on flags and output format
     subtitle_codec = 'srt' if args.convert_subs or args.output.lower().endswith('.mkv') else 'copy'
     
     if args.remux:
         # --- SUB-MODE: Remux ---
         print("\nMode: Lossless Remux")
         ffmpeg_cmd = ['ffmpeg', '-i', args.input]
+        # ** THE FIX IS HERE **
         if args.subs:
-            ffmpeg_cmd.extend(['-i', args.subs, '-map', '0', '-map', '1', '-metadata:s:s:0', 'language=eng'])
-            ffmpeg_cmd.extend(['-c', 'copy', '-c:s', subtitle_codec])
-        else:
+            ffmpeg_cmd.extend(['-i', args.subs])
+            # Map video and audio from input 0, subtitles from input 1
+            ffmpeg_cmd.extend(['-map', '0:v', '-map', '0:a?', '-map', '1:s'])
+            ffmpeg_cmd.extend(['-c:v', 'copy', '-c:a', 'copy', '-c:s', subtitle_codec])
+        else: # Original logic for files without external subs
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
             ffmpeg_cmd.extend(['-c:v', 'copy', '-c:a', 'copy', '-c:s', subtitle_codec])
         
@@ -120,10 +122,13 @@ Examples:
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input])
         encoding_params = ['-c:v', 'hevc_qsv', '-preset', 'medium', '-global_quality', '24', '-c:a', 'copy']
         
+        # ** THE FIX IS ALSO HERE **
         if args.subs:
-            ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a', '-map', '1:s'])
-            ffmpeg_cmd.extend(['-c:s', subtitle_codec, '-metadata:s:s:0', 'language=eng'])
-        else:
+            ffmpeg_cmd.extend(['-i', args.subs])
+            # Map video and audio from input 0, subtitles from input 1
+            ffmpeg_cmd.extend(['-map', '0:v', '-map', '0:a?', '-map', '1:s'])
+            ffmpeg_cmd.extend(['-c:s', subtitle_codec])
+        else: # Original logic for files without external subs
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
             ffmpeg_cmd.extend(['-c:s', subtitle_codec])
 
@@ -132,8 +137,7 @@ Examples:
 
     run_ffmpeg_command(ffmpeg_cmd)
 
-# This function is now only used if you manually add the call back, 
-# but is left here for potential future use.
+# ... (estimate_transcode_time and run_ffmpeg_command functions are unchanged) ...
 def estimate_transcode_time(input_file):
     print("\n--- Transcode Estimate (for this hardware) ---")
     ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_file]
