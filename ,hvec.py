@@ -9,12 +9,14 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "2.5"
+__version__ = "2.6"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v2.5: Changed subtitle handling to automatically convert to SRT when the output container is MKV, improving remux compatibility.
+v2.6: Changed behavior to default the output filename if -o is not specified, replacing the previous "info-only" mode for a faster workflow.
+v2.5: Changed subtitle handling to automatically convert to SRT when the
+      output container is MKV, improving remux compatibility.
 v2.4: Added --convert-subs flag to handle incompatible embedded subtitles.
 v2.3: Improved --remux mode to intelligently ignore incompatible tracks.
 v2.2: Added -r/--remux mode for lossless stream copying.
@@ -37,7 +39,7 @@ ESTIMATED_FPS = 85
 
 def main():
     """
-    Parses arguments and performs media operations: info, transcode, or remux.
+    Parses arguments and performs media operations: transcode or remux.
     """
     # --- Manually check for --version flag BEFORE argparse ---
     if '-v' in sys.argv or '--version' in sys.argv:
@@ -50,18 +52,18 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
-  # Get info on a video
+  # Transcode movie.mp4 to movie.mkv (output name is automatic)
   ,hvec.py -i movie.mp4
 
-  # Transcode a video using QSV hardware acceleration
-  ,hvec.py -i movie.mp4 -o movie_new.mkv
+  # Remux a video, converting subtitles, with automatic output name
+  ,hvec.py -i movie.m4v --remux
 
-  # Remux a video, converting its incompatible subtitles
-  ,hvec.py -i movie.m4v -o movie_new.mkv --remux
+  # Transcode with an explicit output name
+  ,hvec.py -i movie.mp4 -o movie_new.mkv
 """
     )
     parser.add_argument("-i", "--input", required=True, help="Input video file")
-    parser.add_argument("-o", "--output", help="Output MKV file. If omitted, script will display info about the input file.")
+    parser.add_argument("-o", "--output", help="Output MKV file. If omitted, it's generated from the input name.")
     parser.add_argument("-s", "--subs", help="(Optional) Subtitle file to embed.")
     parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux (stream copy) instead of transcoding.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress all warnings and progress. Overrides --less-noise.")
@@ -78,29 +80,20 @@ Examples:
         print(f"Error: Input file not found at '{args.input}'", file=sys.stderr)
         sys.exit(1)
 
-    # --- MODE 1: Info-only ---
+    # ** THE FIX IS HERE **
+    # Check for output file and create a default if not provided
     if not args.output:
-        # ...(Info-mode is unchanged)...
-        print(f"\n--- Media Information for: {os.path.basename(args.input)} ---\n")
-        try:
-            subprocess.run(['ffprobe', '-hide_banner', args.input], check=True)
-            estimate_transcode_time(args.input)
-        except FileNotFoundError:
-            print("Error: 'ffprobe' not found. Is FFmpeg installed correctly?", file=sys.stderr)
-            sys.exit(1)
-        except subprocess.CalledProcessError:
-            print("\nError: ffprobe failed to analyze the file.", file=sys.stderr)
-            sys.exit(1)
-        sys.exit(0)
-
-    # --- MODE 2: Output Mode ---
+        # Generate a default output filename by replacing the extension with .mkv
+        base_name, _ = os.path.splitext(args.input)
+        args.output = base_name + ".mkv"
+        print(f"\nInfo: No output file specified. Defaulting to '{args.output}'")
+    
+    # --- MODE: Output Mode ---
     if args.subs and not os.path.exists(args.subs):
         print(f"Error: Subtitle file not found at '{args.subs}'", file=sys.stderr)
         sys.exit(1)
     
-    # ** THE FIX IS HERE **
-    # Default to 'copy' unless the user asks to convert OR the output is MKV,
-    # in which case 'srt' is a much safer and more compatible default.
+    # Determine the subtitle codec based on flags and output format
     subtitle_codec = 'srt' if args.convert_subs or args.output.lower().endswith('.mkv') else 'copy'
     
     if args.remux:
@@ -139,7 +132,8 @@ Examples:
 
     run_ffmpeg_command(ffmpeg_cmd)
 
-# ... (estimate_transcode_time and run_ffmpeg_command functions are unchanged) ...
+# This function is now only used if you manually add the call back, 
+# but is left here for potential future use.
 def estimate_transcode_time(input_file):
     print("\n--- Transcode Estimate (for this hardware) ---")
     ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_file]
