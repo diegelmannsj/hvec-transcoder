@@ -9,11 +9,15 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "2.7"
+__version__ = "2.8"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v2.8: Corrected a major bug in Transcode mode that incorrectly forced the input
+      decoder to H.264 (h264_qsv), causing errors with non-H.264 source files
+      like H.265. The script now correctly allows FFmpeg to auto-detect the
+      input codec for hardware decoding.
 v2.7: Fixed subtitle embedding (--subs) to correctly map streams, preventing conflicts with existing/incompatible subtitle tracks in the source file.
 v2.6: Changed behavior to default the output filename if -o is not specified,
       replacing the previous "info-only" mode for a faster workflow.
@@ -99,7 +103,7 @@ Examples:
         # --- SUB-MODE: Remux ---
         print("\nMode: Lossless Remux")
         ffmpeg_cmd = ['ffmpeg', '-i', args.input]
-        # ** THE FIX IS HERE **
+
         if args.subs:
             ffmpeg_cmd.extend(['-i', args.subs])
             # Map video and audio from input 0, subtitles from input 1
@@ -119,10 +123,14 @@ Examples:
         elif args.less_noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
         
-        ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-c:v', 'h264_qsv', '-i', args.input])
+        # --- THE FIX IS HERE ---
+        # Set global hwaccel but do NOT force an input codec.
+        # FFmpeg will auto-detect the correct one (h264_qsv, hevc_qsv, etc.)
+        ffmpeg_cmd.extend(['-hwaccel', 'qsv'])
+        ffmpeg_cmd.extend(['-i', args.input])
+
         encoding_params = ['-c:v', 'hevc_qsv', '-preset', 'medium', '-global_quality', '24', '-c:a', 'copy']
         
-        # ** THE FIX IS ALSO HERE **
         if args.subs:
             ffmpeg_cmd.extend(['-i', args.subs])
             # Map video and audio from input 0, subtitles from input 1
@@ -137,7 +145,6 @@ Examples:
 
     run_ffmpeg_command(ffmpeg_cmd)
 
-# ... (estimate_transcode_time and run_ffmpeg_command functions are unchanged) ...
 def estimate_transcode_time(input_file):
     print("\n--- Transcode Estimate (for this hardware) ---")
     ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_file]
@@ -171,7 +178,9 @@ def estimate_transcode_time(input_file):
 
 def run_ffmpeg_command(cmd):
     print("\nExecuting FFmpeg command:")
-    print(' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd))
+    # A helper to print the command in a copy-pasteable format
+    cmd_str = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd)
+    print(cmd_str)
     print("\n------------------------- FFmpeg Output -------------------------")
     try:
         subprocess.run(cmd, check=True)
