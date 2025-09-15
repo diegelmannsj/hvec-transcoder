@@ -43,3 +43,42 @@ This script is designed for media library management, allowing for easy, high-qu
 The script is controlled via command-line flags. You can see all available options by running:
 ```bash
 ,hvec --help
+```
+
+### Examples
+
+**1. Basic Transcode of a Single File**
+This will transcode `movie.mp4` to `movie.mkv` using the default quality and preset settings.
+```bash
+,hvec -i movie.mp4
+```
+
+**2. Transcode with Higher Quality**
+Use the `-Q` (quality) and `-p` (preset) flags to get a higher quality, more efficiently compressed file. This will be slower.
+```bash
+,hvec -i movie.mp4 -Q 20 -p slow
+```
+
+**3. Transcode an Entire Directory**
+This finds all video files in the `input_folder` and saves the new HEVC files to `output_folder`.
+```bash
+,hvec -i /path/to/input_folder --out-dir /path/to/output_folder
+```
+
+**4. The "Power User" Batch Command**
+This command recursively scans a library, skips any files that are already H.265, re-encodes the audio to AAC at 192k to save space, and saves the new files to a different directory.
+```bash
+,hvec -i /media/library -R --skip-hevc --acodec aac --abitrate 192k --out-dir /media/library_HEVC
+```
+
+**5. Perform a Dry Run**
+See the command that *would* be executed for the "Power User" example above, without actually running it.
+```bash
+,hvec -i /media/library -R --skip-hevc --acodec aac --abitrate 192k --out-dir /media/library_HEVC --dry-run
+```
+
+**6. Remux a File**
+Quickly copy all streams into a new, clean MKV container without re-encoding.
+```bash
+,hvec -i corrupt_container.mp4 --remux
+```
