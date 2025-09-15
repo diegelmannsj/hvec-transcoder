@@ -26,7 +26,7 @@ This script is designed for media library management, allowing for easy, high-qu
 
 1.  Clone the repository:
     ```bash
-    git clone <your-repo-url>
+    git clone https://github.com/diegelmannsj/hvec-transcoder.git
     cd hvec-project
     ```
 2.  Make the script executable:
