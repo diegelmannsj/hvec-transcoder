@@ -9,11 +9,13 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "3.2"
+__version__ = "3.3"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v3.3: Modified script to always print the current version number on execution
+      as the first line of output, regardless of other flags.
 v3.2: Fixed a crash when transcoding files with bitmap subtitles (e.g., PGS).
       The script now copies subtitle streams (-c:s copy) instead of trying
       to force a conversion to SRT format (-c:s srt).
@@ -21,27 +23,13 @@ v3.1: Added -H/--hvec flag to explicitly force the output to be a transcoded
       HEVC/H.265 file. This flag will override --remux if both are used.
 v3.0: Major feature release. Added batch processing, smarter transcoding,
       and advanced audio control.
-      - Directory Input: The -i flag can now accept a directory to process
-        all video files within it.
-      - Recursive Mode (-R, --recursive): Scans subdirectories in batch mode.
-      - Custom Output Dir (--out-dir): Saves transcoded files to a different
-        directory, preserving the source folder structure in recursive mode.
-      - Skip HEVC (--skip-hevc): In batch mode, intelligently checks and skips
-        files that are already in H.265/HEVC format.
-      - Audio Re-encoding (--acodec, --abitrate): Allows re-encoding audio
-        to save space (e.g., --acodec aac --abitrate 192k).
-      - Dry Run (--dry-run): Prints the FFmpeg command without executing it.
-v2.9: Added optional flags for Quality (-Q, --quality) and Preset (-p, --preset)
-      to allow customization of the QSV transcode. Updated help text.
-v2.8: Corrected a major bug that forced the input decoder to H.264, causing
-      errors with H.265 source files. Script now auto-detects input codec.
 """
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
 # --- Helper Functions ---
-
+# ... (all helper functions are unchanged) ...
 def find_video_files(input_path, recursive):
     """Finds all video files in a given path."""
     video_files = []
@@ -84,7 +72,6 @@ def run_ffmpeg_command(cmd):
     print(cmd_str)
     print("\n------------------------- FFmpeg Output -------------------------")
     try:
-        # Pass stdout and stderr to the user's terminal directly
         process = subprocess.run(cmd, check=True)
         print("-----------------------------------------------------------------")
         print(f"\nSuccessfully created '{cmd[-1]}'.")
@@ -93,16 +80,17 @@ def run_ffmpeg_command(cmd):
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         print("-----------------------------------------------------------------")
-        # The CalledProcessError exception from subprocess.run does not contain stdout/stderr
-        # by default unless you capture it, but the live output will have already been printed.
         print(f"\nError: FFmpeg failed with exit code {e.returncode}.", file=sys.stderr)
         sys.exit(1)
-
 
 # --- Main Logic ---
 
 def main():
     """Parses arguments and performs media operations."""
+    # --- THE CHANGE IS HERE ---
+    # Always print the version first, before any other logic.
+    print(f"hvec v{__version__}")
+
     if '-v' in sys.argv or '--version' in sys.argv:
         print(VERSION_HISTORY)
         sys.exit(0)
@@ -122,7 +110,7 @@ Examples:
   ,hvec -i movie.mp4 --remux -H
 """
     )
-    # --- All Arguments Defined Here ---
+    # ... (all arguments are unchanged) ...
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
     parser.add_argument("-o", "--output", help="Output MKV file. Only used for single file input.")
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
@@ -145,15 +133,17 @@ Examples:
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
 
-    print(f"--- hvec Transcoder v{__version__} ---")
+    # --- THIS LINE WAS REMOVED ---
+    # print(f"--- hvec Transcoder v{__version__} ---")
 
+    # ... (rest of the script is unchanged) ...
     files_to_process = []
     if not os.path.exists(args.input):
         print(f"Error: Input path not found: '{args.input}'", file=sys.stderr)
         sys.exit(1)
 
     if os.path.isdir(args.input):
-        print(f"Input is a directory. Scanning for video files...")
+        print(f"\nInput is a directory. Scanning for video files...")
         files_to_process = find_video_files(args.input, args.recursive)
         print(f"Found {len(files_to_process)} video files to process.")
     else:
@@ -171,7 +161,6 @@ Examples:
             base_name, _ = os.path.splitext(os.path.basename(input_file))
             new_filename = base_name + ".mkv"
             if args.out_dir:
-                # Preserve subdirectory structure relative to input path
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
                 output_dir = os.path.join(args.out_dir, relative_path)
                 if not os.path.exists(output_dir):
@@ -186,16 +175,12 @@ Examples:
                 base_name, _ = os.path.splitext(input_file)
                 output_file = base_name + ".mkv"
 
-        # --- Build FFmpeg Command ---
         ffmpeg_cmd = ['ffmpeg']
-
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
         elif args.less_noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
-
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-i', input_file])
-
         if args.subs:
             if len(files_to_process) > 1:
                 print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
@@ -204,25 +189,19 @@ Examples:
                     print(f"Error: Subtitle file not found: '{args.subs}'", file=sys.stderr)
                     continue
                 ffmpeg_cmd.extend(['-i', args.subs])
-
-        # --- Map Streams ---
         if args.subs and len(files_to_process) == 1:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '1:s:0'])
         else:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
-
-        # --- Add Encoding/Copy Parameters ---
         if args.remux and not args.hvec:
             print("Mode: Lossless Remux")
             ffmpeg_cmd.extend(['-c', 'copy'])
         else:
             if args.hvec:
-                print("Mode: QSV Transcode (Forced by -H/--hvec flag)")
+                print("\nMode: QSV Transcode (Forced by -H/--hvec flag)")
             else:
-                print("Mode: QSV Transcode")
-            # Video
+                print("\nMode: QSV Transcode")
             ffmpeg_cmd.extend(['-c:v', 'hevc_qsv', '-preset', args.preset, '-global_quality', str(args.quality)])
-            # Audio
             if args.acodec:
                 print(f"Re-encoding audio to {args.acodec.upper()}")
                 ffmpeg_cmd.extend(['-c:a', args.acodec])
@@ -230,12 +209,8 @@ Examples:
                     ffmpeg_cmd.extend(['-b:a', args.abitrate])
             else:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
-            # Subtitles --- THE FIX IS HERE ---
             ffmpeg_cmd.extend(['-c:s', 'copy'])
-
         ffmpeg_cmd.append(output_file)
-
-        # --- Execute or Print Command ---
         if args.dry_run:
             print_ffmpeg_command(ffmpeg_cmd)
         else:
