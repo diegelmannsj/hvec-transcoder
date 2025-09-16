@@ -9,11 +9,13 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "3.4"
+__version__ = "3.5"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v3.5: Output filenames are now automatically sanitized. Parentheses are
+      removed and spaces are replaced with periods.
 v3.4: In batch mode, output files are now automatically renamed with a .CONV
       suffix before the extension to distinguish them from source files.
 v3.3: Modified script to always print the current version number on execution
@@ -101,7 +103,8 @@ def main():
         epilog="""
 Examples:
   # Transcode a single file with default settings
-  ,hvec -i movie.mp4
+  # "My Movie (2025).mp4" -> "My.Movie.2025.mkv"
+  ,hvec -i "My Movie (2025).mp4"
 
   # Transcode all videos in a folder, adding .CONV to each new filename
   ,hvec -i /path/to/videos/
@@ -109,7 +112,7 @@ Examples:
     )
     # ... (all arguments are unchanged) ...
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
-    parser.add_argument("-o", "--output", help="Output MKV file. Only used for single file input.")
+    parser.add_argument("-o", "--output", help="Output MKV file. If specified, name sanitization is skipped.")
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
     parser.add_argument("-s", "--subs", help="(Optional) External subtitle file to embed (single file mode only).")
@@ -145,7 +148,7 @@ Examples:
     for i, input_file in enumerate(files_to_process, 1):
         print(f"\n--- Processing file {i}/{len(files_to_process)}: {os.path.basename(input_file)} ---")
 
-        if args.skip_hevc and is_hevc(input_file):
+        if args.skip-hevc and is_hevc(input_file):
             print("Video is already HEVC. Skipping.")
             continue
 
@@ -154,7 +157,8 @@ Examples:
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
             # --- THE CHANGE IS HERE ---
-            new_filename = base_name + ".CONV.mkv"
+            sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
+            new_filename = sanitized_base_name + ".CONV.mkv"
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
                 output_dir = os.path.join(args.out_dir, relative_path)
@@ -165,10 +169,14 @@ Examples:
                 output_file = os.path.join(os.path.dirname(input_file), new_filename)
         else: # Single file mode
             if args.output:
+                # If user specifies an output file, use it exactly as-is.
                 output_file = args.output
             else:
+                # Otherwise, generate a sanitized name automatically.
                 base_name, _ = os.path.splitext(input_file)
-                output_file = base_name + ".mkv"
+                # --- THE CHANGE IS ALSO HERE ---
+                sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
+                output_file = sanitized_base_name + ".mkv"
         
         # ... (rest of the script is unchanged) ...
         ffmpeg_cmd = ['ffmpeg']
