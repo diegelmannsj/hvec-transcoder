@@ -9,11 +9,13 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "3.3"
+__version__ = "3.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v3.4: In batch mode, output files are now automatically renamed with a .CONV
+      suffix before the extension to distinguish them from source files.
 v3.3: Modified script to always print the current version number on execution
       as the first line of output, regardless of other flags.
 v3.2: Fixed a crash when transcoding files with bitmap subtitles (e.g., PGS).
@@ -87,8 +89,6 @@ def run_ffmpeg_command(cmd):
 
 def main():
     """Parses arguments and performs media operations."""
-    # --- THE CHANGE IS HERE ---
-    # Always print the version first, before any other logic.
     print(f"hvec v{__version__}")
 
     if '-v' in sys.argv or '--version' in sys.argv:
@@ -103,11 +103,8 @@ Examples:
   # Transcode a single file with default settings
   ,hvec -i movie.mp4
 
-  # Remux a file, which is faster but does not re-encode to HEVC
-  ,hvec -i movie.mp4 --remux
-
-  # Force a transcode to HEVC, even if --remux is also present
-  ,hvec -i movie.mp4 --remux -H
+  # Transcode all videos in a folder, adding .CONV to each new filename
+  ,hvec -i /path/to/videos/
 """
     )
     # ... (all arguments are unchanged) ...
@@ -133,10 +130,6 @@ Examples:
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
 
-    # --- THIS LINE WAS REMOVED ---
-    # print(f"--- hvec Transcoder v{__version__} ---")
-
-    # ... (rest of the script is unchanged) ...
     files_to_process = []
     if not os.path.exists(args.input):
         print(f"Error: Input path not found: '{args.input}'", file=sys.stderr)
@@ -156,10 +149,12 @@ Examples:
             print("Video is already HEVC. Skipping.")
             continue
 
+        # --- Determine Output Path ---
         output_file = ""
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
-            new_filename = base_name + ".mkv"
+            # --- THE CHANGE IS HERE ---
+            new_filename = base_name + ".CONV.mkv"
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
                 output_dir = os.path.join(args.out_dir, relative_path)
@@ -174,7 +169,8 @@ Examples:
             else:
                 base_name, _ = os.path.splitext(input_file)
                 output_file = base_name + ".mkv"
-
+        
+        # ... (rest of the script is unchanged) ...
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
