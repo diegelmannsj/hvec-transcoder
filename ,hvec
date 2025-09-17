@@ -9,11 +9,13 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "3.6"
+__version__ = "3.7"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v3.7: Added -D/--delete flag to delete the source file after a
+      successful transcode.
 v3.6: Fixed a crash (AttributeError) caused by a typo when checking the
       --skip-hevc argument. Changed 'args.skip-hevc' to 'args.skip_hevc'.
 v3.5: Output filenames are now automatically sanitized. Parentheses are
@@ -35,7 +37,6 @@ v3.0: Major feature release. Added batch processing, smarter transcoding,
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
 # --- Helper Functions ---
-# ... (all helper functions are unchanged) ...
 def find_video_files(input_path, recursive):
     """Finds all video files in a given path."""
     video_files = []
@@ -71,8 +72,8 @@ def print_ffmpeg_command(cmd):
     cmd_str = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd)
     print(cmd_str)
 
-def run_ffmpeg_command(cmd):
-    """Prints and executes the FFmpeg command."""
+def run_ffmpeg_command(cmd, source_file, delete_source):
+    """Prints and executes the FFmpeg command, optionally deleting the source file."""
     print("\nExecuting FFmpeg command:")
     cmd_str = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd)
     print(cmd_str)
@@ -81,6 +82,16 @@ def run_ffmpeg_command(cmd):
         process = subprocess.run(cmd, check=True)
         print("-----------------------------------------------------------------")
         print(f"\nSuccessfully created '{cmd[-1]}'.")
+        
+        # --- NEW: Delete source file if the flag is set and transcode was successful ---
+        if delete_source:
+            print(f"\nInfo: --delete flag is set. Deleting source file...")
+            try:
+                os.remove(source_file)
+                print(f"Successfully deleted: {source_file}")
+            except OSError as e:
+                print(f"\nError: Could not delete source file '{source_file}'. Reason: {e}", file=sys.stderr)
+
     except FileNotFoundError:
         print("\nError: 'ffmpeg' not found. Is it installed and in your PATH?", file=sys.stderr)
         sys.exit(1)
@@ -104,17 +115,17 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
-  # Transcode a single file with default settings
-  # "My Movie (2025).mp4" -> "My.Movie.2025.mkv"
-  ,hvec -i "My Movie (2025).mp4"
+  # Transcode a file and delete the original upon success
+  ,hvec -i "My Movie.mp4" -D
 
-  # Transcode all videos in a folder, adding .CONV to each new filename
-  ,hvec -i /path/to/videos/
+  # Transcode all videos in a folder and delete the originals
+  ,hvec -i /path/to/videos/ -D
 """
     )
-    # ... (all arguments are unchanged) ...
+    # --- All Arguments Defined Here ---
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
     parser.add_argument("-o", "--output", help="Output MKV file. If specified, name sanitization is skipped.")
+    parser.add_argument("-D", "--delete", action="store_true", help="Delete the original input file after a successful transcode.")
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
     parser.add_argument("-s", "--subs", help="(Optional) External subtitle file to embed (single file mode only).")
@@ -150,7 +161,6 @@ Examples:
     for i, input_file in enumerate(files_to_process, 1):
         print(f"\n--- Processing file {i}/{len(files_to_process)}: {os.path.basename(input_file)} ---")
         
-        # --- THE FIX IS HERE ---
         if args.skip_hevc and is_hevc(input_file):
             print("Video is already HEVC. Skipping.")
             continue
@@ -177,7 +187,6 @@ Examples:
                 sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
                 output_file = sanitized_base_name + ".mkv"
         
-        # ... (rest of the script is unchanged) ...
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
@@ -214,10 +223,15 @@ Examples:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
             ffmpeg_cmd.extend(['-c:s', 'copy'])
         ffmpeg_cmd.append(output_file)
+        
+        # --- Execute or Print Command ---
         if args.dry_run:
             print_ffmpeg_command(ffmpeg_cmd)
+            if args.delete:
+                print(f"Info: Source file '{input_file}' would be deleted upon success.")
         else:
-            run_ffmpeg_command(ffmpeg_cmd)
+            # Pass the original input_file path and the delete flag to the function
+            run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete)
 
     print("\n--- All tasks complete. ---")
 
