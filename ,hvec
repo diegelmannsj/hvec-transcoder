@@ -9,30 +9,20 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "3.9"
+__version__ = "4.0"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v4.0: CRITICAL FIX: The --delete flag no longer deletes the source file
+      on a failed conversion.
+      - Script now defaults to NON-INTERACTIVE mode. FFmpeg will fail if
+        the output file exists instead of prompting for overwrite.
+      - Added --overwrite flag to allow overwriting the output file.
 v3.9: Fixed a crash (AttributeError) caused by a typo when checking the
-      --less-noise argument. Changed 'args.less-noise' to 'args.less_noise'.
-v3.8: Added a file size summary that displays the original and new file
-      sizes, the space saved, and the percentage reduction after each
-      successful operation.
-v3.7: Added -D/--delete flag to delete the source file after a
-      successful transcode.
-v3.6: Fixed a crash (AttributeError) caused by a typo when checking the
-      --skip-hevc argument. Changed 'args.skip-hevc' to 'args.skip_hevc'.
-v3.5: Output filenames are now automatically sanitized. Parentheses are
-      removed and spaces are replaced with periods.
-v3.4: In batch mode, output files are automatically renamed with a .CONV
-      suffix before the extension to distinguish them from source files.
-v3.3: Modified script to always print the current version number on execution
-      as the first line of output, regardless of other flags.
-v3.2: Fixed a crash when transcoding files with bitmap subtitles (e.g., PGS).
-      The script now copies subtitle streams (-c:s copy).
-v3.1: Added -H/--hvec flag to explicitly force HEVC output.
-v3.0: Major feature release with batch processing.
+      --less-noise argument.
+v3.8: Added a file size summary after successful operations.
+v3.7: Added -D/--delete flag.
 """
 
 # --- Constants ---
@@ -115,7 +105,9 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
 
     print("\n------------------------- FFmpeg Output -------------------------")
     try:
+        # check=True will raise CalledProcessError on a non-zero exit code
         process = subprocess.run(cmd, check=True)
+        
         print("-----------------------------------------------------------------")
         
         output_file = cmd[-1]
@@ -138,6 +130,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
     except subprocess.CalledProcessError as e:
         print("-----------------------------------------------------------------")
         print(f"\nError: FFmpeg failed with exit code {e.returncode}.", file=sys.stderr)
+        print("Source file was NOT deleted.")
         sys.exit(1)
 
 # --- Main Logic ---
@@ -154,17 +147,18 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
-  # Transcode a file and delete the original upon success
+  # Transcode a file and delete the original (will fail if output exists)
   ,hvec -i "My Movie.mp4" -D
 
-  # Transcode all videos in a folder and delete the originals
-  ,hvec -i /path/to/videos/ -D
+  # Transcode and overwrite the output file if it already exists
+  ,hvec -i "My Movie.mp4" --overwrite
 """
     )
     # --- All Arguments Defined Here ---
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
     parser.add_argument("-o", "--output", help="Output MKV file. If specified, name sanitization is skipped.")
     parser.add_argument("-D", "--delete", action="store_true", help="Delete the original input file after a successful transcode.")
+    parser.add_argument("--overwrite", action="store_true", help="Allow FFmpeg to overwrite existing output files.")
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
     parser.add_argument("-s", "--subs", help="(Optional) External subtitle file to embed (single file mode only).")
@@ -204,7 +198,6 @@ Examples:
             print("Video is already HEVC. Skipping.")
             continue
 
-        # --- Determine Output Path ---
         output_file = ""
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
@@ -226,13 +219,20 @@ Examples:
                 sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
                 output_file = sanitized_base_name + ".mkv"
         
+        # --- THE FIX IS HERE ---
         ffmpeg_cmd = ['ffmpeg']
+        if args.overwrite:
+            ffmpeg_cmd.append('-y') # Assume YES to all prompts (overwrite)
+        else:
+            ffmpeg_cmd.append('-n') # Assume NO to all prompts (fail if output exists)
+
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
-        # --- THE FIX IS HERE ---
         elif args.less_noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
+        
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-i', input_file])
+
         if args.subs:
             if len(files_to_process) > 1:
                 print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
