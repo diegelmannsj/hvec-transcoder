@@ -9,11 +9,13 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "3.8"
+__version__ = "3.9"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v3.9: Fixed a crash (AttributeError) caused by a typo when checking the
+      --less-noise argument. Changed 'args.less-noise' to 'args.less_noise'.
 v3.8: Added a file size summary that displays the original and new file
       sizes, the space saved, and the percentage reduction after each
       successful operation.
@@ -23,7 +25,7 @@ v3.6: Fixed a crash (AttributeError) caused by a typo when checking the
       --skip-hevc argument. Changed 'args.skip-hevc' to 'args.skip_hevc'.
 v3.5: Output filenames are now automatically sanitized. Parentheses are
       removed and spaces are replaced with periods.
-v3.4: In batch mode, output files are now automatically renamed with a .CONV
+v3.4: In batch mode, output files are automatically renamed with a .CONV
       suffix before the extension to distinguish them from source files.
 v3.3: Modified script to always print the current version number on execution
       as the first line of output, regardless of other flags.
@@ -227,7 +229,8 @@ Examples:
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
-        elif args.less-noise:
+        # --- THE FIX IS HERE ---
+        elif args.less_noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-i', input_file])
         if args.subs:
