@@ -9,11 +9,14 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "3.7"
+__version__ = "3.8"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v3.8: Added a file size summary that displays the original and new file
+      sizes, the space saved, and the percentage reduction after each
+      successful operation.
 v3.7: Added -D/--delete flag to delete the source file after a
       successful transcode.
 v3.6: Fixed a crash (AttributeError) caused by a typo when checking the
@@ -25,18 +28,46 @@ v3.4: In batch mode, output files are now automatically renamed with a .CONV
 v3.3: Modified script to always print the current version number on execution
       as the first line of output, regardless of other flags.
 v3.2: Fixed a crash when transcoding files with bitmap subtitles (e.g., PGS).
-      The script now copies subtitle streams (-c:s copy) instead of trying
-      to force a conversion to SRT format (-c:s srt).
-v3.1: Added -H/--hvec flag to explicitly force the output to be a transcoded
-      HEVC/H.265 file. This flag will override --remux if both are used.
-v3.0: Major feature release. Added batch processing, smarter transcoding,
-      and advanced audio control.
+      The script now copies subtitle streams (-c:s copy).
+v3.1: Added -H/--hvec flag to explicitly force HEVC output.
+v3.0: Major feature release with batch processing.
 """
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
 # --- Helper Functions ---
+
+def format_bytes(size_bytes):
+    """Converts a byte value into a human-readable string (KB, MB, GB)."""
+    if size_bytes is None or size_bytes == 0:
+        return "0B"
+    size_name = ("B", "KB", "MB", "GB", "TB")
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return f"{s} {size_name[i]}"
+
+def print_size_summary(original_bytes, new_bytes):
+    """Calculates and prints a summary of the file size change."""
+    if original_bytes is None or new_bytes is None:
+        return
+
+    print("\n--- File Size Summary ---")
+    print(f"Original Size: {format_bytes(original_bytes)}")
+    print(f"New Size     : {format_bytes(new_bytes)}")
+
+    if original_bytes > 0:
+        difference_bytes = original_bytes - new_bytes
+        percentage = (difference_bytes / original_bytes) * 100
+        
+        if difference_bytes > 0:
+            print(f"Space Saved  : {format_bytes(difference_bytes)} ({percentage:.2f}% reduction)")
+        else:
+            print(f"Size Increase: {format_bytes(abs(difference_bytes))} ({abs(percentage):.2f}% increase)")
+    print("-------------------------")
+
+
 def find_video_files(input_path, recursive):
     """Finds all video files in a given path."""
     video_files = []
@@ -77,13 +108,20 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
     print("\nExecuting FFmpeg command:")
     cmd_str = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd)
     print(cmd_str)
+    
+    original_size = os.path.getsize(source_file) if os.path.exists(source_file) else None
+
     print("\n------------------------- FFmpeg Output -------------------------")
     try:
         process = subprocess.run(cmd, check=True)
         print("-----------------------------------------------------------------")
-        print(f"\nSuccessfully created '{cmd[-1]}'.")
         
-        # --- NEW: Delete source file if the flag is set and transcode was successful ---
+        output_file = cmd[-1]
+        print(f"\nSuccessfully created '{output_file}'.")
+        
+        new_size = os.path.getsize(output_file) if os.path.exists(output_file) else None
+        print_size_summary(original_size, new_size)
+        
         if delete_source:
             print(f"\nInfo: --delete flag is set. Deleting source file...")
             try:
@@ -101,7 +139,6 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
         sys.exit(1)
 
 # --- Main Logic ---
-
 def main():
     """Parses arguments and performs media operations."""
     print(f"hvec v{__version__}")
@@ -190,7 +227,7 @@ Examples:
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
-        elif args.less_noise:
+        elif args.less-noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-i', input_file])
         if args.subs:
@@ -224,13 +261,11 @@ Examples:
             ffmpeg_cmd.extend(['-c:s', 'copy'])
         ffmpeg_cmd.append(output_file)
         
-        # --- Execute or Print Command ---
         if args.dry_run:
             print_ffmpeg_command(ffmpeg_cmd)
             if args.delete:
                 print(f"Info: Source file '{input_file}' would be deleted upon success.")
         else:
-            # Pass the original input_file path and the delete flag to the function
             run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete)
 
     print("\n--- All tasks complete. ---")
