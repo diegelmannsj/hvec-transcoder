@@ -9,17 +9,20 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "4.0"
+__version__ = "5.0"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v4.0: Re-implemented critical fix for the --delete flag.
-      - Removed the non-interactive (-n/-y) flags from v4.0-beta.
-      - A conversion is now only considered successful if FFmpeg exits
-        cleanly AND the output file can be successfully verified by FFprobe.
-      - This prevents the source file from being deleted if the output
-        is corrupt or was not created (e.g., user cancels overwrite).
+v5.0: Added interactive Stream Filtering mode (-k, --filter-streams).
+      - Script now uses ffprobe to analyze input file streams.
+      - Displays a summary of which audio/subtitle tracks will be kept or
+        removed based on language (eng) and title (commentary, director).
+      - Prompts the user for confirmation before processing.
+      - Dynamically builds the FFmpeg map command based on the selection.
+v4.0: CRITICAL FIX for the --delete flag. Added ffprobe validation to
+      prevent deleting the source on a failed/corrupt conversion. Reverted
+      non-interactive flags and restored default ffmpeg behavior.
 v3.9: Fixed a crash (AttributeError) caused by a typo when checking the
       --less-noise argument.
 v3.8: Added a file size summary after successful operations.
@@ -30,6 +33,77 @@ v3.7: Added -D/--delete flag.
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
 # --- Helper Functions ---
+
+def get_stream_info(file_path):
+    """Uses ffprobe to get structured information about all streams in a file."""
+    ffprobe_cmd = [
+        'ffprobe', '-v', 'quiet', '-print_format', 'json',
+        '-show_streams', file_path
+    ]
+    try:
+        result = subprocess.run(ffprobe_cmd, check=True, capture_output=True, text=True)
+        return json.loads(result.stdout).get('streams', [])
+    except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError):
+        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr)
+        return None
+
+def plan_stream_selection(streams):
+    """Determines which streams to keep or remove based on defined criteria."""
+    streams_to_keep = []
+    streams_to_remove = []
+    for s in streams:
+        keep_stream = False
+        stream_type = s.get('codec_type')
+        tags = s.get('tags', {})
+        lang = tags.get('language', 'und').lower()
+        title = tags.get('title', '').lower()
+
+        if stream_type == 'video':
+            keep_stream = True
+        elif stream_type == 'audio':
+            if lang == 'eng' or 'commentary' in title or 'director' in title:
+                keep_stream = True
+        elif stream_type == 'subtitle':
+            if lang == 'eng':
+                keep_stream = True
+
+        if keep_stream:
+            streams_to_keep.append(s)
+        else:
+            streams_to_remove.append(s)
+    return streams_to_keep, streams_to_remove
+
+def display_and_confirm_plan(streams_to_keep, streams_to_remove):
+    """Displays the stream selection plan and asks the user for confirmation."""
+    print("\n--- Stream Selection Plan ---")
+    print("The following streams will be KEPT:")
+    if not streams_to_keep:
+        print("  - None")
+    for s in streams_to_keep:
+        stype = s.get('codec_type', 'unknown').capitalize()
+        lang = s.get('tags', {}).get('language', 'und')
+        title = s.get('tags', {}).get('title')
+        title_str = f" - Title: {title}" if title else ""
+        print(f"  - Stream #{s['index']} ({stype}): Lang: {lang}{title_str}")
+
+    print("\nThe following streams will be REMOVED:")
+    if not streams_to_remove:
+        print("  - None")
+    for s in streams_to_remove:
+        stype = s.get('codec_type', 'unknown').capitalize()
+        lang = s.get('tags', {}).get('language', 'und')
+        title = s.get('tags', {}).get('title')
+        title_str = f" - Title: {title}" if title else ""
+        print(f"  - Stream #{s['index']} ({stype}): Lang: {lang}{title_str}")
+    
+    print("-----------------------------")
+    try:
+        choice = input("Proceed with this selection? [y/N]: ").lower().strip()
+        return choice == 'y'
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.")
+        return False
+
 
 def format_bytes(size_bytes):
     """Converts a byte value into a human-readable string (KB, MB, GB)."""
@@ -45,15 +119,12 @@ def print_size_summary(original_bytes, new_bytes):
     """Calculates and prints a summary of the file size change."""
     if original_bytes is None or new_bytes is None:
         return
-
     print("\n--- File Size Summary ---")
     print(f"Original Size: {format_bytes(original_bytes)}")
     print(f"New Size     : {format_bytes(new_bytes)}")
-
     if original_bytes > 0:
         difference_bytes = original_bytes - new_bytes
         percentage = (difference_bytes / original_bytes) * 100
-        
         if difference_bytes > 0:
             print(f"Space Saved  : {format_bytes(difference_bytes)} ({percentage:.2f}% reduction)")
         else:
@@ -106,13 +177,9 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
 
     print("\n------------------------- FFmpeg Output -------------------------")
     try:
-        # Step 1: Run FFmpeg. check=True will raise an error if it fails for any reason.
         subprocess.run(cmd, check=True)
         print("-----------------------------------------------------------------")
-        
         output_file = cmd[-1]
-
-        # Step 2: Verify the output file is a valid media file using FFprobe.
         try:
             ffprobe_cmd = ['ffprobe', '-v', 'error', output_file]
             subprocess.run(ffprobe_cmd, check=True, capture_output=True)
@@ -120,13 +187,9 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
             print(f"\nError: FFmpeg finished, but output file '{output_file}' appears to be invalid or corrupt.", file=sys.stderr)
             print("Source file was NOT deleted.")
             sys.exit(1)
-
-        # If both FFmpeg and FFprobe checks pass, we can consider it a success.
         print(f"\nSuccessfully created and verified '{output_file}'.")
-        
         new_size = os.path.getsize(output_file) if os.path.exists(output_file) else None
         print_size_summary(original_size, new_size)
-        
         if delete_source:
             print(f"\nInfo: --delete flag is set. Deleting source file...")
             try:
@@ -134,7 +197,6 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
                 print(f"Successfully deleted: {source_file}")
             except OSError as e:
                 print(f"\nError: Could not delete source file '{source_file}'. Reason: {e}", file=sys.stderr)
-
     except FileNotFoundError:
         print("\nError: 'ffmpeg' or 'ffprobe' not found. Is FFmpeg installed and in your PATH?", file=sys.stderr)
         sys.exit(1)
@@ -158,16 +220,17 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
-  # Transcode a file and delete the original (will fail if output exists)
-  ,hvec -i "My Movie.mp4" -D
+  # Transcode a file, intelligently keeping only English/Commentary tracks
+  ,hvec -i "My Movie.mkv" -k
 
-  # Transcode all videos in a folder and delete the originals
-  ,hvec -i /path/to/videos/ -D
+  # Transcode a directory, deleting originals, and filtering all files
+  ,hvec -i /path/to/videos/ -D -k
 """
     )
     # --- All Arguments Defined Here ---
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
     parser.add_argument("-o", "--output", help="Output MKV file. If specified, name sanitization is skipped.")
+    parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter audio/subtitle streams to keep English and commentary tracks.")
     parser.add_argument("-D", "--delete", action="store_true", help="Delete the original input file after a successful transcode.")
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
@@ -229,6 +292,7 @@ Examples:
                 sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
                 output_file = sanitized_base_name + ".mkv"
         
+        # --- COMMAND BUILDING LOGIC ---
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
@@ -237,18 +301,34 @@ Examples:
         
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-i', input_file])
 
-        if args.subs:
+        # --- STREAM MAPPING LOGIC ---
+        if args.filter_streams:
+            all_streams = get_stream_info(input_file)
+            if all_streams is None:
+                continue # Skip file if ffprobe fails
+            
+            streams_to_keep, streams_to_remove = plan_stream_selection(all_streams)
+            
+            if not display_and_confirm_plan(streams_to_keep, streams_to_remove):
+                print("Skipping file as per user request.")
+                continue # Skip to the next file
+                
+            # Build map commands from the approved list
+            for stream in streams_to_keep:
+                ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
+        
+        elif args.subs: # Legacy external sub mapping
             if len(files_to_process) > 1:
                 print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
             else:
                 if not os.path.exists(args.subs):
                     print(f"Error: Subtitle file not found: '{args.subs}'", file=sys.stderr)
                     continue
-                ffmpeg_cmd.extend(['-i', args.subs])
-        if args.subs and len(files_to_process) == 1:
-            ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '1:s:0'])
-        else:
+                ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a?', '-map', '1:s:0'])
+        else: # Default behavior: map all streams
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
+
+        # --- CODEC AND OUTPUT LOGIC ---
         if args.remux and not args.hvec:
             print("Mode: Lossless Remux")
             ffmpeg_cmd.extend(['-c', 'copy'])
