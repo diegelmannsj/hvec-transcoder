@@ -9,20 +9,17 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "5.0"
+__version__ = "5.1"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v5.0: Added interactive Stream Filtering mode (-k, --filter-streams).
-      - Script now uses ffprobe to analyze input file streams.
-      - Displays a summary of which audio/subtitle tracks will be kept or
-        removed based on language (eng) and title (commentary, director).
-      - Prompts the user for confirmation before processing.
-      - Dynamically builds the FFmpeg map command based on the selection.
+v5.1: Changed default output name for single files to include the .CONV
+      suffix, matching the behavior of batch mode for consistency.
+v5.0: Added interactive Stream Filtering mode (-k, --filter-streams) with
+      user confirmation to keep/remove tracks based on language and title.
 v4.0: CRITICAL FIX for the --delete flag. Added ffprobe validation to
-      prevent deleting the source on a failed/corrupt conversion. Reverted
-      non-interactive flags and restored default ffmpeg behavior.
+      prevent deleting the source on a failed/corrupt conversion.
 v3.9: Fixed a crash (AttributeError) caused by a typo when checking the
       --less-noise argument.
 v3.8: Added a file size summary after successful operations.
@@ -272,6 +269,7 @@ Examples:
             continue
 
         output_file = ""
+        # --- THE CHANGE IS HERE ---
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
             sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
@@ -290,7 +288,8 @@ Examples:
             else:
                 base_name, _ = os.path.splitext(input_file)
                 sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
-                output_file = sanitized_base_name + ".mkv"
+                # Add .CONV suffix to single files as well for consistency
+                output_file = sanitized_base_name + ".CONV.mkv"
         
         # --- COMMAND BUILDING LOGIC ---
         ffmpeg_cmd = ['ffmpeg']
@@ -305,19 +304,18 @@ Examples:
         if args.filter_streams:
             all_streams = get_stream_info(input_file)
             if all_streams is None:
-                continue # Skip file if ffprobe fails
+                continue 
             
             streams_to_keep, streams_to_remove = plan_stream_selection(all_streams)
             
             if not display_and_confirm_plan(streams_to_keep, streams_to_remove):
                 print("Skipping file as per user request.")
-                continue # Skip to the next file
+                continue
                 
-            # Build map commands from the approved list
             for stream in streams_to_keep:
                 ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
         
-        elif args.subs: # Legacy external sub mapping
+        elif args.subs: 
             if len(files_to_process) > 1:
                 print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
             else:
@@ -325,7 +323,7 @@ Examples:
                     print(f"Error: Subtitle file not found: '{args.subs}'", file=sys.stderr)
                     continue
                 ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a?', '-map', '1:s:0'])
-        else: # Default behavior: map all streams
+        else:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
 
         # --- CODEC AND OUTPUT LOGIC ---
