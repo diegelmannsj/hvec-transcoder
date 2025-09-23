@@ -1,6 +1,6 @@
 # ,hvec - A QSV HEVC Transcoder
 
-A simple yet powerful command-line wrapper for FFmpeg to simplify transcoding video files to the modern HEVC (H.265) codec, using Intel's Quick Sync Video (QSV) for fast, hardware-accelerated performance.
+A simple yet powerful command-line wrapper for FFmpeg to simplify transcoding video files to the modern HEVC (H.265) codec, using Intel's Quick Sync Video (QSV) for fast, hardware-accelerated performance. And yes, the name of the script (,hvec) is from a typo of HVEC (and the comma is intentional, as I use it for all of my scripts)
 
 This script is designed for media library management, allowing for easy, high-quality conversions to save space while maintaining visual fidelity.
 ## Features
