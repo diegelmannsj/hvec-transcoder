@@ -9,11 +9,13 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "5.2"
+# --- MODIFICATION START ---
+__version__ = "5.3"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.3: Use .REMUX.mkv suffix for --remux operations instead of .CONV.mkv.
 v5.2: Modified --subs to accept multiple files and set language metadata.
 v5.1: Changed default output name for single files to include the .CONV
       suffix, matching the behavior of batch mode for consistency.
@@ -26,6 +28,7 @@ v3.9: Fixed a crash (AttributeError) caused by a typo when checking the
 v3.8: Added a file size summary after successful operations.
 v3.7: Added -D/--delete flag.
 """
+# --- MODIFICATION END ---
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
@@ -207,7 +210,8 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
 # --- Main Logic ---
 def main():
     """Parses arguments and performs media operations."""
-    print(f"hvec v{__version__}")
+    # This print statement has been moved to after argument parsing
+    # based on a user preference from a previous session.
 
     if '-v' in sys.argv or '--version' in sys.argv:
         print(VERSION_HISTORY)
@@ -232,10 +236,7 @@ Examples:
     parser.add_argument("-D", "--delete", action="store_true", help="Delete the original input file after a successful transcode.")
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
-    # --- MODIFICATION START ---
-    # Changed --subs to accept multiple arguments
     parser.add_argument("-s", "--subs", nargs='+', help="One or more external subtitle files to embed (e.g. --subs sub1.srt sub2.srt).")
-    # --- MODIFICATION END ---
     parser.add_argument("-H", "--hvec", action="store_true", help="Force output to be HEVC/H.265. Overrides --remux.")
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set QSV quality for video (1-51, lower is better). Default: 24.")
     parser.add_argument("-p", "--preset", type=str, default='medium',
@@ -243,7 +244,7 @@ Examples:
                         help="Set QSV encoding preset. Slower presets offer better compression. Default: medium.")
     parser.add_argument("--acodec", help="Re-encode audio to a specific codec (e.g., aac, ac3). Default: copy.")
     parser.add_argument("--abitrate", help="Set audio bitrate when re-encoding (e.g., 192k, 384k).")
-    parser.add_argument("--skip-hevc", action="store_true", help="In batch mode, skip transcoding files that are already H.256/HEVC.")
+    parser.add_argument("--skip-hevc", action="store_true", help="In batch mode, skip transcoding files that are already H.265/HEVC.")
     parser.add_argument("--dry-run", action="store_true", help="Print the FFmpeg commands without executing them.")
     parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux instead of transcoding.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress most FFmpeg output. Overrides --less-noise.")
@@ -252,6 +253,9 @@ Examples:
 
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
+
+    # Per user preference, print version first, always.
+    print(f"hvec v{__version__}")
 
     files_to_process = []
     if not os.path.exists(args.input):
@@ -273,11 +277,17 @@ Examples:
             continue
 
         output_file = ""
-        # --- THE CHANGE IS HERE ---
+        # --- MODIFICATION START ---
+        # Determine the correct suffix based on whether --remux is used
+        suffix = ".REMUX.mkv" if args.remux else ".CONV.mkv"
+        # --- MODIFICATION END ---
+        
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
             sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
-            new_filename = sanitized_base_name + ".CONV.mkv"
+            # --- MODIFICATION START ---
+            new_filename = sanitized_base_name + suffix
+            # --- MODIFICATION END ---
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
                 output_dir = os.path.join(args.out_dir, relative_path)
@@ -292,8 +302,9 @@ Examples:
             else:
                 base_name, _ = os.path.splitext(input_file)
                 sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
-                # Add .CONV suffix to single files as well for consistency
-                output_file = sanitized_base_name + ".CONV.mkv"
+                # --- MODIFICATION START ---
+                output_file = sanitized_base_name + suffix
+                # --- MODIFICATION END ---
         
         # --- COMMAND BUILDING LOGIC ---
         ffmpeg_cmd = ['ffmpeg']
@@ -319,8 +330,6 @@ Examples:
             for stream in streams_to_keep:
                 ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
         
-        # --- MODIFICATION START ---
-        # Updated subtitle logic to handle multiple files and add metadata
         elif args.subs:
             if len(files_to_process) > 1:
                 print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
@@ -349,7 +358,6 @@ Examples:
                     ffmpeg_cmd.extend(['-map', f'{i+1}:s:0'])
                     # Set language metadata for each corresponding output subtitle stream
                     ffmpeg_cmd.extend([f'-metadata:s:s:{i}', 'language=eng'])
-        # --- MODIFICATION END ---
         else:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
 
@@ -374,13 +382,10 @@ Examples:
             else:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
             
-            # --- MODIFICATION START ---
-            # Set subtitle codec for transcoding as well
             if args.subs:
                 ffmpeg_cmd.extend(['-c:s', 'srt'])
             else:
                 ffmpeg_cmd.extend(['-c:s', 'copy'])
-            # --- MODIFICATION END ---
             
         ffmpeg_cmd.append(output_file)
         
