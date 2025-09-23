@@ -9,11 +9,12 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "5.1"
+__version__ = "5.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.2: Modified --subs to accept multiple files and set language metadata.
 v5.1: Changed default output name for single files to include the .CONV
       suffix, matching the behavior of batch mode for consistency.
 v5.0: Added interactive Stream Filtering mode (-k, --filter-streams) with
@@ -231,7 +232,10 @@ Examples:
     parser.add_argument("-D", "--delete", action="store_true", help="Delete the original input file after a successful transcode.")
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
-    parser.add_argument("-s", "--subs", help="(Optional) External subtitle file to embed (single file mode only).")
+    # --- MODIFICATION START ---
+    # Changed --subs to accept multiple arguments
+    parser.add_argument("-s", "--subs", nargs='+', help="One or more external subtitle files to embed (e.g. --subs sub1.srt sub2.srt).")
+    # --- MODIFICATION END ---
     parser.add_argument("-H", "--hvec", action="store_true", help="Force output to be HEVC/H.265. Overrides --remux.")
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set QSV quality for video (1-51, lower is better). Default: 24.")
     parser.add_argument("-p", "--preset", type=str, default='medium',
@@ -239,7 +243,7 @@ Examples:
                         help="Set QSV encoding preset. Slower presets offer better compression. Default: medium.")
     parser.add_argument("--acodec", help="Re-encode audio to a specific codec (e.g., aac, ac3). Default: copy.")
     parser.add_argument("--abitrate", help="Set audio bitrate when re-encoding (e.g., 192k, 384k).")
-    parser.add_argument("--skip-hevc", action="store_true", help="In batch mode, skip transcoding files that are already H.265/HEVC.")
+    parser.add_argument("--skip-hevc", action="store_true", help="In batch mode, skip transcoding files that are already H.256/HEVC.")
     parser.add_argument("--dry-run", action="store_true", help="Print the FFmpeg commands without executing them.")
     parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux instead of transcoding.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress most FFmpeg output. Overrides --less-noise.")
@@ -315,14 +319,37 @@ Examples:
             for stream in streams_to_keep:
                 ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
         
-        elif args.subs: 
+        # --- MODIFICATION START ---
+        # Updated subtitle logic to handle multiple files and add metadata
+        elif args.subs:
             if len(files_to_process) > 1:
                 print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
+                # Fallback to default stream mapping if subs are ignored in batch mode
+                ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
             else:
-                if not os.path.exists(args.subs):
-                    print(f"Error: Subtitle file not found: '{args.subs}'", file=sys.stderr)
+                # Check if all subtitle files exist first
+                all_subs_exist = True
+                for sub_file in args.subs:
+                    if not os.path.exists(sub_file):
+                        print(f"Error: Subtitle file not found: '{sub_file}'", file=sys.stderr)
+                        all_subs_exist = False
+                if not all_subs_exist:
                     continue
-                ffmpeg_cmd.extend(['-i', args.subs, '-map', '0:v:0', '-map', '0:a?', '-map', '1:s:0'])
+
+                # Add all subtitle files as new inputs
+                for sub_file in args.subs:
+                    ffmpeg_cmd.extend(['-i', sub_file])
+                
+                # Map video and audio from the primary input file
+                ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
+
+                # Map each subtitle stream from its respective input
+                for i in range(len(args.subs)):
+                    # Video is input 0, subs start at input 1, 2, 3...
+                    ffmpeg_cmd.extend(['-map', f'{i+1}:s:0'])
+                    # Set language metadata for each corresponding output subtitle stream
+                    ffmpeg_cmd.extend([f'-metadata:s:s:{i}', 'language=eng'])
+        # --- MODIFICATION END ---
         else:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
 
@@ -330,6 +357,9 @@ Examples:
         if args.remux and not args.hvec:
             print("Mode: Lossless Remux")
             ffmpeg_cmd.extend(['-c', 'copy'])
+            # If we added external subs during remux, we need to set their codec
+            if args.subs:
+                ffmpeg_cmd.extend(['-c:s', 'srt'])
         else:
             if args.hvec:
                 print("\nMode: QSV Transcode (Forced by -H/--hvec flag)")
@@ -343,7 +373,15 @@ Examples:
                     ffmpeg_cmd.extend(['-b:a', args.abitrate])
             else:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
-            ffmpeg_cmd.extend(['-c:s', 'copy'])
+            
+            # --- MODIFICATION START ---
+            # Set subtitle codec for transcoding as well
+            if args.subs:
+                ffmpeg_cmd.extend(['-c:s', 'srt'])
+            else:
+                ffmpeg_cmd.extend(['-c:s', 'copy'])
+            # --- MODIFICATION END ---
+            
         ffmpeg_cmd.append(output_file)
         
         if args.dry_run:
