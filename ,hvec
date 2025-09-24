@@ -10,11 +10,12 @@ import argcomplete
 
 # --- Version History ---
 # --- MODIFICATION START ---
-__version__ = "5.5"
+__version__ = "5.6"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.6: Reworked filename suffix logic to handle all cases correctly.
 v5.5: Prevent adding .REMUX suffix to filenames that already contain .CONV.
 v5.4: Filename sanitization now also replaces underscores (_) with periods.
 v5.3: Use .REMUX.mkv suffix for --remux operations instead of .CONV.mkv.
@@ -35,7 +36,7 @@ v3.7: Added -D/--delete flag.
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
-# --- Helper Functions --- (Functions are unchanged)
+# --- Helper Functions --- (Unchanged)
 
 def get_stream_info(file_path):
     """Uses ffprobe to get structured information about all streams in a file."""
@@ -276,16 +277,23 @@ Examples:
             continue
 
         output_file = ""
-        suffix = ".REMUX.mkv" if args.remux else ".CONV.mkv"
         
+        # --- MODIFICATION START ---
+        # Reworked the entire filename generation logic
+        def generate_output_filename(base_name, is_remux):
+            sanitized_base = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
+            
+            suffix_part = ".REMUX" if is_remux else ".CONV"
+            
+            if sanitized_base.endswith(suffix_part):
+                return sanitized_base + '.mkv'
+            else:
+                return sanitized_base + suffix_part + '.mkv'
+
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
-            # --- MODIFICATION START ---
-            # Remove .CONV suffix before adding a new suffix if it exists
-            base_name = base_name.removesuffix('.CONV')
-            # --- MODIFICATION END ---
-            sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
-            new_filename = sanitized_base_name + suffix
+            new_filename = generate_output_filename(base_name, args.remux)
+            
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
                 output_dir = os.path.join(args.out_dir, relative_path)
@@ -299,12 +307,8 @@ Examples:
                 output_file = args.output
             else:
                 base_name, _ = os.path.splitext(input_file)
-                # --- MODIFICATION START ---
-                # Remove .CONV suffix before adding a new suffix if it exists
-                base_name = base_name.removesuffix('.CONV')
-                # --- MODIFICATION END ---
-                sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
-                output_file = sanitized_base_name + suffix
+                output_file = generate_output_filename(base_name, args.remux)
+        # --- MODIFICATION END ---
         
         # --- COMMAND BUILDING LOGIC (Unchanged) ---
         ffmpeg_cmd = ['ffmpeg']
