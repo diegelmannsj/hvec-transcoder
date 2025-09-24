@@ -9,12 +9,22 @@ import math
 import argcomplete
 
 # --- Version History ---
-# --- MODIFICATION START ---
-__version__ = "5.9"
+__version__ = "5.9.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.9.4: FIX: Corrected an AttributeError typo from 'args.skip-hevc' to
+      'args.skip_hevc'.
+v5.9.3: FIX: Overhauled QSV initialization with -init_hw_device and an explicit
+      filter chain (format=qsv,vpp_qsv) as a final attempt to resolve
+      persistent hardware pipeline errors.
+v5.9.2: FIX: Reworked the QSV command by adding -hwaccel_output_format to
+      ensure video frames remain on the GPU, solving persistent hardware
+      pipeline errors during transcoding.
+v5.9.1: FIX: Added vpp_qsv filter to transcoding to prevent hardware pixel
+      format incompatibility errors, especially when decoding HEVC for
+      AV1 encoding.
 v5.9: Added AV1 encoding support (--av1 flag) using av1_qsv. Modes (--av1,
       --hvec, --remux) are now mutually exclusive. Filename suffix logic
       is updated to handle the new AV1 tag correctly.
@@ -32,12 +42,11 @@ v5.1: Changed default output name for single files to include the .CONV
       suffix, matching the behavior of batch mode for consistency.
 v5.0: Added interactive Stream Filtering mode (-k, --filter-streams).
 """
-# --- MODIFICATION END ---
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
-# --- Helper Functions --- (Unchanged)
+# --- Helper Functions ---
 def get_stream_info(file_path):
     """Uses ffprobe to get structured information about all streams in a file."""
     ffprobe_cmd = [
@@ -273,12 +282,10 @@ Examples:
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
     parser.add_argument("-s", "--subs", nargs='+', help="One or more external subtitle files to embed (e.g. --subs sub1.srt sub2.srt).")
-    # --- MODIFICATION START ---
     mode_group = parser.add_argument_group('Operation Modes (choose one)')
     mode_group.add_argument("--av1", action="store_true", help="Transcode video to AV1 using QSV.")
     mode_group.add_argument("-H", "--hvec", action="store_true", help="Force output to be HEVC/H.265 (default transcode behavior).")
     mode_group.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux instead of transcoding.")
-    # --- MODIFICATION END ---
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set QSV quality for video (1-51, lower is better). Default: 24.")
     parser.add_argument("-p", "--preset", type=str, default='medium',
                         choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'],
@@ -297,13 +304,10 @@ Examples:
     # Per user preference, print version first, always.
     print(f"hvec v{__version__}")
 
-    # --- MODIFICATION START ---
-    # Argument conflict validation
     mode_flags = [args.av1, args.hvec, args.remux]
     if sum(mode_flags) > 1:
         print("Error: --av1, --hvec, and --remux are mutually exclusive. Please choose only one.", file=sys.stderr)
         sys.exit(1)
-    # --- MODIFICATION END ---
 
     files_to_process = []
     if not os.path.exists(args.input):
@@ -324,8 +328,6 @@ Examples:
             print("Video is already HEVC. Skipping.")
             continue
 
-        # --- MODIFICATION START ---
-        # Determine operation mode
         op_mode = 'conv' # default (HEVC)
         if args.av1:
             op_mode = 'av1'
@@ -336,7 +338,6 @@ Examples:
             """Generates an output filename, replacing any existing process tags."""
             sanitized_base = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
             
-            # Remove any known suffixes to prevent duplication like file.CONV.AV1.mkv
             known_suffixes = ['.CONV', '.REMUX', '.AV1']
             for s in known_suffixes:
                 if sanitized_base.upper().endswith(s):
@@ -351,14 +352,11 @@ Examples:
                 suffix_part = ".CONV"
             
             return sanitized_base + suffix_part + '.mkv'
-        # --- MODIFICATION END ---
 
         output_file = ""
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
-            # --- MODIFICATION START ---
             new_filename = generate_output_filename(base_name, op_mode)
-            # --- MODIFICATION END ---
             
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
@@ -373,9 +371,7 @@ Examples:
                 output_file = args.output
             else:
                 base_name, _ = os.path.splitext(input_file)
-                # --- MODIFICATION START ---
                 output_file = generate_output_filename(base_name, op_mode)
-                # --- MODIFICATION END ---
         
         # --- COMMAND BUILDING LOGIC ---
         ffmpeg_cmd = ['ffmpeg']
@@ -384,9 +380,19 @@ Examples:
         elif args.less_noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
         
-        ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-i', input_file])
+        # For transcoding, we set up the most robust and explicit QSV pipeline possible.
+        if not args.remux:
+             ffmpeg_cmd.extend([
+                '-init_hw_device', 'qsv=hw',
+                '-filter_hw_device', 'hw',
+                '-hwaccel', 'qsv',
+                '-hwaccel_output_format', 'qsv'
+             ])
+        
+        ffmpeg_cmd.extend(['-i', input_file])
 
-        # --- STREAM MAPPING LOGIC (Unchanged) ---
+
+        # --- STREAM MAPPING LOGIC ---
         if args.filter_streams:
             all_streams = get_stream_info(input_file)
             if all_streams is None:
@@ -426,7 +432,6 @@ Examples:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
 
         # --- CODEC AND OUTPUT LOGIC ---
-        # --- MODIFICATION START ---
         if args.remux:
             print("Mode: Lossless Remux")
             ffmpeg_cmd.extend(['-c', 'copy'])
@@ -443,7 +448,10 @@ Examples:
                 else:
                     print("\nMode: QSV Transcode (HEVC)")
                 video_codec = 'hevc_qsv'
-
+            
+            # The filterchain must now also be explicitly told about the hardware frames.
+            ffmpeg_cmd.extend(['-vf', 'format=qsv,vpp_qsv=format=nv12'])
+            
             ffmpeg_cmd.extend(['-c:v', video_codec, '-preset', args.preset, '-global_quality', str(args.quality)])
             
             if args.acodec:
@@ -458,7 +466,6 @@ Examples:
                 ffmpeg_cmd.extend(['-c:s', 'srt'])
             else:
                 ffmpeg_cmd.extend(['-c:s', 'copy'])
-        # --- MODIFICATION END ---
             
         ffmpeg_cmd.append(output_file)
         
