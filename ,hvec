@@ -10,11 +10,14 @@ import argcomplete
 
 # --- Version History ---
 # --- MODIFICATION START ---
-__version__ = "5.8"
+__version__ = "5.9"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.9: Added AV1 encoding support (--av1 flag) using av1_qsv. Modes (--av1,
+      --hvec, --remux) are now mutually exclusive. Filename suffix logic
+      is updated to handle the new AV1 tag correctly.
 v5.8: Added a handler for Ctrl+C (KeyboardInterrupt) to exit gracefully
       without deleting the source file.
 v5.7: CRITICAL FIX: Replaced ffmpeg -n flag with a robust 3-point check
@@ -177,28 +180,24 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
     output_file = cmd[-1]
     original_size = os.path.getsize(source_file) if os.path.exists(source_file) else None
     
-    # Get the original modification time of the output file if it exists
     original_mtime = None
     if os.path.exists(output_file):
         try:
             original_mtime = os.path.getmtime(output_file)
         except OSError:
-            pass # File could be deleted between check and getmtime, fail gracefully
+            pass 
 
     print("\n------------------------- FFmpeg Output -------------------------")
     try:
-        # Run ffmpeg. check=True will catch explicit errors from ffmpeg.
         subprocess.run(cmd, check=True)
         print("-----------------------------------------------------------------")
         
         # --- Start of 3-Point Safety Check ---
-        # 1. Check for EXISTENCE of the output file
         if not os.path.exists(output_file):
             print(f"\nError: FFmpeg finished, but output file '{output_file}' was not created.", file=sys.stderr)
             print("Source file was NOT deleted.")
             sys.exit(1)
             
-        # 2. Check for MODIFICATION. This catches the 'n' to overwrite case.
         if original_mtime is not None:
             try:
                 new_mtime = os.path.getmtime(output_file)
@@ -211,7 +210,6 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
                 print("Source file was NOT deleted.")
                 sys.exit(1)
 
-        # 3. Check for VALIDITY of the output file
         try:
             ffprobe_cmd = ['ffprobe', '-v', 'error', output_file]
             subprocess.run(ffprobe_cmd, check=True, capture_output=True)
@@ -219,10 +217,8 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
             print(f"\nError: FFmpeg finished, but output file '{output_file}' appears to be invalid or corrupt.", file=sys.stderr)
             print("Source file was NOT deleted.")
             sys.exit(1)
-        
         # --- End of 3-Point Safety Check ---
 
-        # If all checks pass, we can declare success and proceed.
         print(f"\nSuccessfully created and verified '{output_file}'.")
         new_size = os.path.getsize(output_file) if os.path.exists(output_file) else None
         print_size_summary(original_size, new_size)
@@ -243,14 +239,11 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
         print(f"\nError: FFmpeg failed with exit code {e.returncode}.", file=sys.stderr)
         print("Source file was NOT deleted.")
         sys.exit(1)
-    # --- MODIFICATION START ---
-    # Added a specific handler for Ctrl+C to exit cleanly.
     except KeyboardInterrupt:
         print("\n-----------------------------------------------------------------")
         print("\nOperation cancelled by user (Ctrl+C).")
         print("Source file was NOT deleted.")
         sys.exit(1)
-    # --- MODIFICATION END ---
 
 
 # --- Main Logic ---
@@ -265,10 +258,10 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
-  # Transcode a file, intelligently keeping only English/Commentary tracks
-  ,hvec -i "My Movie.mkv" -k
+  # Transcode a file to AV1, intelligently keeping only English/Commentary tracks
+  ,hvec -i "My Movie.mkv" --av1 -k
 
-  # Transcode a directory, deleting originals, and filtering all files
+  # Transcode a directory to HEVC, deleting originals, and filtering all files
   ,hvec -i /path/to/videos/ -D -k
 """
     )
@@ -280,7 +273,12 @@ Examples:
     parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
     parser.add_argument("-s", "--subs", nargs='+', help="One or more external subtitle files to embed (e.g. --subs sub1.srt sub2.srt).")
-    parser.add_argument("-H", "--hvec", action="store_true", help="Force output to be HEVC/H.265. Overrides --remux.")
+    # --- MODIFICATION START ---
+    mode_group = parser.add_argument_group('Operation Modes (choose one)')
+    mode_group.add_argument("--av1", action="store_true", help="Transcode video to AV1 using QSV.")
+    mode_group.add_argument("-H", "--hvec", action="store_true", help="Force output to be HEVC/H.265 (default transcode behavior).")
+    mode_group.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux instead of transcoding.")
+    # --- MODIFICATION END ---
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set QSV quality for video (1-51, lower is better). Default: 24.")
     parser.add_argument("-p", "--preset", type=str, default='medium',
                         choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'],
@@ -289,7 +287,6 @@ Examples:
     parser.add_argument("--abitrate", help="Set audio bitrate when re-encoding (e.g., 192k, 384k).")
     parser.add_argument("--skip-hevc", action="store_true", help="In batch mode, skip transcoding files that are already H.265/HEVC.")
     parser.add_argument("--dry-run", action="store_true", help="Print the FFmpeg commands without executing them.")
-    parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux instead of transcoding.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress most FFmpeg output. Overrides --less-noise.")
     parser.add_argument("--less-noise", action="store_true", help="Show progress updates only every 30 seconds.")
     parser.add_argument("-v", "--version", action="store_true", help="Show the version history and exit.")
@@ -299,6 +296,14 @@ Examples:
 
     # Per user preference, print version first, always.
     print(f"hvec v{__version__}")
+
+    # --- MODIFICATION START ---
+    # Argument conflict validation
+    mode_flags = [args.av1, args.hvec, args.remux]
+    if sum(mode_flags) > 1:
+        print("Error: --av1, --hvec, and --remux are mutually exclusive. Please choose only one.", file=sys.stderr)
+        sys.exit(1)
+    # --- MODIFICATION END ---
 
     files_to_process = []
     if not os.path.exists(args.input):
@@ -319,21 +324,41 @@ Examples:
             print("Video is already HEVC. Skipping.")
             continue
 
-        output_file = ""
-        
-        def generate_output_filename(base_name, is_remux):
+        # --- MODIFICATION START ---
+        # Determine operation mode
+        op_mode = 'conv' # default (HEVC)
+        if args.av1:
+            op_mode = 'av1'
+        elif args.remux:
+            op_mode = 'remux'
+
+        def generate_output_filename(base_name, mode):
+            """Generates an output filename, replacing any existing process tags."""
             sanitized_base = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
             
-            suffix_part = ".REMUX" if is_remux else ".CONV"
+            # Remove any known suffixes to prevent duplication like file.CONV.AV1.mkv
+            known_suffixes = ['.CONV', '.REMUX', '.AV1']
+            for s in known_suffixes:
+                if sanitized_base.upper().endswith(s):
+                    sanitized_base = sanitized_base[:-len(s)]
+                    break 
             
-            if sanitized_base.endswith(suffix_part):
-                return sanitized_base + '.mkv'
-            else:
-                return sanitized_base + suffix_part + '.mkv'
+            if mode == 'av1':
+                suffix_part = ".AV1"
+            elif mode == 'remux':
+                suffix_part = ".REMUX"
+            else: # 'conv'
+                suffix_part = ".CONV"
+            
+            return sanitized_base + suffix_part + '.mkv'
+        # --- MODIFICATION END ---
 
+        output_file = ""
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
-            new_filename = generate_output_filename(base_name, args.remux)
+            # --- MODIFICATION START ---
+            new_filename = generate_output_filename(base_name, op_mode)
+            # --- MODIFICATION END ---
             
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
@@ -348,7 +373,9 @@ Examples:
                 output_file = args.output
             else:
                 base_name, _ = os.path.splitext(input_file)
-                output_file = generate_output_filename(base_name, args.remux)
+                # --- MODIFICATION START ---
+                output_file = generate_output_filename(base_name, op_mode)
+                # --- MODIFICATION END ---
         
         # --- COMMAND BUILDING LOGIC ---
         ffmpeg_cmd = ['ffmpeg']
@@ -398,18 +425,27 @@ Examples:
         else:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
 
-        # --- CODEC AND OUTPUT LOGIC (Unchanged) ---
-        if args.remux and not args.hvec:
+        # --- CODEC AND OUTPUT LOGIC ---
+        # --- MODIFICATION START ---
+        if args.remux:
             print("Mode: Lossless Remux")
             ffmpeg_cmd.extend(['-c', 'copy'])
             if args.subs:
                 ffmpeg_cmd.extend(['-c:s', 'srt'])
-        else:
-            if args.hvec:
-                print("\nMode: QSV Transcode (Forced by -H--hvec flag)")
-            else:
-                print("\nMode: QSV Transcode")
-            ffmpeg_cmd.extend(['-c:v', 'hevc_qsv', '-preset', args.preset, '-global_quality', str(args.quality)])
+        else: # Transcoding mode (AV1 or HEVC)
+            video_codec = ''
+            if args.av1:
+                print("\nMode: QSV Transcode (AV1)")
+                video_codec = 'av1_qsv'
+            else: # Default is HEVC
+                if args.hvec:
+                    print("\nMode: QSV Transcode (HEVC - Forced)")
+                else:
+                    print("\nMode: QSV Transcode (HEVC)")
+                video_codec = 'hevc_qsv'
+
+            ffmpeg_cmd.extend(['-c:v', video_codec, '-preset', args.preset, '-global_quality', str(args.quality)])
+            
             if args.acodec:
                 print(f"Re-encoding audio to {args.acodec.upper()}")
                 ffmpeg_cmd.extend(['-c:a', args.acodec])
@@ -422,6 +458,7 @@ Examples:
                 ffmpeg_cmd.extend(['-c:s', 'srt'])
             else:
                 ffmpeg_cmd.extend(['-c:s', 'copy'])
+        # --- MODIFICATION END ---
             
         ffmpeg_cmd.append(output_file)
         
