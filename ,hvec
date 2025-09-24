@@ -10,11 +10,12 @@ import argcomplete
 
 # --- Version History ---
 # --- MODIFICATION START ---
-__version__ = "5.4"
+__version__ = "5.5"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.5: Prevent adding .REMUX suffix to filenames that already contain .CONV.
 v5.4: Filename sanitization now also replaces underscores (_) with periods.
 v5.3: Use .REMUX.mkv suffix for --remux operations instead of .CONV.mkv.
 v5.2: Modified --subs to accept multiple files and set language metadata.
@@ -34,7 +35,7 @@ v3.7: Added -D/--delete flag.
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
-# --- Helper Functions --- (Functions are unchanged, keeping them for completeness)
+# --- Helper Functions --- (Functions are unchanged)
 
 def get_stream_info(file_path):
     """Uses ffprobe to get structured information about all streams in a file."""
@@ -280,8 +281,10 @@ Examples:
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
             # --- MODIFICATION START ---
-            sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
+            # Remove .CONV suffix before adding a new suffix if it exists
+            base_name = base_name.removesuffix('.CONV')
             # --- MODIFICATION END ---
+            sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
             new_filename = sanitized_base_name + suffix
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
@@ -297,8 +300,10 @@ Examples:
             else:
                 base_name, _ = os.path.splitext(input_file)
                 # --- MODIFICATION START ---
-                sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
+                # Remove .CONV suffix before adding a new suffix if it exists
+                base_name = base_name.removesuffix('.CONV')
                 # --- MODIFICATION END ---
+                sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
                 output_file = sanitized_base_name + suffix
         
         # --- COMMAND BUILDING LOGIC (Unchanged) ---
