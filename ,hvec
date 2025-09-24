@@ -9,39 +9,28 @@ import math
 import argcomplete
 
 # --- Version History ---
-__version__ = "5.9.4"
+# --- MODIFICATION START ---
+__version__ = "5.9.5"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.9.5: FIX: Use -qsv_params for AV1 quality setting on builds that do not
+      support the -global_quality flag for av1_qsv.
 v5.9.4: FIX: Corrected an AttributeError typo from 'args.skip-hevc' to
       'args.skip_hevc'.
 v5.9.3: FIX: Overhauled QSV initialization with -init_hw_device and an explicit
       filter chain (format=qsv,vpp_qsv) as a final attempt to resolve
       persistent hardware pipeline errors.
 v5.9.2: FIX: Reworked the QSV command by adding -hwaccel_output_format to
-      ensure video frames remain on the GPU, solving persistent hardware
-      pipeline errors during transcoding.
+      ensure video frames remain on the GPU.
 v5.9.1: FIX: Added vpp_qsv filter to transcoding to prevent hardware pixel
-      format incompatibility errors, especially when decoding HEVC for
-      AV1 encoding.
+      format incompatibility errors.
 v5.9: Added AV1 encoding support (--av1 flag) using av1_qsv. Modes (--av1,
-      --hvec, --remux) are now mutually exclusive. Filename suffix logic
-      is updated to handle the new AV1 tag correctly.
-v5.8: Added a handler for Ctrl+C (KeyboardInterrupt) to exit gracefully
-      without deleting the source file.
-v5.7: CRITICAL FIX: Replaced ffmpeg -n flag with a robust 3-point check
-      (existence, modification, validity) before deleting a source file to
-      prevent data loss on a failed overwrite.
-v5.6: Reworked filename suffix logic to handle all cases correctly.
-v5.5: Prevent adding .REMUX suffix to filenames that already contain .CONV.
-v5.4: Filename sanitization now also replaces underscores (_) with periods.
-v5.3: Use .REMUX.mkv suffix for --remux operations instead of .CONV.mkv.
-v5.2: Modified --subs to accept multiple files and set language metadata.
-v5.1: Changed default output name for single files to include the .CONV
-      suffix, matching the behavior of batch mode for consistency.
-v5.0: Added interactive Stream Filtering mode (-k, --filter-streams).
+      --hvec, --remux) are now mutually exclusive.
 """
+# --- MODIFICATION END ---
+
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
@@ -108,7 +97,7 @@ def display_and_confirm_plan(streams_to_keep, streams_to_remove):
         title = s.get('tags', {}).get('title')
         title_str = f" - Title: {title}" if title else ""
         print(f"  - Stream #{s['index']} ({stype}): Lang: {lang}{title_str}")
-    
+
     print("-----------------------------")
     try:
         choice = input("Proceed with this selection? [y/N]: ").lower().strip()
@@ -185,28 +174,28 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
     print("\nExecuting FFmpeg command:")
     cmd_str = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd)
     print(cmd_str)
-    
+
     output_file = cmd[-1]
     original_size = os.path.getsize(source_file) if os.path.exists(source_file) else None
-    
+
     original_mtime = None
     if os.path.exists(output_file):
         try:
             original_mtime = os.path.getmtime(output_file)
         except OSError:
-            pass 
+            pass
 
     print("\n------------------------- FFmpeg Output -------------------------")
     try:
         subprocess.run(cmd, check=True)
         print("-----------------------------------------------------------------")
-        
+
         # --- Start of 3-Point Safety Check ---
         if not os.path.exists(output_file):
             print(f"\nError: FFmpeg finished, but output file '{output_file}' was not created.", file=sys.stderr)
             print("Source file was NOT deleted.")
             sys.exit(1)
-            
+
         if original_mtime is not None:
             try:
                 new_mtime = os.path.getmtime(output_file)
@@ -231,7 +220,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
         print(f"\nSuccessfully created and verified '{output_file}'.")
         new_size = os.path.getsize(output_file) if os.path.exists(output_file) else None
         print_size_summary(original_size, new_size)
-        
+
         if delete_source:
             print(f"\nInfo: --delete flag is set. Deleting source file...")
             try:
@@ -323,7 +312,7 @@ Examples:
 
     for i, input_file in enumerate(files_to_process, 1):
         print(f"\n--- Processing file {i}/{len(files_to_process)}: {os.path.basename(input_file)} ---")
-        
+
         if args.skip_hevc and is_hevc(input_file):
             print("Video is already HEVC. Skipping.")
             continue
@@ -337,27 +326,27 @@ Examples:
         def generate_output_filename(base_name, mode):
             """Generates an output filename, replacing any existing process tags."""
             sanitized_base = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
-            
+
             known_suffixes = ['.CONV', '.REMUX', '.AV1']
             for s in known_suffixes:
                 if sanitized_base.upper().endswith(s):
                     sanitized_base = sanitized_base[:-len(s)]
-                    break 
-            
+                    break
+
             if mode == 'av1':
                 suffix_part = ".AV1"
             elif mode == 'remux':
                 suffix_part = ".REMUX"
             else: # 'conv'
                 suffix_part = ".CONV"
-            
+
             return sanitized_base + suffix_part + '.mkv'
 
         output_file = ""
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
             new_filename = generate_output_filename(base_name, op_mode)
-            
+
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
                 output_dir = os.path.join(args.out_dir, relative_path)
@@ -372,14 +361,14 @@ Examples:
             else:
                 base_name, _ = os.path.splitext(input_file)
                 output_file = generate_output_filename(base_name, op_mode)
-        
+
         # --- COMMAND BUILDING LOGIC ---
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
         elif args.less_noise:
             ffmpeg_cmd.extend(['-stats_period', '30'])
-        
+
         # For transcoding, we set up the most robust and explicit QSV pipeline possible.
         if not args.remux:
              ffmpeg_cmd.extend([
@@ -388,7 +377,7 @@ Examples:
                 '-hwaccel', 'qsv',
                 '-hwaccel_output_format', 'qsv'
              ])
-        
+
         ffmpeg_cmd.extend(['-i', input_file])
 
 
@@ -396,17 +385,17 @@ Examples:
         if args.filter_streams:
             all_streams = get_stream_info(input_file)
             if all_streams is None:
-                continue 
-            
+                continue
+
             streams_to_keep, streams_to_remove = plan_stream_selection(all_streams)
-            
+
             if not display_and_confirm_plan(streams_to_keep, streams_to_remove):
                 print("Skipping file as per user request.")
                 continue
-                
+
             for stream in streams_to_keep:
                 ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
-        
+
         elif args.subs:
             if len(files_to_process) > 1:
                 print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
@@ -422,7 +411,7 @@ Examples:
 
                 for sub_file in args.subs:
                     ffmpeg_cmd.extend(['-i', sub_file])
-                
+
                 ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
 
                 for i in range(len(args.subs)):
@@ -438,22 +427,28 @@ Examples:
             if args.subs:
                 ffmpeg_cmd.extend(['-c:s', 'srt'])
         else: # Transcoding mode (AV1 or HEVC)
-            video_codec = ''
+            # --- MODIFICATION START ---
             if args.av1:
                 print("\nMode: QSV Transcode (AV1)")
                 video_codec = 'av1_qsv'
+                # Use -qsv_params for AV1 as -global_quality is unsupported on this build
+                quality_params = ['-qsv_params', f'RateControlMethod=ICQ:ICQQuality={args.quality}']
             else: # Default is HEVC
                 if args.hvec:
                     print("\nMode: QSV Transcode (HEVC - Forced)")
                 else:
                     print("\nMode: QSV Transcode (HEVC)")
                 video_codec = 'hevc_qsv'
-            
+                # HEVC works fine with the standard -global_quality flag
+                quality_params = ['-global_quality', str(args.quality)]
+
             # The filterchain must now also be explicitly told about the hardware frames.
             ffmpeg_cmd.extend(['-vf', 'format=qsv,vpp_qsv=format=nv12'])
-            
-            ffmpeg_cmd.extend(['-c:v', video_codec, '-preset', args.preset, '-global_quality', str(args.quality)])
-            
+
+            ffmpeg_cmd.extend(['-c:v', video_codec, '-preset', args.preset])
+            ffmpeg_cmd.extend(quality_params) # Add the correct quality params for the chosen codec
+            # --- MODIFICATION END ---
+
             if args.acodec:
                 print(f"Re-encoding audio to {args.acodec.upper()}")
                 ffmpeg_cmd.extend(['-c:a', args.acodec])
@@ -461,14 +456,14 @@ Examples:
                     ffmpeg_cmd.extend(['-b:a', args.abitrate])
             else:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
-            
+
             if args.subs:
                 ffmpeg_cmd.extend(['-c:s', 'srt'])
             else:
                 ffmpeg_cmd.extend(['-c:s', 'copy'])
-            
+
         ffmpeg_cmd.append(output_file)
-        
+
         if args.dry_run:
             print_ffmpeg_command(ffmpeg_cmd)
             if args.delete:
