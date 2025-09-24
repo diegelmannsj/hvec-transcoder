@@ -10,18 +10,19 @@ import argcomplete
 
 # --- Version History ---
 # --- MODIFICATION START ---
-__version__ = "5.9.5"
+__version__ = "5.9.6"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.9.6: FIX: Switched AV1 rate control to CQP mode to match FFmpeg build's
+      supported method, resolving final "unsupported parameter" error.
 v5.9.5: FIX: Use -qsv_params for AV1 quality setting on builds that do not
       support the -global_quality flag for av1_qsv.
 v5.9.4: FIX: Corrected an AttributeError typo from 'args.skip-hevc' to
       'args.skip_hevc'.
 v5.9.3: FIX: Overhauled QSV initialization with -init_hw_device and an explicit
-      filter chain (format=qsv,vpp_qsv) as a final attempt to resolve
-      persistent hardware pipeline errors.
+      filter chain (format=qsv,vpp_qsv).
 v5.9.2: FIX: Reworked the QSV command by adding -hwaccel_output_format to
       ensure video frames remain on the GPU.
 v5.9.1: FIX: Added vpp_qsv filter to transcoding to prevent hardware pixel
@@ -431,8 +432,9 @@ Examples:
             if args.av1:
                 print("\nMode: QSV Transcode (AV1)")
                 video_codec = 'av1_qsv'
-                # Use -qsv_params for AV1 as -global_quality is unsupported on this build
-                quality_params = ['-qsv_params', f'RateControlMethod=ICQ:ICQQuality={args.quality}']
+                # This build requires CQP rate control for AV1. Set QPI/P/B to the user's quality value.
+                q_val = args.quality
+                quality_params = ['-qsv_params', f'RateControlMethod=CQP:QPI={q_val}:QPP={q_val}:QPB={q_val}']
             else: # Default is HEVC
                 if args.hvec:
                     print("\nMode: QSV Transcode (HEVC - Forced)")
