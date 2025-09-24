@@ -10,11 +10,12 @@ import argcomplete
 
 # --- Version History ---
 # --- MODIFICATION START ---
-__version__ = "5.3"
+__version__ = "5.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.4: Filename sanitization now also replaces underscores (_) with periods.
 v5.3: Use .REMUX.mkv suffix for --remux operations instead of .CONV.mkv.
 v5.2: Modified --subs to accept multiple files and set language metadata.
 v5.1: Changed default output name for single files to include the .CONV
@@ -33,7 +34,7 @@ v3.7: Added -D/--delete flag.
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
-# --- Helper Functions ---
+# --- Helper Functions --- (Functions are unchanged, keeping them for completeness)
 
 def get_stream_info(file_path):
     """Uses ffprobe to get structured information about all streams in a file."""
@@ -210,9 +211,6 @@ def run_ffmpeg_command(cmd, source_file, delete_source):
 # --- Main Logic ---
 def main():
     """Parses arguments and performs media operations."""
-    # This print statement has been moved to after argument parsing
-    # based on a user preference from a previous session.
-
     if '-v' in sys.argv or '--version' in sys.argv:
         print(VERSION_HISTORY)
         sys.exit(0)
@@ -277,17 +275,14 @@ Examples:
             continue
 
         output_file = ""
-        # --- MODIFICATION START ---
-        # Determine the correct suffix based on whether --remux is used
         suffix = ".REMUX.mkv" if args.remux else ".CONV.mkv"
-        # --- MODIFICATION END ---
         
         if len(files_to_process) > 1: # Batch mode
             base_name, _ = os.path.splitext(os.path.basename(input_file))
-            sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
             # --- MODIFICATION START ---
-            new_filename = sanitized_base_name + suffix
+            sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
             # --- MODIFICATION END ---
+            new_filename = sanitized_base_name + suffix
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input)
                 output_dir = os.path.join(args.out_dir, relative_path)
@@ -301,12 +296,12 @@ Examples:
                 output_file = args.output
             else:
                 base_name, _ = os.path.splitext(input_file)
-                sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.')
                 # --- MODIFICATION START ---
-                output_file = sanitized_base_name + suffix
+                sanitized_base_name = base_name.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
                 # --- MODIFICATION END ---
+                output_file = sanitized_base_name + suffix
         
-        # --- COMMAND BUILDING LOGIC ---
+        # --- COMMAND BUILDING LOGIC (Unchanged) ---
         ffmpeg_cmd = ['ffmpeg']
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
@@ -315,7 +310,7 @@ Examples:
         
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-i', input_file])
 
-        # --- STREAM MAPPING LOGIC ---
+        # --- STREAM MAPPING LOGIC (Unchanged) ---
         if args.filter_streams:
             all_streams = get_stream_info(input_file)
             if all_streams is None:
@@ -333,10 +328,8 @@ Examples:
         elif args.subs:
             if len(files_to_process) > 1:
                 print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
-                # Fallback to default stream mapping if subs are ignored in batch mode
                 ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
             else:
-                # Check if all subtitle files exist first
                 all_subs_exist = True
                 for sub_file in args.subs:
                     if not os.path.exists(sub_file):
@@ -345,27 +338,21 @@ Examples:
                 if not all_subs_exist:
                     continue
 
-                # Add all subtitle files as new inputs
                 for sub_file in args.subs:
                     ffmpeg_cmd.extend(['-i', sub_file])
                 
-                # Map video and audio from the primary input file
                 ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
 
-                # Map each subtitle stream from its respective input
                 for i in range(len(args.subs)):
-                    # Video is input 0, subs start at input 1, 2, 3...
                     ffmpeg_cmd.extend(['-map', f'{i+1}:s:0'])
-                    # Set language metadata for each corresponding output subtitle stream
                     ffmpeg_cmd.extend([f'-metadata:s:s:{i}', 'language=eng'])
         else:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
 
-        # --- CODEC AND OUTPUT LOGIC ---
+        # --- CODEC AND OUTPUT LOGIC (Unchanged) ---
         if args.remux and not args.hvec:
             print("Mode: Lossless Remux")
             ffmpeg_cmd.extend(['-c', 'copy'])
-            # If we added external subs during remux, we need to set their codec
             if args.subs:
                 ffmpeg_cmd.extend(['-c:s', 'srt'])
         else:
