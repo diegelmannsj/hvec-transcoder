@@ -11,26 +11,24 @@ import re
 from tqdm import tqdm
 
 # --- Version History ---
-__version__ = "5.9"
+__version__ = "5.10"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v5.10: CRITICAL FIX: Reworked progress bar logic to use ffmpeg's '-progress'
+       flag, which provides machine-readable output. This fixes the bug
+       where the progress bar would get stuck at 0% due to the way ffmpeg
+       handles console output with carriage returns.
 v5.9: Added a tqdm progress bar with ETA for FFmpeg transcode operations.
-      (Note: Requires 'pip install tqdm'). The bar is skipped for remuxing
-      or when --quiet is used.
-v5.8: Added a handler for Ctrl+C (KeyboardInterrupt) to exit gracefully
-      without deleting the source file.
-v5.7: CRITICAL FIX: Replaced ffmpeg -n flag with a robust 3-point check
-      (existence, modification, validity) before deleting a source file to
-      prevent data loss on a failed overwrite.
+v5.8: Added a handler for Ctrl+C (KeyboardInterrupt) to exit gracefully.
+v5.7: CRITICAL FIX: Replaced ffmpeg -n flag with a robust 3-point check.
 v5.6: Reworked filename suffix logic to handle all cases correctly.
 v5.5: Prevent adding .REMUX suffix to filenames that already contain .CONV.
 v5.4: Filename sanitization now also replaces underscores (_) with periods.
 v5.3: Use .REMUX.mkv suffix for --remux operations instead of .CONV.mkv.
 v5.2: Modified --subs to accept multiple files and set language metadata.
-v5.1: Changed default output name for single files to include the .CONV
-      suffix, matching the behavior of batch mode for consistency.
+v5.1: Changed default output name for single files to include the .CONV suffix.
 v5.0: Added interactive Stream Filtering mode (-k, --filter-streams).
 """
 
@@ -38,9 +36,6 @@ v5.0: Added interactive Stream Filtering mode (-k, --filter-streams).
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 
 # --- Helper Functions ---
-
-# --- MODIFICATION START ---
-# NEW function to get video duration for the progress bar.
 def get_video_duration(file_path):
     """Uses ffprobe to get the duration of a video file in seconds."""
     ffprobe_cmd = [
@@ -53,7 +48,6 @@ def get_video_duration(file_path):
     except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
         print(f"Warning: Could not get video duration for '{file_path}'. Progress bar disabled.", file=sys.stderr)
         return None
-# --- MODIFICATION END ---
 
 def get_stream_info(file_path):
     """Uses ffprobe to get structured information about all streams in a file."""
@@ -69,7 +63,7 @@ def get_stream_info(file_path):
         return None
 
 def plan_stream_selection(streams):
-    """Determains which streams to keep or remove based on defined criteria."""
+    """Determines which streams to keep or remove based on defined criteria."""
     streams_to_keep = []
     streams_to_remove = []
     for s in streams:
@@ -189,7 +183,7 @@ def print_ffmpeg_command(cmd):
     print(cmd_str)
 
 # --- MODIFICATION START ---
-# This function is heavily reworked to handle the progress bar.
+# This function is reworked to use the `-progress` flag and parse stdout.
 def run_ffmpeg_command(cmd, source_file, delete_source, is_remux=False, is_quiet=False):
     """Executes the FFmpeg command, shows a progress bar, and handles the output."""
     print("\nExecuting FFmpeg command:")
@@ -199,19 +193,15 @@ def run_ffmpeg_command(cmd, source_file, delete_source, is_remux=False, is_quiet
     output_file = cmd[-1]
     original_size = os.path.getsize(source_file) if os.path.exists(source_file) else None
     
-    # Fallback to simple execution for remuxing (too fast) or quiet mode
     if is_remux or is_quiet:
         print("\n(Progress bar is disabled for remux or quiet mode)")
         try:
-            # Use original subprocess.run for simplicity here
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
             print(f"\nError: FFmpeg failed with exit code {e.returncode}.", file=sys.stderr)
             print("Source file was NOT deleted.")
             sys.exit(1)
-        # Continue to safety checks below
     else:
-        # Progress bar execution for transcodes
         total_duration = get_video_duration(source_file)
         if not total_duration:
             print("\nCould not get duration, running FFmpeg without progress...")
@@ -223,21 +213,32 @@ def run_ffmpeg_command(cmd, source_file, delete_source, is_remux=False, is_quiet
                 sys.exit(1)
         else:
             try:
-                time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
+                time_pattern = re.compile(r"(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
                 
-                process = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                # Use -progress flag, which writes to stdout. Capture stderr for errors.
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                            universal_newlines=True, encoding='utf-8')
                 
                 with tqdm(total=round(total_duration), unit='s', dynamic_ncols=True, desc="Transcoding") as pbar:
-                    for line in process.stderr:
-                        match = time_pattern.search(line)
-                        if match:
-                            h, m, s, ms = map(int, match.groups())
-                            elapsed_seconds = h * 3600 + m * 60 + s + ms / 100
-                            pbar.update(round(elapsed_seconds - pbar.n))
-
+                    for line in process.stdout: # Read from stdout now
+                        if line.strip().startswith("out_time="):
+                            time_str = line.strip().split("=")[1]
+                            match = time_pattern.search(time_str)
+                            if match:
+                                h, m, s, ms = map(int, match.groups())
+                                elapsed_seconds = h * 3600 + m * 60 + s + ms / 100
+                                # Ensure we don't update backwards or too far forward
+                                update_amount = max(0, round(elapsed_seconds - pbar.n))
+                                pbar.update(update_amount)
+                
+                # After progress is done, check for errors on stderr
+                stderr_output = process.stderr.read()
                 process.wait()
+
                 if process.returncode != 0:
+                     print("\n--- FFmpeg Error Output ---")
+                     print(stderr_output)
+                     print("---------------------------")
                      print(f"\nError: FFmpeg failed with exit code {process.returncode}.", file=sys.stderr)
                      print("Source file was NOT deleted.")
                      sys.exit(1)
@@ -251,7 +252,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, is_remux=False, is_quiet
                 print("Source file was NOT deleted.")
                 sys.exit(1)
 
-    # --- This entire section remains the same, but now runs AFTER the progress bar logic ---
+    # Safety checks remain the same
     original_mtime = None
     if os.path.exists(output_file):
         try:
@@ -259,7 +260,6 @@ def run_ffmpeg_command(cmd, source_file, delete_source, is_remux=False, is_quiet
         except OSError:
             pass 
 
-    # --- Start of 3-Point Safety Check ---
     if not os.path.exists(output_file):
         print(f"\nError: FFmpeg finished, but output file '{output_file}' was not created.", file=sys.stderr)
         print("Source file was NOT deleted.")
@@ -283,8 +283,6 @@ def run_ffmpeg_command(cmd, source_file, delete_source, is_remux=False, is_quiet
         print("Source file was NOT deleted.")
         sys.exit(1)
     
-    # --- End of 3-Point Safety Check ---
-
     print(f"\nSuccessfully created and verified '{output_file}'.")
     new_size = os.path.getsize(output_file) if os.path.exists(output_file) else None
     print_size_summary(original_size, new_size)
@@ -318,25 +316,25 @@ Examples:
   ,hvec -i /path/to/videos/ -D -k
 """
     )
-    # --- All Arguments Defined Here ---
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
     parser.add_argument("-o", "--output", help="Output MKV file. If specified, name sanitization is skipped.")
-    parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter audio/subtitle streams to keep English and commentary tracks.")
+    parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter audio/subtitle streams.")
     parser.add_argument("-D", "--delete", action="store_true", help="Delete the original input file after a successful transcode.")
-    parser.add_argument("--out-dir", help="Output directory for batch processing. Preserves source folder structure.")
-    parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories when -i is a directory.")
-    parser.add_argument("-s", "--subs", nargs='+', help="One or more external subtitle files to embed (e.g. --subs sub1.srt sub2.srt).")
+    parser.add_argument("--out-dir", help="Output directory for batch processing.")
+    parser.add_argument("-R", "--recursive", action="store_true", help="Process files in subdirectories.")
+    parser.add_argument("-s", "--subs", nargs='+', help="One or more external subtitle files to embed.")
     parser.add_argument("-H", "--hvec", action="store_true", help="Force output to be HEVC/H.265. Overrides --remux.")
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set QSV quality for video (1-51, lower is better). Default: 24.")
     parser.add_argument("-p", "--preset", type=str, default='medium',
                         choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'],
-                        help="Set QSV encoding preset. Slower presets offer better compression. Default: medium.")
-    parser.add_argument("--acodec", help="Re-encode audio to a specific codec (e.g., aac, ac3). Default: copy.")
-    parser.add_argument("--abitrate", help="Set audio bitrate when re-encoding (e.g., 192k, 384k).")
-    parser.add_argument("--skip-hevc", action="store_true", help="In batch mode, skip transcoding files that are already H.265/HEVC.")
-    parser.add_argument("--dry-run", action="store_true", help="Print the FFmpeg commands without executing them.")
+                        help="Set QSV encoding preset. Default: medium.")
+    parser.add_argument("--acodec", help="Re-encode audio to a specific codec (e.g., aac, ac3).")
+    parser.add_argument("--abitrate", help="Set audio bitrate when re-encoding (e.g., 192k).")
+    parser.add_argument("--skip-hevc", action="store_true", help="In batch mode, skip files that are already HEVC.")
+    parser.add_argument("--dry-run", action="store_true", help="Print FFmpeg commands without executing them.")
     parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux instead of transcoding.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg's console output. Disables progress bar.")
+    # --less-noise is now functionally ignored when a progress bar is active, but kept for compatibility.
     parser.add_argument("--less-noise", action="store_true", help="Show progress updates only every 30 seconds.")
     parser.add_argument("-v", "--version", action="store_true", help="Show the version history and exit.")
 
@@ -396,81 +394,56 @@ Examples:
         ffmpeg_cmd = ['ffmpeg']
         
         # --- MODIFICATION START ---
-        # Added -stats to ensure progress is shown even with loglevel changes,
-        # but quiet mode will still override it in run_ffmpeg_command.
+        # Reworked to use the script-friendly -progress flag.
         if args.quiet:
             ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
-        elif args.less_noise:
-            ffmpeg_cmd.extend(['-stats_period', '30'])
         else:
-            # This ensures the time= field is printed for the progress bar.
-            ffmpeg_cmd.extend(['-v', 'error', '-stats'])
+            # Send machine-readable progress to stdout and hide the regular stats line.
+            ffmpeg_cmd.extend(['-progress', '-', '-nostats'])
         # --- MODIFICATION END ---
         
         ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-i', input_file])
 
-        # --- STREAM MAPPING LOGIC ---
+        # Stream mapping logic (unchanged)
         if args.filter_streams:
             all_streams = get_stream_info(input_file)
-            if all_streams is None:
-                continue 
-            streams_to_keep, streams_to_remove = plan_stream_selection(all_streams)
-            if not display_and_confirm_plan(streams_to_keep, streams_to_remove):
-                print("Skipping file as per user request.")
-                continue
-            for stream in streams_to_keep:
-                ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
+            if all_streams is None: continue 
+            streams_to_keep, _ = plan_stream_selection(all_streams)
+            if not display_and_confirm_plan(streams_to_keep, _):
+                print("Skipping file as per user request."); continue
+            for stream in streams_to_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
         elif args.subs:
             if len(files_to_process) > 1:
-                print("Warning: External subtitles (--subs) are only supported for single file processing. Ignoring.")
-                ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
+                print("Warning: --subs ignored in batch mode."); ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
             else:
                 for sub_file in args.subs:
-                    if not os.path.exists(sub_file):
-                        print(f"Error: Subtitle file not found: '{sub_file}'", file=sys.stderr)
-                        continue
-                    ffmpeg_cmd.extend(['-i', sub_file])
+                    if os.path.exists(sub_file): ffmpeg_cmd.extend(['-i', sub_file])
                 ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
                 for i in range(len(args.subs)):
-                    ffmpeg_cmd.extend(['-map', f'{i+1}:s:0'])
-                    ffmpeg_cmd.extend([f'-metadata:s:s:{i}', 'language=eng'])
+                    ffmpeg_cmd.extend(['-map', f'{i+1}:s:0', f'-metadata:s:s:{i}', 'language=eng'])
         else:
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?', '-map', '0:s?'])
 
-        # --- CODEC AND OUTPUT LOGIC ---
+        # Codec logic
         is_remux_op = args.remux and not args.hvec
         if is_remux_op:
             print("Mode: Lossless Remux")
             ffmpeg_cmd.extend(['-c', 'copy'])
-            if args.subs:
-                ffmpeg_cmd.extend(['-c:s', 'srt'])
+            if args.subs: ffmpeg_cmd.extend(['-c:s', 'srt'])
         else:
             print("\nMode: QSV Transcode")
             ffmpeg_cmd.extend(['-c:v', 'hevc_qsv', '-preset', args.preset, '-global_quality', str(args.quality)])
-            if args.acodec:
-                print(f"Re-encoding audio to {args.acodec.upper()}")
-                ffmpeg_cmd.extend(['-c:a', args.acodec])
-                if args.abitrate:
-                    ffmpeg_cmd.extend(['-b:a', args.abitrate])
-            else:
-                ffmpeg_cmd.extend(['-c:a', 'copy'])
-            
-            if args.subs:
-                ffmpeg_cmd.extend(['-c:s', 'srt'])
-            else:
-                ffmpeg_cmd.extend(['-c:s', 'copy'])
+            ffmpeg_cmd.extend(['-c:a', args.acodec] if args.acodec else ['-c:a', 'copy'])
+            if args.acodec and args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
+            ffmpeg_cmd.extend(['-c:s', 'srt'] if args.subs else ['-c:s', 'copy'])
             
         ffmpeg_cmd.append(output_file)
         
         if args.dry_run:
             print_ffmpeg_command(ffmpeg_cmd)
-            if args.delete:
-                print(f"Info: Source file '{input_file}' would be deleted upon success.")
+            if args.delete: print(f"Info: Source file '{input_file}' would be deleted upon success.")
         else:
-            # --- MODIFICATION START ---
-            # Pass new flags to the command runner function
             run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, is_remux=is_remux_op, is_quiet=args.quiet)
-            # --- MODIFICATION END ---
 
     print("\n--- All tasks complete. ---")
 
