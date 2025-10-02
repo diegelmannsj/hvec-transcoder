@@ -240,7 +240,12 @@ def main():
                 output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
                 output_file = os.path.join(output_dir, new_filename)
             else: output_file = os.path.join(os.path.dirname(input_file), new_filename)
-        
+            # Prevent overwriting the source if generated output name is the same
+        if os.path.abspath(output_file) == os.path.abspath(input_file):
+            base, ext = os.path.splitext(output_file)
+            output_file = f"{base}.COPY{ext}"
+            print(f"Info: Input and output filenames are identical. New output will be '{os.path.basename(output_file)}'")
+                    
         if os.path.exists(output_file) and not args.dry_run:
             try:
                 if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y':
