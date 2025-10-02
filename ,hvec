@@ -12,11 +12,15 @@ import shutil
 from tqdm import tqdm
 
 # --- Version History ---
-__version__ = "6.0"
+__version__ = "6.1"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v6.1: Fixed a bug in the file size summary where values would not appear.
+      - Replaced format_bytes and print_size_summary functions with more
+        robust versions that handle all cases correctly.
+      - Summary now shows Original, New, and Difference for better clarity.
 v6.0: Rebuilt the progress bar feature from the ground up, starting from the
       stable v5.8 baseline. This version implements the definitive progress
       bar using the best tools discovered during previous debugging:
@@ -84,16 +88,42 @@ def display_and_confirm_plan(s_keep, s_rem):
     try: return input("Proceed? [y/N]: ").lower().strip() == 'y'
     except KeyboardInterrupt: return False
 
-def format_bytes(b):
-    if b is None or b == 0: return "0B"; n = ("B", "KB", "MB", "GB", "TB"); i = int(math.floor(math.log(b, 1024))); p = math.pow(1024, i); s = round(b / p, 2); return f"{s} {n[i]}"
+def format_size(size_bytes):
+    """Converts a size in bytes to a human-readable string using binary prefixes."""
+    if size_bytes is None or not isinstance(size_bytes, (int, float)) or size_bytes < 0:
+        return "N/A"
+    if size_bytes == 0:
+        return "0 B"
+    size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
+    try:
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        if i >= len(size_name):
+            i = len(size_name) - 1
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return f"{s} {size_name[i]}"
+    except (ValueError, TypeError):
+        return "N/A"
 
-def print_size_summary(orig_b, new_b):
-    if orig_b is None or new_b is None: return
-    print(f"\n--- File Size Summary ---\nOriginal: {format_bytes(orig_b)}\nNew:      {format_bytes(new_b)}")
-    if orig_b > 0:
-        diff = orig_b - new_b; perc = (diff / orig_b) * 100
-        if diff > 0: print(f"Saved:    {format_bytes(diff)} ({perc:.2f}% reduction)")
-        else: print(f"Increase: {format_bytes(abs(diff))} ({abs(perc):.2f}% increase)")
+def print_size_summary(original_size_bytes, new_size_bytes):
+    """Prints a formatted summary of the file size change."""
+    print("\n--- File Size Summary ---")
+    original_size_str = format_size(original_size_bytes)
+    new_size_str = format_size(new_size_bytes)
+    
+    print(f"Original:   {original_size_str}")
+    print(f"New:        {new_size_str}")
+
+    if original_size_bytes is not None and new_size_bytes is not None and original_size_bytes > 0:
+        difference_bytes = new_size_bytes - original_size_bytes
+        percentage_change = (difference_bytes / original_size_bytes) * 100
+        change_type = "increase" if difference_bytes >= 0 else "decrease"
+        difference_str = format_size(abs(difference_bytes))
+        
+        print(f"Difference: {difference_str} ({abs(percentage_change):.2f}% {change_type})")
+    else:
+        print("Difference: N/A")
+        
     print("-------------------------")
 
 def find_video_files(p, r):
@@ -113,7 +143,8 @@ def print_ffmpeg_command(cmd): print("\nExecuting FFmpeg command (Dry Run):"); p
 def run_ffmpeg_command(cmd, source_file, delete_source, total_frames=None):
     """Executes FFmpeg, showing a progress bar, and handling output."""
     print("\nExecuting FFmpeg command:"); print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
-    output_file = cmd[-1]; original_size = os.path.getsize(source_file) if os.path.exists(source_file) else None
+    output_file = cmd[-1]
+    original_size_bytes = os.path.getsize(source_file) if os.path.exists(source_file) else None
     
     # If progress flags aren't in the command, run simply.
     if "-progress" not in cmd:
@@ -143,11 +174,13 @@ def run_ffmpeg_command(cmd, source_file, delete_source, total_frames=None):
 
     # Post-run safety checks
     if not os.path.exists(output_file): print(f"\nError: Output file not created.", file=sys.stderr); sys.exit(1)
-    try: subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
+    try:
+        new_size_bytes = os.path.getsize(output_file)
+        subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
     except Exception: print(f"\nError: Output file appears to be invalid.", file=sys.stderr); sys.exit(1)
     
     print(f"\nSuccessfully created and verified '{output_file}'.")
-    print_size_summary(original_size, os.path.getsize(output_file))
+    print_size_summary(original_size_bytes, new_size_bytes)
     
     if delete_source:
         print(f"\nInfo: --delete flag is set. Deleting source file...")
