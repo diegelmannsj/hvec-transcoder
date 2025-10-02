@@ -17,6 +17,9 @@ __version__ = "6.1"
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v6.2: - Implemented a check to compare the generated output filename against the input filename.
+      - If the names are identical (e.g., re-remuxing a .REMUX file), the script now automatically inserts ".COPY" before the file extension of the output file.
+      - This prevents the script from attempting to overwrite its own source file and provides a clear indicator of the new file's identity.
 v6.1: Fixed a bug in the file size summary where values would not appear.
       - Replaced format_bytes and print_size_summary functions with more
         robust versions that handle all cases correctly.
