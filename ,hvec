@@ -12,11 +12,16 @@ import shutil
 from tqdm import tqdm
 
 # --- Version History ---
-__version__ = "6.1"
+__version__ = "6.3"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v6.3	fix(remux): Convert incompatible subtitles to SRT
+
+- Added `-c:s srt` to the remux command logic.
+- This fixes "Subtitle codec not supported" errors when remuxing MP4 files containing `tx3g` (Timed Text) subtitles into an MKV container.
+- The subtitles are now automatically converted to the compatible SRT format during the remux process.
 v6.2: - Implemented a check to compare the generated output filename against the input filename.
       - If the names are identical (e.g., re-remuxing a .REMUX file), the script now automatically inserts ".COPY" before the file extension of the output file.
       - This prevents the script from attempting to overwrite its own source file and provides a clear indicator of the new file's identity.
@@ -298,6 +303,7 @@ def main():
 
         if is_remux_op:
             print("Mode: Lossless Remux"); ffmpeg_cmd.extend(['-c', 'copy'])
+            ffmpeg_cmd.extend(['-c:s', 'srt'])
             if args.subs: ffmpeg_cmd.extend(['-c:s', 'srt'])
         else:
             print("\nMode: VAAPI Transcode")
