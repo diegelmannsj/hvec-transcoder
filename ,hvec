@@ -275,7 +275,11 @@ def main():
         # Use VAAPI, the proven fix for your hardware
         if not is_remux_op:
             ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
-        
+         # --- ADD THIS NEW BLOCK ---
+        # Fix for AVI containers with bad timestamps
+        if input_file.lower().endswith('.avi'):
+            ffmpeg_cmd.extend(['-fflags', '+genpts'])
+        # --- END OF NEW BLOCK ---      
         ffmpeg_cmd.extend(['-i', input_file])
         
         if args.filter_streams:
