@@ -13,466 +13,479 @@ from tqdm import tqdm
 import grp # Added for group name resolution
 
 # --- Version History ---
-__version__ = "6.5"
+__version__ = "6.10" [cite: 7]
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v6.6    fix(chapters): Use -map_metadata for chapter embedding
+v6.10   fix(chapters): Force ffmetadata parser for chapter input
 
-        - Replaced '-map 0' with '-map_metadata 0' to correctly
-          handle chapter files as metadata, not streams.
-        - Removed the invalid '-c:m copy' flag, resolving the
-          FFmpeg "Trailing garbage" error.
-        - The chapter feature is now fully functional.
+        - The chapter embedding was failing because FFmpeg was
+          incorrectly guessing the format of the input .txt file.
+        - The script now explicitly adds '-f ffmetadata' before
+          the chapter file input.
+        - This forces FFmpeg to use the correct parser, allowing
+          '-map_chapters 0' to find and embed the chapters.
 
-v6.5    feat(chapters): Add external chapter file embedding (--chapters/-C)
+v6.9    (Failed Fix) Replaced global -c copy with per-stream copy. [cite: 79]
+v6.8    (Failed Fix) Corrected default stream mapping. [cite: 77]
+v6.7    (Failed Fix) Used -map_chapters, but other logic was wrong. [cite: 74, 78]
+v6.6    (Failed Fix) Used -map_metadata. 
+v6.5    feat(chapters): Add external chapter file embedding (--chapters/-C) [cite: 8]
 
-        - Adds new '-C'/'--chapters' argument to embed an external chapter
-          file (TXT/XML) into the output.
-        - This is supported in single-file mode only.
-        - Updates FFmpeg command logic to add the chapter file as the first
-          input (input 0), shifting the main video to input 1.
-        - All stream mapping logic ('-map') is updated to use the new
-          dynamic index for video, audio, and subtitle streams.
-
-v6.4    feat(permissions): Implement permission handling and jellyfin group prompt 
+v6.4    feat(permissions): Implement permission handling and jellyfin group prompt [cite: 10]
 
         - The script now preserves the original file's permissions (owner, group,
-          and mode) and applies them to the output file by default. 
-        - Before processing, it checks if the input file's group is 'jellyfin'. 
+          and mode) and applies them to the output file by default. [cite: 10]
+        - Before processing, it checks if the input file's group is 'jellyfin'. [cite: 11]
         - If the group is NOT 'jellyfin', it interactively prompts the user, asking
-          if they want to change the output file's group to 'jellyfin'. 
+          if they want to change the output file's group to 'jellyfin'. [cite: 12]
         - The prompt defaults to 'Yes', so simply pressing Enter will apply the
-          'jellyfin' group. 
-v6.3	fix(remux): Convert incompatible subtitles to SRT 
+          'jellyfin' group. [cite: 13]
+v6.3	fix(remux): Convert incompatible subtitles to SRT [cite: 14]
 
-- Added `-c:s srt` to the remux command logic. 
-- This fixes "Subtitle codec not supported" errors when remuxing MP4 files containing `tx3g` (Timed Text) subtitles into an MKV container. 
-- The subtitles are now automatically converted to the compatible SRT format during the remux process. 
-v6.2: - Implemented a check to compare the generated output filename against the input filename. 
-- If the names are identical (e.g., re-remuxing a .REMUX file), the script now automatically inserts ".COPY" before the file extension of the output file. 
-- This prevents the script from attempting to overwrite its own source file and provides a clear indicator of the new file's identity. 
-v6.1: Fixed a bug in the file size summary where values would not appear. 
+- Added `-c:s srt` to the remux command logic. [cite: 14]
+- This fixes "Subtitle codec not supported" errors when remuxing MP4 files containing `tx3g` (Timed Text) subtitles into an MKV container. [cite: 15]
+- The subtitles are now automatically converted to the compatible SRT format during the remux process. [cite: 16]
+v6.2: - Implemented a check to compare the generated output filename against the input filename. [cite: 17]
+- If the names are identical (e.g., re-remuxing a .REMUX file), the script now automatically inserts ".COPY" before the file extension of the output file. [cite: 18]
+- This prevents the script from attempting to overwrite its own source file and provides a clear indicator of the new file's identity. [cite: 19]
+v6.1: Fixed a bug in the file size summary where values would not appear. [cite: 20]
 - Replaced format_bytes and print_size_summary functions with more
-        robust versions that handle all cases correctly. 
-- Summary now shows Original, New, and Difference for better clarity. 
+        robust versions that handle all cases correctly. [cite: 21]
+- Summary now shows Original, New, and Difference for better clarity. [cite: 22]
 v6.0: Rebuilt the progress bar feature from the ground up, starting from the
-      stable v5.8 baseline. 
+      stable v5.8 baseline. [cite: 23]
 This version implements the definitive progress
       bar using the best tools discovered during previous debugging:
       - `mediainfo` is the primary method for getting a fast, accurate
-        frame count, with a fallback to `ffprobe`. 
-- `tqdm` is used to display a clean, Python-native progress bar. 
+        frame count, with a fallback to `ffprobe`. [cite: 24]
+- `tqdm` is used to display a clean, Python-native progress bar. [cite: 25]
 - Incorporates critical fixes for hardware hangs (using VAAPI), I/O
-        buffering (using `stdbuf`), and overwrite stalls. 
-v5.8: Added a handler for Ctrl+C to exit gracefully. 
+        buffering (using `stdbuf`), and overwrite stalls. [cite: 26]
+v5.8: Added a handler for Ctrl+C to exit gracefully. [cite: 27]
 """
 # --- MODIFICATION END ---
 
 # --- Constants ---
-VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
+VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm') [cite: 7]
 
 # --- Helper Functions ---
-def get_total_frames(file_path):
-    """Gets total frames quickly using mediainfo (preferred) or falls back."""
-    # Method 1: mediainfo (fast and most reliable)
-    if shutil.which('mediainfo'):
-        cmd = ['mediainfo', '--Inform=Video;%FrameCount%', file_path]
-        try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            return int(result.stdout.strip()) 
-        except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
-            pass # Fall through to the next method
+def get_total_frames(file_path): [cite: 7]
+    """Gets total frames quickly using mediainfo (preferred) or falls back.""" [cite: 7]
+    # Method 1: mediainfo (fast and most reliable) 
+    if shutil.which('mediainfo'): [cite: 7]
+        cmd = ['mediainfo', '--Inform=Video;%FrameCount%', file_path] [cite: 7]
+        try: [cite: 7]
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True) [cite: 7]
+            return int(result.stdout.strip()) [cite: 28]
+        except (subprocess.CalledProcessError, ValueError, FileNotFoundError): [cite: 7]
+            pass # Fall through to the next method 
 
-    # Method 2: ffprobe (fast estimate, as a fallback)
-    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration,avg_frame_rate', '-of', 'json', file_path]
-    try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        data = json.loads(result.stdout)['streams'][0]
-        if 'duration' not in data or 'avg_frame_rate' not in data: return None 
-        duration, fr_str = float(data['duration']), data['avg_frame_rate']
-        if '/' in fr_str:
-            n, d = map(int, fr_str.split('/'));
-            frame_rate = n / d if d != 0 else 0 
-        else: frame_rate = float(fr_str)
-        if duration <= 0 or frame_rate <= 0: return None
-        return int(duration * frame_rate)
-    except Exception:
-        return None
+    # Method 2: ffprobe (fast estimate, as a fallback) 
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration,avg_frame_rate', '-of', 'json', file_path] [cite: 7]
+    try: [cite: 7]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True) [cite: 7]
+        data = json.loads(result.stdout)['streams'][0] [cite: 7]
+        if 'duration' not in data or 'avg_frame_rate' not in data: return None [cite: 29]
+        duration, fr_str = float(data['duration']), data['avg_frame_rate'] [cite: 7]
+        if '/' in fr_str: [cite: 7]
+            n, d = map(int, fr_str.split('/')); [cite: 7]
+            frame_rate = n / d if d != 0 else 0 [cite: 30]
+        else: frame_rate = float(fr_str) [cite: 7]
+        if duration <= 0 or frame_rate <= 0: return None [cite: 7]
+        return int(duration * frame_rate) [cite: 7]
+    except Exception: [cite: 7]
+        return None [cite: 7]
 
-def get_stream_info(file_path):
-    """Uses ffprobe to get structured information about all streams in a file."""
-    ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', file_path]
-    try:
-        result = subprocess.run(ffprobe_cmd, check=True, capture_output=True, text=True) 
-        return json.loads(result.stdout).get('streams', [])
-    except Exception:
-        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr)
-        return None
+def get_stream_info(file_path): [cite: 7]
+    """Uses ffprobe to get structured information about all streams in a file.""" [cite: 7]
+    ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', file_path] [cite: 7]
+    try: [cite: 7]
+        result = subprocess.run(ffprobe_cmd, check=True, capture_output=True, text=True) [cite: 31]
+        return json.loads(result.stdout).get('streams', []) [cite: 7]
+    except Exception: [cite: 7]
+        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr) [cite: 7]
+        return None [cite: 7]
 
-def plan_stream_selection(streams):
-    streams_to_keep, streams_to_remove = [], []
-    for s in streams:
-        keep = False;
-        stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); 
-        title = s.get('title', '').lower() 
-        if stype == 'video' or (stype == 'audio' and (lang == 'eng' or 'commentary' in title or 'director' in title)) or (stype == 'subtitle' and lang == 'eng'): keep = True
-        if keep: streams_to_keep.append(s)
-        else: streams_to_remove.append(s)
-    return streams_to_keep, streams_to_remove
+def plan_stream_selection(streams): [cite: 7]
+    streams_to_keep, streams_to_remove = [], [] [cite: 7]
+    for s in streams: [cite: 7]
+        keep = False; [cite: 7]
+        stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); [cite: 32]
+        title = s.get('title', '').lower() [cite: 33]
+        if stype == 'video' or (stype == 'audio' and (lang == 'eng' or 'commentary' in title or 'director' in title)) or (stype == 'subtitle' and lang == 'eng'): keep = True [cite: 7]
+        if keep: streams_to_keep.append(s) [cite: 7]
+        else: streams_to_remove.append(s) [cite: 7]
+    return streams_to_keep, streams_to_remove [cite: 7]
 
-def display_and_confirm_plan(s_keep, s_rem):
-    print("\n--- Stream Selection Plan ---\nKEPT:");
-    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep] 
-    print("\nREMOVED:");
-    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem] 
-    try: return input("Proceed? [y/N]: ").lower().strip() == 'y'
-    except KeyboardInterrupt: return False
+def display_and_confirm_plan(s_keep, s_rem): [cite: 7]
+    print("\n--- Stream Selection Plan ---\nKEPT:"); [cite: 7]
+    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep] [cite: 34]
+    print("\nREMOVED:"); [cite: 7]
+    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem] [cite: 35]
+    try: return input("Proceed? [y/N]: ").lower().strip() == 'y' [cite: 7]
+    except KeyboardInterrupt: return False [cite: 7]
 
-def format_size(size_bytes):
-    """Converts a size in bytes to a human-readable string using binary prefixes."""
-    if size_bytes is None or not isinstance(size_bytes, (int, float)) or size_bytes < 0:
-        return "N/A"
-    if size_bytes == 0:
-        return "0 B"
-    size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
-    try: 
-        i = int(math.floor(math.log(size_bytes, 1024)))
-        if i >= len(size_name):
-            i = len(size_name) - 1
-        p = math.pow(1024, i)
-        s = round(size_bytes / p, 2)
-        return f"{s} {size_name[i]}"
-    except (ValueError, TypeError):
-        return "N/A"
+def format_size(size_bytes): [cite: 7]
+    """Converts a size in bytes to a human-readable string using binary prefixes.""" [cite: 7]
+    if size_bytes is None or not isinstance(size_bytes, (int, float)) or size_bytes < 0: [cite: 7]
+        return "N/A" [cite: 7]
+    if size_bytes == 0: [cite: 7]
+        return "0 B" [cite: 7]
+    size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB") [cite: 7]
+    try: [cite: 36]
+        i = int(math.floor(math.log(size_bytes, 1024))) [cite: 7]
+        if i >= len(size_name): [cite: 7]
+            i = len(size_name) - 1 [cite: 7]
+        p = math.pow(1024, i) [cite: 7]
+        s = round(size_bytes / p, 2) [cite: 7]
+        return f"{s} {size_name[i]}" [cite: 7]
+    except (ValueError, TypeError): [cite: 7]
+        return "N/A" [cite: 7]
 
-def print_size_summary(original_size_bytes, new_size_bytes):
-    """Prints a formatted summary of the file size change.""" 
-    print("\n--- File Size Summary ---")
-    original_size_str = format_size(original_size_bytes)
-    new_size_str = format_size(new_size_bytes)
+def print_size_summary(original_size_bytes, new_size_bytes): [cite: 7]
+    """Prints a formatted summary 
+of the file size change.""" [cite: 37]
+    print("\n--- File Size Summary ---") [cite: 7]
+    original_size_str = format_size(original_size_bytes) [cite: 7]
+    new_size_str = format_size(new_size_bytes) [cite: 7]
     
-    print(f"Original:   {original_size_str}")
-    print(f"New:         {new_size_str}")
+    print(f"Original:   {original_size_str}") [cite: 7]
+    print(f"New:         {new_size_str}") [cite: 7]
 
-    if original_size_bytes is not None and new_size_bytes is not None and original_size_bytes > 0:
-        difference_bytes = new_size_bytes - original_size_bytes
-        percentage_change = (difference_bytes / original_size_bytes) * 100
-        change_type = "increase" if difference_bytes >= 0 else "decrease" 
-        difference_str = format_size(abs(difference_bytes))
+    if original_size_bytes is not None and new_size_bytes is not None and original_size_bytes > 0: [cite: 7]
+        difference_bytes = new_size_bytes - original_size_bytes [cite: 7]
+        percentage_change = (difference_bytes / original_size_bytes) * 100 [cite: 7]
+        change_type = "increase" if difference_bytes >= 0 else "decrease" [cite: 38]
+        difference_str = format_size(abs(difference_bytes)) [cite: 7]
         
-        print(f"Difference: {difference_str} ({abs(percentage_change):.2f}% {change_type})")
-    else:
-        print("Difference: N/A")
+        print(f"Difference: {difference_str} ({abs(percentage_change):.2f}% {change_type})") [cite: 7]
+    else: [cite: 7]
+        print("Difference: N/A") [cite: 7]
         
-    print("-------------------------")
+    print("-------------------------") [cite: 7]
 
-def find_video_files(p, r):
-    vids = [];
-    if r: [vids.extend([os.path.join(root, f) for f in files if f.lower().endswith(VIDEO_EXTENSIONS)]) for root, _, files in os.walk(p)] 
-    else: vids.extend([os.path.join(p, f) for f in os.listdir(p) if f.lower().endswith(VIDEO_EXTENSIONS)])
-    return vids
+def find_video_files(p, r): [cite: 7]
+    vids = []; [cite: 7]
+    if r: [vids.extend([os.path.join(root, f) for f in files if f.lower().endswith(VIDEO_EXTENSIONS)]) for root, _, files in os.walk(p)] [cite: 39]
+    else: vids.extend([os.path.join(p, f) for f in os.listdir(p) if f.lower().endswith(VIDEO_EXTENSIONS)]) [cite: 7]
+    return vids [cite: 7]
 
-def is_hevc(f):
-    if not os.path.exists(f): return False
-    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', f]
-    try: return 'hevc' in subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.lower()
-    except Exception: return False
+def is_hevc(f): [cite: 7]
+    if not os.path.exists(f): return False [cite: 7]
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', f] [cite: 7]
+    try: return 'hevc' in subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.lower() [cite: 7]
+    except Exception: return False [cite: 7]
 
-def print_ffmpeg_command(cmd):
-    """Prints the FFmpeg command for dry-run mode."""
-    print("\nExecuting FFmpeg command (Dry Run):")
-    print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
+def print_ffmpeg_command(cmd): [cite: 7]
+    """Prints the FFmpeg command for dry-run mode.""" [cite: 7]
+    print("\nExecuting FFmpeg command (Dry Run):") [cite: 7]
+    print(' '.join(f'"{a}"' [cite: 7]
+if ' ' in a else a for a in cmd)) [cite: 40]
 
-def run_ffmpeg_command(cmd, source_file, delete_source, total_frames=None, permissions=None):
-    """Executes FFmpeg, showing a progress bar, and handling output."""
-    print("\nExecuting FFmpeg command:")
-    print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd)) 
-    output_file = cmd[-1]
-    original_size_bytes = os.path.getsize(source_file) if os.path.exists(source_file) else None
+def run_ffmpeg_command(cmd, source_file, delete_source, total_frames=None, permissions=None): [cite: 7]
+    """Executes FFmpeg, showing a progress bar, and handling output.""" [cite: 7]
+    print("\nExecuting FFmpeg command:") [cite: 7]
+    print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd)) [cite: 7]
+    output_file = cmd[-1] [cite: 7]
+    original_size_bytes = os.path.getsize(source_file) if os.path.exists(source_file) else None [cite: 7]
     
-    # If progress flags aren't in the command, run simply.
-    if "-progress" not in cmd: 
-        try:
-            subprocess.run(cmd, check=True)
-        except (subprocess.CalledProcessError, KeyboardInterrupt):
-            print("\nOperation failed or was cancelled.", file=sys.stderr)
-            sys.exit(1)
-    else:
-        # Run with a tqdm progress bar (determinate or indeterminate).
-        if total_frames is None: 
-            print("\nWarning: Could not get total frames. Progress bar will not show percentage or ETA.")
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8')
-            with tqdm(total=total_frames, unit='frame', dynamic_ncols=True, desc="Transcoding") as pbar:
-                for line in process.stdout:
-                    if line.strip().startswith("frame="): 
-                        current_frame = int(line.strip().split("=")[1])
-                        pbar.update(max(0, current_frame - pbar.n))
-            stderr_output = process.stderr.read();
-            process.wait() 
-            if process.returncode != 0:
-                print(f"\n--- FFmpeg Error ---\n{stderr_output}\n--------------------")
-                sys.exit(1)
-        except (FileNotFoundError, KeyboardInterrupt) as e:
-            print(f"\nError: A required command was not found (e.g., ffmpeg, stdbuf)." if isinstance(e, FileNotFoundError) else "\nCancelled.", file=sys.stderr)
-            if 'process' in locals(): process.terminate() 
-            sys.exit(1)
+    # If progress flags aren't in the command, run simply. 
+    if "-progress" not in cmd: [cite: 41]
+        try: [cite: 7]
+            subprocess.run(cmd, check=True) [cite: 7]
+        except (subprocess.CalledProcessError, KeyboardInterrupt): [cite: 7]
+            print("\nOperation failed or was cancelled.", file=sys.stderr) [cite: 7]
+            sys.exit(1) [cite: 7]
+    else: [cite: 7]
+        # Run with a tqdm progress bar (determinate or indeterminate). 
+        if total_frames is None: [cite: 42]
+            print("\nWarning: Could not get total frames. Progress bar will not show percentage or ETA.") [cite: 7]
+        try: [cite: 7]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8') [cite: 7]
+            with tqdm(total=total_frames, unit='frame', dynamic_ncols=True, desc="Transcoding") as pbar: [cite: 7]
+                for line in process.stdout: [cite: 7]
+                    if line.strip().startswith("frame="): [cite: 43]
+                        current_frame = int(line.strip().split("=")[1]) [cite: 7]
+                        pbar.update(max(0, current_frame - pbar.n)) [cite: 7]
+            stderr_output = process.stderr.read(); [cite: 7]
+            process.wait() [cite: 44]
+            if process.returncode != 0: [cite: 7]
+                print(f"\n--- FFmpeg Error ---\n{stderr_output}\n--------------------") [cite: 7]
+                sys.exit(1) [cite: 7]
+        except (FileNotFoundError, KeyboardInterrupt) as e: [cite: 7]
+            print(f"\nError: A required command was not found (e.g., ffmpeg, stdbuf)." if isinstance(e, FileNotFoundError) else "\nCancelled.", file=sys.stderr) [cite: 7]
+            if 'process' in locals(): process.terminate() [cite: 45]
+            sys.exit(1) [cite: 7]
 
-    # Post-run safety checks
-    if not os.path.exists(output_file):
-        print(f"\nError: Output file not created.", file=sys.stderr)
-        sys.exit(1)
-    try:
-        new_size_bytes = os.path.getsize(output_file)
-        subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
-    except Exception:
-        print(f"\nError: Output file appears to be invalid.", file=sys.stderr)
-        sys.exit(1)
+    # Post-run safety checks 
+    if not os.path.exists(output_file): [cite: 7]
+        print(f"\nError: Output file not created.", file=sys.stderr) [cite: 7]
+        sys.exit(1) [cite: 7]
+    try: [cite: 7]
+        new_size_bytes = os.path.getsize(output_file) [cite: 7]
+        subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True) [cite: 7]
+    except Exception: [cite: 7]
+        print(f"\nError: Output file appears to be invalid.", [cite: 7]
+file=sys.stderr) [cite: 46]
+        sys.exit(1) [cite: 7]
     
-    print(f"\nSuccessfully created and verified '{output_file}'.")
+    print(f"\nSuccessfully created and verified '{output_file}'.") [cite: 7]
     
-    # --- PERMISSIONS LOGIC START ---
-    if permissions:
-        try:
-            # Apply ownership (uid, gid) first
-            os.chown(output_file, permissions['uid'], permissions['gid'])
-            # Then apply the file mode (rwx permissions)
-            os.chmod(output_file, permissions['mode']) 
-            print(f"Info: Applied permissions and group to '{os.path.basename(output_file)}'.")
-        except OSError as e:
-            print(f"\nWarning: Could not set permissions on output file. Reason: {e}", file=sys.stderr)
-    # --- PERMISSIONS LOGIC END ---
+    # --- PERMISSIONS LOGIC START --- 
+    if permissions: [cite: 7]
+        try: [cite: 7]
+            # Apply ownership (uid, gid) first 
+            os.chown(output_file, permissions['uid'], permissions['gid']) [cite: 7]
+            # Then apply the file mode (rwx permissions) 
+            os.chmod(output_file, permissions['mode']) [cite: 47]
+            print(f"Info: Applied permissions and group to '{os.path.basename(output_file)}'.") [cite: 7]
+        except OSError as e: [cite: 7]
+            print(f"\nWarning: Could not set permissions on output file.\nReason: {e}", file=sys.stderr) [cite: 48]
+    # --- PERMISSIONS LOGIC END --- 
    
-    print_size_summary(original_size_bytes, new_size_bytes)
+    print_size_summary(original_size_bytes, new_size_bytes) [cite: 7]
     
-    if delete_source:
-        print(f"\nInfo: --delete flag is set. Deleting source file...")
-        try: 
-            os.remove(source_file)
-            print(f"Successfully deleted: {source_file}") 
-        except OSError as e:
-            print(f"\nError: Could not delete source file '{source_file}'. Reason: {e}", file=sys.stderr)
+    if delete_source: [cite: 7]
+        print(f"\nInfo: --delete flag is set. Deleting source file...") [cite: 7]
+        try: [cite: 7]
+            os.remove(source_file) [cite: 7]
+            print(f"Successfully deleted: {source_file}") [cite: 7]
+        except OSError as e: [cite: 7]
+            print(f"\nError: Could not delete source file '{source_file}'. Reason: {e}", file=sys.stderr) [cite: 49]
 
 # --- Main Logic ---
-def main():
-    # --- FIX: Print current version FIRST, then parse args ---
-    print(f",hvec v{__version__}")
+def main(): [cite: 7]
+    # --- FIX: Print current version FIRST, then parse args --- 
+    print(f",hvec v{__version__}") [cite: 7]
 
-    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R")
-    parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
-    parser.add_argument("-o", "--output", help="Output MKV file.")
-    parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter streams.")
-    parser.add_argument("-D", "--delete", action="store_true", help="Delete original file after success.")
-    parser.add_argument("--out-dir", help="Output directory for batch processing.")
-    parser.add_argument("-R", "--recursive", action="store_true", help="Process subdirectories.")
+    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R") [cite: 7]
+    parser.add_argument("-i", "--input", required=True, help="Input video file or directory.") [cite: 7]
+    parser.add_argument("-o", "--output", help="Output MKV file.") [cite: 7]
+    parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter streams.") [cite: 7]
+    parser.add_argument("-D", "--delete", action="store_true", [cite: 7]
+help="Delete original file after success.") [cite: 50]
+    parser.add_argument("--out-dir", help="Output directory for batch processing.") [cite: 7]
+    parser.add_argument("-R", "--recursive", action="store_true", help="Process subdirectories.") [cite: 7]
     
-    # --- NEW: Added --chapters argument ---
-    parser.add_argument(
-        "-C", "--chapters",
-        help="(Optional) External chapter file (TXT or XML) to embed (single file mode only)."
-    )
+    # --- NEW: Added --chapters argument --- 
+    parser.add_argument( [cite: 7]
+        "-C", "--chapters", [cite: 7]
+        help="(Optional) External chapter file (TXT or XML) to embed (single file mode only)." [cite: 7]
+    ) [cite: 7]
     
-    parser.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed.")
-    parser.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output.") 
-    parser.add_argument("-Q", "--quality", type=int, default=24, help="Set encoding quality (1-51 for VAAPI).")
-    parser.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.")
-    parser.add_argument("--acodec", help="Re-encode audio codec.")
-    parser.add_argument("--abitrate", help="Set audio bitrate.")
-    parser.add_argument("--skip-hevc", action="store_true", help="Skip files that are already HEVC.")
-    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
-    parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux.")
-    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg output.")
-    parser.add_argument("-v", "--version", action="store_true", help="Show version history.")
+    parser.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed.") [cite: 7]
+    parser.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output.") [cite: 7]
+    parser.add_argument("-Q", "--quality", type=int, default=24, help="Set encoding quality (1-51 for VAAPI).") [cite: 51]
+    parser.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.") [cite: 7]
+    parser.add_argument("--acodec", help="Re-encode audio codec.") [cite: 7]
+    parser.add_argument("--abitrate", help="Set audio bitrate.") [cite: 7]
+    parser.add_argument("--skip-hevc", action="store_true", help="Skip files that are already HEVC.") [cite: 7]
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing.") [cite: 7]
+    parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux.") [cite: 7]
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg output.") [cite: 7]
+    parser.add_argument("-v", "--version", action="store_true", help="Show version history.") [cite: 7]
     
-    argcomplete.autocomplete(parser) 
-    args = parser.parse_args()
+    argcomplete.autocomplete(parser) [cite: 7]
+    args = parser.parse_args() [cite: 52]
     
-    # --- FIX: Handle --version flag *after* parsing ---
-    if args.version:
-        print(VERSION_HISTORY) # Print full history
-        sys.exit(0) # Exit cleanly
+    # --- FIX: Handle --version flag *after* parsing --- 
+    if args.version: [cite: 7]
+        print(VERSION_HISTORY) # Print full history 
+        sys.exit(0) # Exit cleanly 
 
-    if not os.path.exists(args.input):
-        print(f"Error: Input not found", file=sys.stderr)
-        sys.exit(1)
-    files_to_process = find_video_files(args.input, args.recursive) if os.path.isdir(args.input) else [args.input]
+    if not os.path.exists(args.input): [cite: 7]
+        print(f"Error: Input not found", file=sys.stderr) [cite: 7]
+        sys.exit(1) [cite: 7]
+    files_to_process = find_video_files(args.input, args.recursive) if os.path.isdir(args.input) else [args.input] [cite: 7]
 
-    for i, input_file in enumerate(files_to_process, 1):
-        print(f"\n--- Processing file {i}/{len(files_to_process)}: {os.path.basename(input_file)} ---")
+    for i, input_file in enumerate(files_to_process, 1): [cite: 7]
+        print(f"\n--- Processing file {i}/{len(files_to_process)}: {os.path.basename(input_file)} ---") [cite: 53]
         
-        # --- NEW: Check for chapters in batch mode ---
-        if args.chapters and len(files_to_process) > 1:
-            print("Info: --chapters flag is ignored in batch/directory mode.")
-            args.chapters = None # Disable it for this run
+        # --- NEW: Check for chapters in batch mode --- 
+        if args.chapters and len(files_to_process) > 1: [cite: 7]
+            print("Info: --chapters flag is ignored in batch/directory mode.") [cite: 7]
+            args.chapters = None # Disable it for this run 
         
-        # --- PERMISSIONS LOGIC START ---
-        try:
-            stat_info = os.stat(input_file)
-            input_gid = stat_info.st_gid
-            input_group_name = grp.getgrgid(input_gid).gr_name 
+        # --- PERMISSIONS LOGIC START --- [cite: 54]
+        try: [cite: 7]
+            stat_info = os.stat(input_file) [cite: 7]
+            input_gid = stat_info.st_gid [cite: 7]
+            input_group_name = grp.getgrgid(input_gid).gr_name [cite: 7]
             
-            target_gid = input_gid # Default to preserving the original group
+            target_gid = input_gid # Default to preserving the original group 
 
-            if input_group_name != 'jellyfin':
-                try:
-                    jellyfin_gid = grp.getgrnam('jellyfin').gr_gid
-                    response = input(f"Warning: Source group is '{input_group_name}'. Change output group to 'jellyfin'? [Y/n]: ").lower().strip() 
-                    # Default to Yes if the user just presses Enter
-                    if response in ('y', 'yes', ''):
-                        target_gid = jellyfin_gid 
-                        print("Info: Output group will be set to 'jellyfin'.")
-                except KeyError:
-                    print("Info: 'jellyfin' group not found. Preserving original group.") 
-                except (KeyboardInterrupt, EOFError):
-                    print("\nCancelled.")
-                    sys.exit(1)
+            if input_group_name != 'jellyfin': [cite: 55]
+                try: [cite: 7]
+                    jellyfin_gid = grp.getgrnam('jellyfin').gr_gid [cite: 7]
+                    response = input(f"Warning: Source group is '{input_group_name}'.\nChange output group to 'jellyfin'? [Y/n]: ").lower().strip() [cite: 56]
+                    # Default to Yes if the user just presses Enter 
+                    if response in ('y', 'yes', ''): [cite: 7]
+                        target_gid = jellyfin_gid [cite: 7]
+                        print("Info: Output group will be set to 'jellyfin'.") [cite: 57]
+                except KeyError: [cite: 7]
+                    print("Info: 'jellyfin' group not found. Preserving original group.") [cite: 7]
+                except (KeyboardInterrupt, EOFError): [cite: 7]
+                    print("\nCancelled.") [cite: 58]
+                    sys.exit(1) [cite: 7]
             
-            # Prepare permissions dictionary to pass to the ffmpeg function
-            permissions_to_apply = {
-                'uid': stat_info.st_uid, 
-                'gid': target_gid,
-                'mode': stat_info.st_mode
-            }
-        except (OSError, KeyError) as e:
-            print(f"Warning: Could not read source permissions. Reason: {e}", file=sys.stderr)
-            permissions_to_apply = None
+            # Prepare permissions dictionary to pass to the ffmpeg function 
+            permissions_to_apply = { [cite: 7]
+                'uid': stat_info.st_uid, [cite: 7]
+                'gid': target_gid, [cite: 59]
+                'mode': stat_info.st_mode [cite: 7]
+            } [cite: 7]
+        except (OSError, KeyError) as e: [cite: 7]
+            print(f"Warning: Could not read source permissions. Reason: {e}", file=sys.stderr) [cite: 7]
+            permissions_to_apply = None [cite: 7]
         # --- PERMISSIONS LOGIC END --- 
 
-        if args.skip_hevc and is_hevc(input_file):
-            print("Video is already HEVC. Skipping.")
-            continue
+        if args.skip_hevc and is_hevc(input_file): [cite: 60]
+            print("Video is already HEVC.\nSkipping.") [cite: 61]
+            continue [cite: 7]
 
-        def generate_output_filename(base, is_remux):
-            sanitized = base.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.')
-            suffix = ".REMUX" if is_remux else ".CONV"
-            return f"{sanitized}{suffix}.mkv" if not sanitized.endswith(suffix) else f"{sanitized}.mkv" 
+        def generate_output_filename(base, is_remux): [cite: 7]
+            sanitized = base.replace('(', '').replace(')', '').replace(' ', '.').replace('_', '.') [cite: 7]
+            suffix = ".REMUX" if is_remux else ".CONV" [cite: 7]
+            return f"{sanitized}{suffix}.mkv" if not sanitized.endswith(suffix) else f"{sanitized}.mkv" [cite: 7]
 
-        if args.output and len(files_to_process) == 1: output_file = args.output
-        else:
-            base, _ = os.path.splitext(os.path.basename(input_file))
-            new_filename = generate_output_filename(base, args.remux)
-            if args.out_dir:
-                relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input)) 
-                output_dir = os.path.join(args.out_dir, relative_path);
-                os.makedirs(output_dir, exist_ok=True) 
-                output_file = os.path.join(output_dir, new_filename)
-            else: output_file = os.path.join(os.path.dirname(input_file), new_filename)
-            # Prevent overwriting the source if generated output name is the same
-        if os.path.abspath(output_file) == os.path.abspath(input_file):
-            base, ext = os.path.splitext(output_file)
-            output_file = f"{base}.COPY{ext}"
-            print(f"Info: Input and output filenames are identical. New output will be '{os.path.basename(output_file)}'") 
+        if args.output and len(files_to_process) == 1: output_file = args.output [cite: 7]
+        else: [cite: 62]
+            base, _ = os.path.splitext(os.path.basename(input_file)) [cite: 7]
+            new_filename = generate_output_filename(base, args.remux) [cite: 7]
+            if args.out_dir: [cite: 7]
+                relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input)) [cite: 7]
+                output_dir = os.path.join(args.out_dir, relative_path); [cite: 7]
+                os.makedirs(output_dir, exist_ok=True) [cite: 63]
+                output_file = os.path.join(output_dir, new_filename) [cite: 7]
+            else: output_file = os.path.join(os.path.dirname(input_file), new_filename) [cite: 7]
+            # Prevent overwriting the source if generated output name is the same 
+        if os.path.abspath(output_file) == os.path.abspath(input_file): [cite: 7]
+            base, ext = os.path.splitext(output_file) [cite: 7]
+            output_file = f"{base}.COPY{ext}" [cite: 64]
+            print(f"Info: Input and output filenames are identical.\nNew output will be '{os.path.basename(output_file)}'") [cite: 65]
                     
-        if os.path.exists(output_file) and not args.dry_run:
-            try:
-                if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y':
-                    print("Skipping.")
-                    continue
-            except KeyboardInterrupt:
-                print("\nCancelled.")
-                sys.exit(1)
+        if os.path.exists(output_file) and not args.dry_run: [cite: 7]
+            try: [cite: 7]
+                if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': [cite: 7]
+                    print("Skipping.") [cite: 7]
+                    continue [cite: 66]
+            except KeyboardInterrupt: [cite: 7]
+                print("\nCancelled.") [cite: 7]
+                sys.exit(1) [cite: 7]
         
-        is_remux_op = args.remux and not args.hvec
-        total_frames = None
-        use_progress_bar = not (is_remux_op or args.quiet or args.dry_run)
+        is_remux_op = args.remux and not args.hvec [cite: 7]
+        total_frames = None [cite: 7]
+        use_progress_bar = not [cite: 7]
+(is_remux_op or args.quiet or args.dry_run) [cite: 67]
         
-        if use_progress_bar:
-            total_frames = get_total_frames(input_file)
+        if use_progress_bar: [cite: 7]
+            total_frames = get_total_frames(input_file) [cite: 7]
 
-        ffmpeg_cmd = ['ffmpeg', '-y']
+        ffmpeg_cmd = ['ffmpeg', '-y'] [cite: 7]
         
-        if use_progress_bar: 
-            if sys.platform != "win32": ffmpeg_cmd = ['stdbuf', '-o0'] + ffmpeg_cmd
-            ffmpeg_cmd.extend(['-progress', '-', '-nostats'])
-        elif args.quiet:
-            ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
-        else:
-            ffmpeg_cmd.extend(['-v', 'error', '-stats'])
+        if use_progress_bar: [cite: 7]
+            if sys.platform != "win32": ffmpeg_cmd = ['stdbuf', '-o0'] + ffmpeg_cmd [cite: 7]
+            ffmpeg_cmd.extend(['-progress', '-', '-nostats']) [cite: 7]
+        elif args.quiet: [cite: 68]
+            ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner']) [cite: 7]
+        else: [cite: 7]
+            ffmpeg_cmd.extend(['-v', 'error', '-stats']) [cite: 7]
         
-        # Use VAAPI, the proven fix for your hardware
-        if not is_remux_op:
-            ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi']) 
+        # Use VAAPI, the proven fix for your hardware 
+        if not is_remux_op: [cite: 7]
+            ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi']) [cite: 7]
         
-        # Fix for AVI containers with bad timestamps
-        if input_file.lower().endswith('.avi'):
-            ffmpeg_cmd.extend(['-fflags', '+genpts'])
+        # Fix for AVI containers with bad timestamps 
+        if input_file.lower().endswith('.avi'): [cite: 7]
+            ffmpeg_cmd.extend(['-fflags', '+genpts']) [cite: 7]
             
-        # --- NEW: Dynamic Input and Mapping Logic ---
-        main_input_index = 0
-        subtitle_input_index = 1 # Default, will be adjusted
+        # --- NEW: Dynamic Input and Mapping Logic --- 
+        main_input_index = 0 [cite: 7]
+        subtitle_input_index = 1 # Default, will be adjusted 
         
-        # Add chapter file as the first input (index 0)
-        if args.chapters and os.path.exists(args.chapters):
-            ffmpeg_cmd.extend(['-i', args.chapters])
-            main_input_index = 1 # Video is now input 1
-            subtitle_input_index = 2 # Subs start at input 2
-            print(f"Info: Chapter file added as input 0.")
-        elif args.chapters:
-            # File not found, but flag was passed
-            print(f"Warning: Chapter file not found at {args.chapters}. Skipping chapter embedding.")
-            args.chapters = None # Clear it so mapping logic skips it
+        # Add chapter file as the first input (index 0) 
+        if args.chapters and os.path.exists(args.chapters): [cite: 7]
+            # --- THIS IS THE FIX ---
+            # Force FFmpeg to use the ffmetadata parser for the .txt file [cite: 80, 81, 82]
+            ffmpeg_cmd.extend(['-f', 'ffmetadata', '-i', args.chapters])
+            # --- END FIX ---
+            main_input_index = 1 # Video is now input 1 
+            subtitle_input_index = 2 # Subs start at input 2 
+            print(f"Info: Chapter file added as input 0.") [cite: 7]
+        elif args.chapters: [cite: 71]
+            # File not found, but flag was passed 
+            print(f"Warning: Chapter file not found at {args.chapters}.\nSkipping chapter embedding.") [cite: 72]
+            args.chapters = None # Clear it so mapping logic skips it 
 
-        # Add main video input (index 0 or 1)
-        ffmpeg_cmd.extend(['-i', input_file]) 
+        # Add main video input (index 0 or 1) 
+        ffmpeg_cmd.extend(['-i', input_file]) [cite: 7]
         
-        if args.filter_streams:
-            all_streams = get_stream_info(input_file)
-            if all_streams is None: continue
-            s_keep, s_rem = plan_stream_selection(all_streams)
-            if not display_and_confirm_plan(s_keep, s_rem):
-                print("Skipping file.")
-                continue
+        if args.filter_streams: [cite: 7]
+            all_streams = get_stream_info(input_file) [cite: 7]
+            if all_streams is None: continue [cite: 7]
+            s_keep, s_rem = plan_stream_selection(all_streams) [cite: 73]
+            if not display_and_confirm_plan(s_keep, s_rem): [cite: 7]
+                print("Skipping file.") [cite: 7]
+                continue [cite: 7]
             
-            # --- UPDATED MAPPING ---
-            if args.chapters:
-                ffmpeg_cmd.extend(['-map_metadata', '0']) # Map chapter metadata from input 0
-            for stream in s_keep: 
-                ffmpeg_cmd.extend(['-map', f"{main_input_index}:{stream['index']}"]) # Use dynamic index
-
-        elif args.subs and len(files_to_process) == 1:
-            for sub_file in args.subs:
-                if os.path.exists(sub_file): ffmpeg_cmd.extend(['-i', sub_file])
-            
-            # --- UPDATED MAPPING ---
-            if args.chapters:
-                ffmpeg_cmd.extend(['-map_metadata', '0']) # Map chapter metadata from input 0
-            
-            ffmpeg_cmd.extend(['-map', f'{main_input_index}:v:0', '-map', f'{main_input_index}:a?']) # Use dynamic index
-            
-            for j in range(len(args.subs)): 
-                # Use dynamic subtitle index
-                ffmpeg_cmd.extend(['-map', f'{subtitle_input_index + j}:s:0', f'-metadata:s:s:{j}', 'language=eng'])
-        
-        else:
             # --- UPDATED MAPPING --- 
-            if args.chapters:
-                ffmpeg_cmd.extend(['-map_metadata', '0']) # Map chapter metadata from input 0
-                
-            ffmpeg_cmd.extend(['-map', f'{main_input_index}:v:0', '-map', f'{main_input_index}:a?', '-map', f'{main_input_index}:s?']) # Use dynamic index
+            if args.chapters: [cite: 74]
+                ffmpeg_cmd.extend(['-map_chapters', '0']) # Map chapter metadata from input 0 
+            for stream in s_keep: [cite: 7]
+                ffmpeg_cmd.extend(['-map', f"{main_input_index}:{stream['index']}"]) # Use dynamic index 
 
-        if is_remux_op:
-            print("Mode: Lossless Remux");
-            ffmpeg_cmd.extend(['-c', 'copy']) 
-            ffmpeg_cmd.extend(['-c:s', 'srt'])
-            if args.subs: ffmpeg_cmd.extend(['-c:s', 'srt'])
-        else:
-            print("\nMode: VAAPI Transcode")
-            # Use VAAPI codec, the proven fix
-            ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
-            ffmpeg_cmd.extend(['-c:a', args.acodec] if args.acodec else ['-c:a', 'copy']) 
-            if args.acodec and args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
-            ffmpeg_cmd.extend(['-c:s', 'srt'] if args.subs else ['-c:s', 'copy'])
+        elif args.subs and len(files_to_process) == 1: [cite: 7]
+            for sub_file in args.subs: [cite: 7]
+                if os.path.exists(sub_file): ffmpeg_cmd.extend(['-i', sub_file]) [cite: 75]
             
-        ffmpeg_cmd.append(output_file)
+            # --- UPDATED MAPPING --- 
+            if args.chapters: [cite: 7]
+                ffmpeg_cmd.extend(['-map_chapters', '0']) # Map chapter metadata from input 0 
+            
+            ffmpeg_cmd.extend(['-map', f'{main_input_index}:v:0', [cite: 7]
+'-map', f'{main_input_index}:a?']) # Use dynamic index [cite: 76]
+            
+            for j in range(len(args.subs)): [cite: 7]
+                # Use dynamic subtitle index 
+                ffmpeg_cmd.extend(['-map', f'{subtitle_input_index + j}:s:0', f'-metadata:s:s:{j}', 'language=eng']) [cite: 7]
         
-        if args.dry_run: 
-            print_ffmpeg_command(ffmpeg_cmd)
-        else: 
-            run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, total_frames=total_frames, permissions=permissions_to_apply) 
+        else: [cite: 7]
+            # --- UPDATED MAPPING --- [cite: 77]
+            # Map ALL streams from the main video input (video, audio, subs, etc.) 
+            ffmpeg_cmd.extend(['-map', f'{main_input_index}']) [cite: 7]
+            
+            if args.chapters: [cite: 7]
+                # And also map the chapters from the chapter input 
+                ffmpeg_cmd.extend(['-map_chapters', '0']) [cite: 78]
 
-    print("\n--- All tasks complete. ---")
+        if is_remux_op: [cite: 7]
+            print("Mode: Lossless Remux"); [cite: 7]
+            # Do NOT use global '-c copy' as it conflicts with -map_chapters [cite: 79]
+            ffmpeg_cmd.extend(['-c:v', 'copy']) # Copy video streams 
+            ffmpeg_cmd.extend(['-c:a', 'copy']) # Copy audio streams 
+            ffmpeg_cmd.extend(['-c:d', 'copy']) # Copy data streams 
+            
+            ffmpeg_cmd.extend(['-c:s', 'srt']) [cite: 7]
+            if [cite: 7]
+args.subs: ffmpeg_cmd.extend(['-c:s', 'srt']) [cite: 80]
+        else: [cite: 7]
+            print("\nMode: VAAPI Transcode") [cite: 7]
+            # Use VAAPI codec, the proven fix 
+            ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)]) [cite: 7]
+            ffmpeg_cmd.extend(['-c:a', args.acodec] if args.acodec else ['-c:a', 'copy']) [cite: 7]
+            if args.acodec and args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate]) [cite: 7]
+            ffmpeg_cmd.extend(['-c:s', 'srt'] if args.subs else ['-c:s', 'copy']) [cite: 81]
+            
+        ffmpeg_cmd.append(output_file) [cite: 7]
+        
+        if args.dry_run: [cite: 7]
+            print_ffmpeg_command(ffmpeg_cmd) [cite: 7]
+        else: [cite: 7]
+            run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, total_frames=total_frames, permissions=permissions_to_apply) [cite: 7]
 
-if __name__ == "__main__":
-    main()
+    print("\n--- All tasks complete.\n---") [cite: 82]
+
+if __name__ == "__main__": [cite: 7]
+    main() [cite: 7]
