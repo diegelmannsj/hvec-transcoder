@@ -13,11 +13,16 @@ from tqdm import tqdm
 import grp # Added for group name resolution
 
 # --- Version History ---
-__version__ = "7.2"
+__version__ = "7.2.1"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v7.2.1  fix(typo): Corrected 'add_ar_argument' to 'add_argument'
+
+        - Fixed a simple typo in the argparse definition for the
+          -H/--hvec flag that caused an AttributeError.
+
 v7.2    fix(logic): Allow --normalize and --remux to work together
 
         - Refactored the '--- Codec Logic ---' section in main().
@@ -265,7 +270,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, total_frames=None, permi
     # --- Chapter Embedding (NEW STEP) ---
     chapters_embedded_successfully = True # Assume success if not requested
     if chapter_file_to_embed:
-        chapters_embedded_successfully = embed_chapters_mkvpropedit(chapter_file_to_embed, output_file)
+        chapters_embedded_successfully = embed_chapters_mkvpropedit(chapter_file_to_embed, output_mkv)
         if not chapters_embedded_successfully:
             print(f"\nError: Failed to embed chapters using mkvpropedit. Output file '{output_file}' may be incomplete.", file=sys.stderr)
             # Decide if you want to exit here or continue. For now, we continue but warn.
@@ -305,7 +310,9 @@ def main():
     parser.add_argument("-R", "--recursive", action="store_true", help="Process subdirectories.")
     parser.add_argument("-C", "--chapters", help="External chapter file (TXT/OGM or XML) to embed (requires MKVToolNix).")
     parser.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed (single file mode only).")
-    parser.add_ar_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
+    # --- THIS IS THE FIX ---
+    parser.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
+    # --- END FIX ---
     parser.add_argument("-N", "--normalize", action="store_true", help="Normalize audio to EBU R128 (-23 LUFS) standard (transcode mode only).")
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set VAAPI quality (1-51).")
     parser.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.")
