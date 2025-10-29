@@ -13,33 +13,38 @@ from tqdm import tqdm
 import grp # Added for group name resolution
 
 # --- Version History ---
-__version__ = "7.2.2"
+__version__ = "7.3"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v7.3    feat(normalize): Add .NORM suffix and update summary
+
+        - The 'generate_output_filename' function now accepts an
+          'is_normalized' flag (from args.normalize) and will
+          append a '.NORM' suffix to the output filename.
+        - The 'audio_normalized' boolean status is now passed from
+          'main()' to 'run_ffmpeg_command()' and finally to
+          'print_size_summary()'.
+        - 'print_size_summary()' will now display an
+          "Audio:      Normalized (EBU R128)" line if normalization
+          was successfully performed, providing clear confirmation.
+
 v7.2.2  fix(ffmpeg): Add -nostdin flag to disable interactive mode
 
-        - Adds the global '-nostdin' flag to the main ffmpeg command.
+        - Adds the global '-nostdin' flag to the main ffmpeg command
+          and the loudnorm analysis command.
         - This prevents ffmpeg from listening for interactive commands
           on stdin, which was causing 'Enter command: ...' prompts
           and 'Parse error...' messages to appear during processing.
-        - This makes the console output much cleaner and more robust.
 
 v7.2.1  fix(typo): Corrected 'add_ar_argument' to 'add_argument'
 
-        - Fixed a simple typo in the argparse definition for the
-          -H/--hvec flag that caused an AttributeError.
-
 v7.2    fix(logic): Allow --normalize and --remux to work together
 
-        - Refactored the '--- Codec Logic ---' section in main().
-        - Video codec logic is now handled separately from audio logic.
-        - This fixes a flaw where --remux (global -c copy)
-          conflicted with --normalize (audio re-encode).
-        - Now, using --remux sets the video codec to 'copy' (-c:v copy)
-          and --normalize sets the audio codec logic (re-encode 0:a:0,
-          copy others), allowing them to be used together.
+        - Refactored logic to handle video and audio codecs separately,
+          allowing --remux (video copy) and --normalize (audio
+          re-encode) to be used together.
 
 v7.1    feat(audio): Add -N/--normalize flag for 2-pass loudnorm
 v7.0    refactor(chapters): Use mkvpropedit for chapter embedding
@@ -111,7 +116,7 @@ def format_size(size_bytes):
         return f"{s} {size_name[i]}"
     except (ValueError, TypeError): return "N/A"
 
-def print_size_summary(original_size_bytes, new_size_bytes):
+def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=False):
     """Prints a formatted summary of the file size change."""
     print("\n--- File Size Summary ---")
     original_size_str = format_size(original_size_bytes); new_size_str = format_size(new_size_bytes)
@@ -121,6 +126,10 @@ def print_size_summary(original_size_bytes, new_size_bytes):
         change_type = "increase" if difference_bytes >= 0 else "decrease"; difference_str = format_size(abs(difference_bytes))
         print(f"Difference: {difference_str} ({abs(percentage_change):.2f}% {change_type})")
     else: print("Difference: N/A")
+    
+    if audio_normalized:
+        print("Audio:      Normalized (EBU R128)")
+    
     print("-------------------------")
 
 def find_video_files(p, r):
@@ -217,7 +226,7 @@ def embed_chapters_mkvpropedit(chapter_file, output_mkv):
         print(f"\nAn unexpected error occurred running mkvpropedit: {e}", file=sys.stderr)
         return False
 
-def run_ffmpeg_command(cmd, source_file, delete_source, total_frames=None, permissions=None, chapter_file_to_embed=None):
+def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None):
     """Executes FFmpeg, shows progress, verifies output, and optionally embeds chapters."""
     print("\nExecuting FFmpeg command:")
     print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
@@ -274,7 +283,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, total_frames=None, permi
             print(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
         except OSError as e: print(f"\nWarning: Could not set permissions. Reason: {e}", file=sys.stderr)
 
-    print_size_summary(original_size_bytes, new_size_bytes)
+    print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=audio_normalized)
     
     # --- Delete Source ---
     # Only delete if BOTH FFmpeg AND chapter embedding (if requested) were successful
@@ -354,20 +363,24 @@ def main():
         if args.skip_hevc and is_hevc(input_file): print("Already HEVC. Skipping."); continue
 
         # --- Output Filename Generation ---
-        def generate_output_filename(base, is_remux, has_chapters):
+        def generate_output_filename(base, is_remux, has_chapters, is_normalized):
             sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.') # Cleaner regex
             suffix = ".REMUX" if is_remux else ".CONV"
             chapter_suffix = ".CHAPTERS" if has_chapters else ""
+            norm_suffix = ".NORM" if is_normalized else "" # <--- NEW
             # Ensure suffix isn't duplicated, handle case where base already ends with it
             base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
-            return f"{base_no_suffix}{suffix}{chapter_suffix}.mkv"
+            return f"{base_no_suffix}{suffix}{norm_suffix}{chapter_suffix}.mkv" # <--- MODIFIED
 
         is_remux_op = args.remux and not args.hvec
         if args.output and len(files_to_process) == 1: output_file = args.output
         else:
             base, _ = os.path.splitext(os.path.basename(input_file));
+            # Check for suffixes
             has_chapters_flag = chapter_file_for_this_run is not None
-            new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag)
+            has_normalized_flag = args.normalize # <--- NEW
+            new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag, has_normalized_flag) # <--- MODIFIED
+            
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input))
                 output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
@@ -388,9 +401,7 @@ def main():
         # --- FFmpeg Command Construction ---
         total_frames = get_total_frames(input_file) if not (is_remux_op or args.quiet or args.dry_run) else None
         
-        # --- THIS IS THE FIX ---
         ffmpeg_cmd = ['ffmpeg', '-y', '-nostdin']
-        # --- END FIX ---
         
         # Progress/Verbosity
         use_progress_bar = total_frames is not None and not (is_remux_op or args.quiet or args.dry_run)
@@ -437,6 +448,7 @@ def main():
             ffmpeg_cmd.extend(['-map', '0']) # Map all streams from input 0
 
         # --- Codec Logic (Refactored for v7.2) ---
+        audio_normalized = False # <--- MOVED: Define here for later use
 
         # 1. VIDEO LOGIC
         if is_remux_op:
@@ -447,7 +459,6 @@ def main():
             ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
 
         # 2. AUDIO LOGIC
-        audio_normalized = False
         if args.normalize:
             if is_remux_op:
                 print("Info: Normalizing audio while remuxing video.")
@@ -501,6 +512,7 @@ def main():
                 ffmpeg_cmd,
                 input_file,
                 args.delete,
+                audio_normalized=audio_normalized, # <--- MODIFIED
                 total_frames=total_frames,
                 permissions=permissions_to_apply,
                 chapter_file_to_embed=chapter_file_for_this_run
