@@ -13,18 +13,30 @@ from tqdm import tqdm
 import grp # Added for group name resolution
 
 # --- Version History ---
-__version__ = "7.1"
+__version__ = "7.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v7.2    fix(logic): Allow --normalize and --remux to work together
+
+        - Refactored the '--- Codec Logic ---' section in main().
+        - Video codec logic is now handled separately from audio logic.
+        - This fixes a flaw where --remux (global -c copy)
+          conflicted with --normalize (audio re-encode).
+        - Now, using --remux sets the video codec to 'copy' (-c:v copy)
+          and --normalize sets the audio codec logic (re-encode 0:a:0,
+          copy others), allowing them to be used together in a
+          "hybrid" (video-pass-through, audio-process) mode.
+        - Cleaned up subtitle logic to always convert to SRT (-c:s srt)
+          for better compatibility, simplifying the old logic.
+
 v7.1    feat(audio): Add -N/--normalize flag for 2-pass loudnorm
 
         - Adds a new helper function 'run_loudnorm_analysis' to perform
           an ffmpeg "Pass 1" to measure audio loudness.
         - This function captures ffmpeg's stderr, finds the JSON
-          output block, and parses it using Python's 'json' module
-          (no 'jq' dependency required).
+          output block, and parses it using Python's 'json' module.
         - Adds the '-N' / '--normalize' argument to argparse.
         - When '-N' is used in transcode mode:
             1. Runs the 'Pass 1' analysis.
@@ -33,37 +45,9 @@ v7.1    feat(audio): Add -N/--normalize flag for 2-pass loudnorm
             3. This filter is applied to the first audio stream (0:a:0),
                which is re-encoded to 320k AAC.
             4. All other audio streams are copied.
-        - If '-N' is used with '-r' (remux), a warning is printed
-          and normalization is skipped.
 
 v7.0    refactor(chapters): Use mkvpropedit for chapter embedding
-
-        - Removed all previous, failing FFmpeg chapter logic (-f ffmetadata,
-          -map_metadata, -map_chapters). FFmpeg was unreliable for embedding
-          chapters from OGM text files during remux/transcode.
-        - The script now uses 'mkvpropedit' (from MKVToolNix) to embed
-          chapters AFTER the main FFmpeg remux/transcode is complete.
-        - This separates concerns and uses the standard, reliable tool
-          for MKV chapter manipulation.
-        - Requires MKVToolNix to be installed ('sudo dnf install mkvtoolnix').
-
-v6.15   (Failed Fix) Swapped map order.
-v6.14   (Failed Fix) Re-implemented per-stream copy.
-v6.13   (Failed Fix) Reverted to global -c copy.
-v6.12   (Partial Fix) Reverted faulty ffmetadata flag.
-v6.11   (Partial Fix) Fixed typo.
-v6.10   (Failed Fix) Forced ffmetadata parser (caused global tags).
-v6.9    (Partial Fix) Used per-stream copy correctly.
-v6.8    (Partial Fix) Corrected default stream mapping correctly.
-v6.7    (Partial Fix) Used -map_chapters flag correctly.
-v6.6    (Failed Fix) Used -map_metadata incorrectly.
-v6.5    feat(chapters): Add external chapter file embedding (--chapters/-C)
-v6.4    feat(permissions): Implement permission handling and jellyfin group prompt
-v6.3	fix(remux): Convert incompatible subtitles to SRT
-v6.2:   fix(overwrite): Prevent source file overwrite
-v6.1:   fix(summary): Correct file size summary logic
-v6.0:   feat(progress): Rebuild progress bar with tqdm
-v5.8:   fix(exit): Add Ctrl+C handler
+        ...
 """
 # --- MODIFICATION END ---
 
@@ -160,7 +144,6 @@ def print_ffmpeg_command(cmd):
     print("\nExecuting FFmpeg command (Dry Run):")
     print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
 
-# --- NEW: Function to run audio analysis ---
 def run_loudnorm_analysis(input_file):
     """
     Runs FFmpeg Pass 1 to analyze audio loudness and returns the parsed JSON data.
@@ -203,7 +186,6 @@ def run_loudnorm_analysis(input_file):
     except Exception as e:
         print(f"\nAn unexpected error occurred during audio analysis: {e}", file=sys.stderr)
         return None
-# --- END NEW FUNCTION ---
 
 def embed_chapters_mkvpropedit(chapter_file, output_mkv):
     """Embeds chapters into an existing MKV file using mkvpropedit."""
@@ -323,7 +305,7 @@ def main():
     parser.add_argument("-R", "--recursive", action="store_true", help="Process subdirectories.")
     parser.add_argument("-C", "--chapters", help="External chapter file (TXT/OGM or XML) to embed (requires MKVToolNix).")
     parser.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed (single file mode only).")
-    parser.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
+    parser.add_ar_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
     parser.add_argument("-N", "--normalize", action="store_true", help="Normalize audio to EBU R128 (-23 LUFS) standard (transcode mode only).")
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set VAAPI quality (1-51).")
     parser.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.")
@@ -377,21 +359,20 @@ def main():
         if args.skip_hevc and is_hevc(input_file): print("Already HEVC. Skipping."); continue
 
         # --- Output Filename Generation ---
-        def generate_output_filename(base, is_remux, has_chapters): # <--- 1. ADD ARGUMENT
+        def generate_output_filename(base, is_remux, has_chapters):
             sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.') # Cleaner regex
             suffix = ".REMUX" if is_remux else ".CONV"
-            chapter_suffix = ".CHAPTERS" if has_chapters else "" # <--- 2. ADD THIS LINE
+            chapter_suffix = ".CHAPTERS" if has_chapters else ""
             # Ensure suffix isn't duplicated, handle case where base already ends with it
             base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
-            return f"{base_no_suffix}{suffix}{chapter_suffix}.mkv" # <--- 3. ADD SUFFIX TO RETURN
+            return f"{base_no_suffix}{suffix}{chapter_suffix}.mkv"
 
         is_remux_op = args.remux and not args.hvec
         if args.output and len(files_to_process) == 1: output_file = args.output
         else:
             base, _ = os.path.splitext(os.path.basename(input_file));
-            # Check if chapters are being added for the filename suffix
-            has_chapters_flag = chapter_file_for_this_run is not None # <--- 1. ADD THIS LINE
-            new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag) # <--- 2. PASS FLAG
+            has_chapters_flag = chapter_file_for_this_run is not None
+            new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag)
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input))
                 output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
@@ -427,7 +408,6 @@ def main():
         if input_file.lower().endswith('.avi'): ffmpeg_cmd.extend(['-fflags', '+genpts'])
             
         # --- Input Files ---
-        # NOTE: Chapter input is NOT added here anymore
         ffmpeg_cmd.extend(['-i', input_file]) # Main video input is always index 0 now
         
         # Add subtitle inputs if provided (single file mode only)
@@ -447,70 +427,73 @@ def main():
             if all_streams is None: continue
             s_keep, s_rem = plan_stream_selection(all_streams)
             if not display_and_confirm_plan(s_keep, s_rem): print("Skipping file."); continue
-            # Map selected streams (always from input 0)
             for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
-            # NOTE: Subtitle mapping (-s) is ignored if filtering (-k)
             args.subs = [] # Disable subtitle embedding if filtering
 
         elif args.subs: # Only map subs if -s was used and -k was not
-            # Map video/audio from main input (index 0)
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
-            # Map subtitle streams from subtitle inputs (starting at index 1)
             for j in range(len(args.subs)):
                  ffmpeg_cmd.extend(['-map', f'{subtitle_input_index + j}:s:0', f'-metadata:s:s:{j}', 'language=eng'])
         
         else: # Default: Map all streams from main input
             ffmpeg_cmd.extend(['-map', '0']) # Map all streams from input 0
 
-        # --- Codec Logic ---
-        if is_remux_op:
-            print("Mode: Lossless Remux");
-            ffmpeg_cmd.extend(['-c', 'copy']) # Global copy for remux
-            ffmpeg_cmd.extend(['-c:s', 'srt']) # Ensure subs are compatible
-            if args.normalize:
-                print("Warning: --normalize flag is ignored in --remux mode.")
-        else: # Transcode
-            print("\nMode: VAAPI Transcode")
-            ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
-            
-            # --- MODIFIED: Audio Logic ---
-            if args.normalize:
-                analysis_data = run_loudnorm_analysis(input_file)
-                if analysis_data:
-                    try:
-                        measured_i = analysis_data['input_i']
-                        measured_tp = analysis_data['input_tp']
-                        measured_lra = analysis_data['input_lra']
-                        measured_thresh = analysis_data['input_thresh']
-                        
-                        filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
-                        
-                        # Apply normalization to first audio stream, copy others
-                        ffmpeg_cmd.extend(['-c:a', 'copy', '-c:a:0', 'aac', '-b:a:0', '320k', '-af:a:0', filter_string])
-                        print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams copied.")
-                    except KeyError:
-                        print("Warning: Audio analysis JSON was incomplete. Falling back to default audio settings.", file=sys.stderr)
-                        ffmpeg_cmd.extend(['-c:a', args.acodec if args.acodec else 'copy'])
-                        if args.acodec and args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
-                else:
-                    print("Warning: Audio normalization analysis failed. Falling back to default audio settings.", file=sys.stderr)
-                    # Fall back to user's requested acodec or copy
-                    ffmpeg_cmd.extend(['-c:a', args.acodec if args.acodec else 'copy'])
-                    if args.acodec and args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
-            else:
-                # Original audio logic
-                ffmpeg_cmd.extend(['-c:a', args.acodec if args.acodec else 'copy'])
-                if args.acodec and args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
-            # --- END Audio Logic ---
+        # --- Codec Logic (Refactored for v7.2) ---
 
-            ffmpeg_cmd.extend(['-c:s', 'srt' if args.subs else 'copy']) # Convert embedded subs if -s used, else copy
+        # 1. VIDEO LOGIC
+        if is_remux_op:
+            print("Mode: Lossless Video Remux");
+            ffmpeg_cmd.extend(['-c:v', 'copy'])
+        else:
+            print("\nMode: VAAPI Video Transcode")
+            ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
+
+        # 2. AUDIO LOGIC
+        audio_normalized = False
+        if args.normalize:
+            if is_remux_op:
+                print("Info: Normalizing audio while remuxing video.")
+            
+            analysis_data = run_loudnorm_analysis(input_file)
+            if analysis_data:
+                try:
+                    measured_i = analysis_data['input_i']
+                    measured_tp = analysis_data['input_tp']
+                    measured_lra = analysis_data['input_lra']
+                    measured_thresh = analysis_data['input_thresh']
+                    
+                    filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
+                    
+                    # Apply normalization to first audio stream, copy others
+                    ffmpeg_cmd.extend(['-c:a', 'copy', '-c:a:0', 'aac', '-b:a:0', '320k', '-af:a:0', filter_string])
+                    print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams copied.")
+                    audio_normalized = True # Mark as complete
+                except KeyError:
+                    print("Warning: Audio analysis JSON was incomplete. Falling back to default audio settings.", file=sys.stderr)
+            else:
+                print("Warning: Audio normalization analysis failed. Falling back to default audio settings.", file=sys.stderr)
+        
+        if not audio_normalized:
+            # Run this block if --normalize=False OR if --normalize=True but it failed
+            if args.acodec:
+                ffmpeg_cmd.extend(['-c:a', args.acodec])
+                if args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
+            else:
+                ffmpeg_cmd.extend(['-c:a', 'copy'])
+                if not args.normalize: # Don't print "copying" if we're here on a failed normalize
+                    print("Info: Copying all audio streams.")
+
+        # 3. SUBTITLE LOGIC
+        # Always convert to srt for max compatibility (per v6.3 fix)
+        ffmpeg_cmd.extend(['-c:s', 'srt'])
+        
+        # --- END Codec Logic ---
 
         ffmpeg_cmd.append(output_file) # Add output file path
         
         # --- Execute ---
         if args.dry_run:
             print_ffmpeg_command(ffmpeg_cmd)
-            # Optionally print mkvpropedit command in dry run too
             if chapter_file_for_this_run:
                  mkvpropedit_cmd = ['mkvpropedit', output_file, '--chapters', chapter_file_for_this_run]
                  print("\nMKVPropEdit command (Dry Run):")
@@ -522,7 +505,7 @@ def main():
                 args.delete,
                 total_frames=total_frames,
                 permissions=permissions_to_apply,
-                chapter_file_to_embed=chapter_file_for_this_run # Pass chapter file to runner function
+                chapter_file_to_embed=chapter_file_for_this_run
             )
 
     print("\n--- All tasks complete. ---")
