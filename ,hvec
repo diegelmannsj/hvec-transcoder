@@ -13,11 +13,19 @@ from tqdm import tqdm
 import grp # Added for group name resolution
 
 # --- Version History ---
-__version__ = "7.2.1"
+__version__ = "7.2.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v7.2.2  fix(ffmpeg): Add -nostdin flag to disable interactive mode
+
+        - Adds the global '-nostdin' flag to the main ffmpeg command.
+        - This prevents ffmpeg from listening for interactive commands
+          on stdin, which was causing 'Enter command: ...' prompts
+          and 'Parse error...' messages to appear during processing.
+        - This makes the console output much cleaner and more robust.
+
 v7.2.1  fix(typo): Corrected 'add_ar_argument' to 'add_argument'
 
         - Fixed a simple typo in the argparse definition for the
@@ -31,26 +39,9 @@ v7.2    fix(logic): Allow --normalize and --remux to work together
           conflicted with --normalize (audio re-encode).
         - Now, using --remux sets the video codec to 'copy' (-c:v copy)
           and --normalize sets the audio codec logic (re-encode 0:a:0,
-          copy others), allowing them to be used together in a
-          "hybrid" (video-pass-through, audio-process) mode.
-        - Cleaned up subtitle logic to always convert to SRT (-c:s srt)
-          for better compatibility, simplifying the old logic.
+          copy others), allowing them to be used together.
 
 v7.1    feat(audio): Add -N/--normalize flag for 2-pass loudnorm
-
-        - Adds a new helper function 'run_loudnorm_analysis' to perform
-          an ffmpeg "Pass 1" to measure audio loudness.
-        - This function captures ffmpeg's stderr, finds the JSON
-          output block, and parses it using Python's 'json' module.
-        - Adds the '-N' / '--normalize' argument to argparse.
-        - When '-N' is used in transcode mode:
-            1. Runs the 'Pass 1' analysis.
-            2. On success, builds a 'Pass 2' loudnorm filter string
-               targeting EBU R128 (-23 LUFS).
-            3. This filter is applied to the first audio stream (0:a:0),
-               which is re-encoded to 320k AAC.
-            4. All other audio streams are copied.
-
 v7.0    refactor(chapters): Use mkvpropedit for chapter embedding
         ...
 """
@@ -155,14 +146,13 @@ def run_loudnorm_analysis(input_file):
     """
     print("Running audio normalization analysis (Pass 1)...")
     cmd = [
-        'ffmpeg', '-i', input_file,
+        'ffmpeg', '-nostdin', '-i', input_file, # Added -nostdin
         '-map', '0:a:0',  # Analyze the first audio stream
         '-af', 'loudnorm=print_format=json',
         '-f', 'null', '-'
     ]
     try:
         # ffmpeg writes all info, including the JSON, to stderr.
-        # check=False because ffmpeg may exit non-zero even on success here.
         result = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding='utf-8')
         stderr_output = result.stderr
         
@@ -310,9 +300,7 @@ def main():
     parser.add_argument("-R", "--recursive", action="store_true", help="Process subdirectories.")
     parser.add_argument("-C", "--chapters", help="External chapter file (TXT/OGM or XML) to embed (requires MKVToolNix).")
     parser.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed (single file mode only).")
-    # --- THIS IS THE FIX ---
     parser.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
-    # --- END FIX ---
     parser.add_argument("-N", "--normalize", action="store_true", help="Normalize audio to EBU R128 (-23 LUFS) standard (transcode mode only).")
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set VAAPI quality (1-51).")
     parser.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.")
@@ -399,7 +387,10 @@ def main():
         
         # --- FFmpeg Command Construction ---
         total_frames = get_total_frames(input_file) if not (is_remux_op or args.quiet or args.dry_run) else None
-        ffmpeg_cmd = ['ffmpeg', '-y']
+        
+        # --- THIS IS THE FIX ---
+        ffmpeg_cmd = ['ffmpeg', '-y', '-nostdin']
+        # --- END FIX ---
         
         # Progress/Verbosity
         use_progress_bar = total_frames is not None and not (is_remux_op or args.quiet or args.dry_run)
