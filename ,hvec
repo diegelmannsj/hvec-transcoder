@@ -269,7 +269,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     # --- Chapter Embedding (NEW STEP) ---
     chapters_embedded_successfully = True # Assume success if not requested
     if chapter_file_to_embed:
-        chapters_embedded_successfully = embed_chapters_mkvpropedit(chapter_file_to_embed, output_mkv)
+        chapters_embedded_successfully = embed_chapters_mkvpropedit(chapter_file_to_embed, output_file)
         if not chapters_embedded_successfully:
             print(f"\nError: Failed to embed chapters using mkvpropedit. Output file '{output_file}' may be incomplete.", file=sys.stderr)
             # Decide if you want to exit here or continue. For now, we continue but warn.
