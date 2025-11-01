@@ -13,17 +13,28 @@ from tqdm import tqdm
 import grp # Added for group name resolution
 
 # --- Version History ---
-__version__ = "7.3"
+__version__ = "7.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v7.4    feat(normalize): Print audio stats & use VBR for audio
+        fix(ffmpeg): Disable hwaccel decode for .avi files
+
+        - Audio normalization now prints the measured loudness (LUFS)
+          and true peak (dBTP) found during analysis.
+        - Switched normalization re-encode from CBR (-b:a 320k) to
+          VBR (-q:a 4) to prevent file size bloat.
+        - Fixed a bug where hwaccel decode was (incorrectly)
+          attempted on .avi files, causing a crash.
+
 v7.3    feat(normalize): Add .NORM suffix and update summary
 
         - The 'generate_output_filename' function now accepts an
           'is_normalized' flag (from args.normalize) and will
           append a '.NORM' suffix to the output filename.
-        - The 'audio_normalized' boolean status is now passed from
+        - The 'audio_normalized' boolean status is 
+          now passed from
           'main()' to 'run_ffmpeg_command()' and finally to
           'print_size_summary()'.
         - 'print_size_summary()' will now display an
@@ -32,12 +43,12 @@ v7.3    feat(normalize): Add .NORM suffix and update summary
 
 v7.2.2  fix(ffmpeg): Add -nostdin flag to disable interactive mode
 
-        - Adds the global '-nostdin' flag to the main ffmpeg command
+        - Adds the global '-nostdin' flag to 
+          the main ffmpeg command
           and the loudnorm analysis command.
         - This prevents ffmpeg from listening for interactive commands
           on stdin, which was causing 'Enter command: ...' prompts
           and 'Parse error...' messages to appear during processing.
-
 v7.2.1  fix(typo): Corrected 'add_ar_argument' to 'add_argument'
 
 v7.2    fix(logic): Allow --normalize and --remux to work together
@@ -45,7 +56,6 @@ v7.2    fix(logic): Allow --normalize and --remux to work together
         - Refactored logic to handle video and audio codecs separately,
           allowing --remux (video copy) and --normalize (audio
           re-encode) to be used together.
-
 v7.1    feat(audio): Add -N/--normalize flag for 2-pass loudnorm
 v7.0    refactor(chapters): Use mkvpropedit for chapter embedding
         ...
@@ -90,18 +100,15 @@ def get_stream_info(file_path):
 def plan_stream_selection(streams):
     streams_to_keep, streams_to_remove = [], []
     for s in streams:
-        keep = False; stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower();
-        title = s.get('title', '').lower()
+        keep = False; stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); title = s.get('title', '').lower()
         if stype == 'video' or (stype == 'audio' and (lang == 'eng' or 'commentary' in title or 'director' in title)) or (stype == 'subtitle' and lang == 'eng'): keep = True
         if keep: streams_to_keep.append(s)
         else: streams_to_remove.append(s)
     return streams_to_keep, streams_to_remove
 
 def display_and_confirm_plan(s_keep, s_rem):
-    print("\n--- Stream Selection Plan ---\nKEPT:");
-    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep]
-    print("\nREMOVED:");
-    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem]
+    print("\n--- Stream Selection Plan ---\nKEPT:"); [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep]
+    print("\nREMOVED:"); [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem]
     try: return input("Proceed? [y/N]: ").lower().strip() == 'y'
     except KeyboardInterrupt: return False
 
@@ -411,10 +418,15 @@ def main():
         elif args.quiet: ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
         else: ffmpeg_cmd.extend(['-v', 'error', '-stats'])
         
-        # Hardware Acceleration (only for transcode)
-        if not is_remux_op: ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
-        # Input Fixes
-        if input_file.lower().endswith('.avi'): ffmpeg_cmd.extend(['-fflags', '+genpts'])
+        # --- FIX 3: .avi HWACCEL ---
+        # Hardware Acceleration & Input Fixes
+        if input_file.lower().endswith('.avi'):
+            # .avi (mpeg4) files often need this flag and DON'T support hwaccel decode
+            ffmpeg_cmd.extend(['-fflags', '+genpts'])
+        elif not is_remux_op:
+            # Use hwaccel decode for all other non-remux transcodes
+            ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
+        # --- END FIX 3 ---
             
         # --- Input Files ---
         ffmpeg_cmd.extend(['-i', input_file]) # Main video input is always index 0 now
@@ -452,8 +464,7 @@ def main():
 
         # 1. VIDEO LOGIC
         if is_remux_op:
-            print("Mode: Lossless Video Remux");
-            ffmpeg_cmd.extend(['-c:v', 'copy'])
+            print("Mode: Lossless Video Remux"); ffmpeg_cmd.extend(['-c:v', 'copy'])
         else:
             print("\nMode: VAAPI Video Transcode")
             ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
@@ -471,10 +482,20 @@ def main():
                     measured_lra = analysis_data['input_lra']
                     measured_thresh = analysis_data['input_thresh']
                     
+                    # --- FIX 2: PRINT AUDIO STATS ---
+                    print("Info: Audio analysis found:")
+                    print(f"  - Input Loudness: {measured_i} LUFS")
+                    print(f"  - Input True Peak: {measured_tp} dBTP")
+                    # --- END FIX 2 ---
+                    
                     filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                     
                     # Apply normalization to first audio stream, copy others
-                    ffmpeg_cmd.extend(['-c:a', 'copy', '-c:a:0', 'aac', '-b:a:0', '320k', '-af:a:0', filter_string])
+                    # --- FIX 1: AUDIO BITRATE ---
+                    # Changed -b:a:0 320k to VBR mode -q:a:0 4
+                    ffmpeg_cmd.extend(['-c:a', 'copy', '-c:a:0', 'aac', '-q:a:0', '4', '-af:a:0', filter_string])
+                    # --- END FIX 1 ---
+                    
                     print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams copied.")
                     audio_normalized = True # Mark as complete
                 except KeyError:
