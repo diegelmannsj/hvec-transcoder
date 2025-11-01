@@ -13,11 +13,18 @@ from tqdm import tqdm
 import grp # Added for group name resolution
 
 # --- Version History ---
-__version__ = "7.5"
+__version__ = "7.6"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v7.6    fix(ffmpeg): Correct ffmpeg syntax for -vf filter
+        
+        - Moved the '-vf format=nv12,hwupload' filter to *after*
+          the '-i' flag, fixing the "Invalid argument" error.
+        - Filter flags (-vf) are output options, not input options,
+          and were in the wrong place in v7.5.
+
 v7.5    fix(ffmpeg): Add hwupload filter for software-decoded .avi
         
         - Fixes a filter crash when transcoding .avi files.
@@ -402,13 +409,12 @@ def main():
         elif args.quiet: ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
         else: ffmpeg_cmd.extend(['-v', 'error', '-stats'])
         
-        # --- .avi HWACCEL FIX (v7.5) ---
-        # Hardware Acceleration & Input Fixes
+        # --- .avi HWACCEL FIX (v7.6) ---
         is_avi_transcode = input_file.lower().endswith('.avi') and not is_remux_op
         
         if is_avi_transcode:
-            # .avi (mpeg4) files need sw decode + manual hw upload
-            ffmpeg_cmd.extend(['-fflags', '+genpts', '-vf', 'format=nv12,hwupload'])
+            # .avi files need this input flag (goes BEFORE -i)
+            ffmpeg_cmd.extend(['-fflags', '+genpts'])
         elif not is_remux_op:
             # Use hwaccel decode for all other non-remux transcodes
             ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
@@ -453,6 +459,13 @@ def main():
             print("Mode: Lossless Video Remux"); ffmpeg_cmd.extend(['-c:v', 'copy'])
         else:
             print("\nMode: VAAPI Video Transcode")
+            
+            # --- .avi HWACCEL FIX (v7.6) ---
+            if is_avi_transcode:
+                # Add the manual hwupload filter (goes AFTER -i)
+                ffmpeg_cmd.extend(['-vf', 'format=nv12,hwupload'])
+            # --- END FIX ---
+                
             ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
 
         # 2. AUDIO LOGIC
