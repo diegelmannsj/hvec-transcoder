@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+
+import argparse
+import subprocess
+import sys
+import os
+import json
+import math
+import argcomplete
+import re
+import shutil
+from tqdm import tqdm
+import grp # Added for group name resolution
+
+# --- Version History ---
+__version__ = "7.0"
+
+VERSION_HISTORY = f"""
+,hvec Transcoder v{__version__}
+---------------------------------
+v7.0    refactor(chapters): Use mkvpropedit for chapter embedding
+
+        - Removed all previous, failing FFmpeg chapter logic (-f ffmetadata,
+          -map_metadata, -map_chapters). FFmpeg was unreliable for embedding
+          chapters from OGM text files during remux/transcode.
+        - The script now uses 'mkvpropedit' (from MKVToolNix) to embed
+          chapters AFTER the main FFmpeg remux/transcode is complete.
+        - This separates concerns and uses the standard, reliable tool
+          for MKV chapter manipulation.
+        - Requires MKVToolNix to be installed ('sudo dnf install mkvtoolnix').
+
+v6.15   (Failed Fix) Swapped map order.
+v6.14   (Failed Fix) Re-implemented per-stream copy.
+v6.13   (Failed Fix) Reverted to global -c copy.
+v6.12   (Partial Fix) Reverted faulty ffmetadata flag.
+v6.11   (Partial Fix) Fixed typo.
+v6.10   (Failed Fix) Forced ffmetadata parser (caused global tags).
+v6.9    (Partial Fix) Used per-stream copy correctly.
+v6.8    (Partial Fix) Corrected default stream mapping correctly.
+v6.7    (Partial Fix) Used -map_chapters flag correctly.
+v6.6    (Failed Fix) Used -map_metadata incorrectly.
+v6.5    feat(chapters): Add external chapter file embedding (--chapters/-C)
+v6.4    feat(permissions): Implement permission handling and jellyfin group prompt
+v6.3	fix(remux): Convert incompatible subtitles to SRT
+v6.2:   fix(overwrite): Prevent source file overwrite
+v6.1:   fix(summary): Correct file size summary logic
+v6.0:   feat(progress): Rebuild progress bar with tqdm
+v5.8:   fix(exit): Add Ctrl+C handler
+"""
+# --- MODIFICATION END ---
+
+# --- Constants ---
+VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
+
+# --- Helper Functions ---
+def get_total_frames(file_path):
+    """Gets total frames quickly using mediainfo (preferred) or falls back."""
+    if shutil.which('mediainfo'):
+        cmd = ['mediainfo', '--Inform=Video;%FrameCount%', file_path]
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return int(result.stdout.strip())
+        except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+            pass
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration,avg_frame_rate', '-of', 'json', file_path]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        data = json.loads(result.stdout)['streams'][0]
+        if 'duration' not in data or 'avg_frame_rate' not in data: return None
+        duration, fr_str = float(data['duration']), data['avg_frame_rate']
+        if '/' in fr_str:
+            n, d = map(int, fr_str.split('/')); frame_rate = n / d if d != 0 else 0
+        else: frame_rate = float(fr_str)
+        if duration <= 0 or frame_rate <= 0: return None
+        return int(duration * frame_rate)
+    except Exception: return None
+
+def get_stream_info(file_path):
+    """Uses ffprobe to get structured information about all streams in a file."""
+    ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', file_path]
+    try:
+        result = subprocess.run(ffprobe_cmd, check=True, capture_output=True, text=True)
+        return json.loads(result.stdout).get('streams', [])
+    except Exception:
+        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr); return None
+
+def plan_stream_selection(streams):
+    streams_to_keep, streams_to_remove = [], []
+    for s in streams:
+        keep = False; stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); title = s.get('title', '').lower()
+        if stype == 'video' or (stype == 'audio' and (lang == 'eng' or 'commentary' in title or 'director' in title)) or (stype == 'subtitle' and lang == 'eng'): keep = True
+        if keep: streams_to_keep.append(s)
+        else: streams_to_remove.append(s)
+    return streams_to_keep, streams_to_remove
+
+def display_and_confirm_plan(s_keep, s_rem):
+    print("\n--- Stream Selection Plan ---\nKEPT:"); [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep]
+    print("\nREMOVED:"); [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem]
+    try: return input("Proceed? [y/N]: ").lower().strip() == 'y'
+    except KeyboardInterrupt: return False
+
+def format_size(size_bytes):
+    """Converts a size in bytes to a human-readable string using binary prefixes."""
+    if size_bytes is None or not isinstance(size_bytes, (int, float)) or size_bytes < 0: return "N/A"
+    if size_bytes == 0: return "0 B"
+    size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
+    try:
+        i = int(math.floor(math.log(size_bytes, 1024))); i = min(i, len(size_name) - 1)
+        p = math.pow(1024, i); s = round(size_bytes / p, 2)
+        return f"{s} {size_name[i]}"
+    except (ValueError, TypeError): return "N/A"
+
+def print_size_summary(original_size_bytes, new_size_bytes):
+    """Prints a formatted summary of the file size change."""
+    print("\n--- File Size Summary ---")
+    original_size_str = format_size(original_size_bytes); new_size_str = format_size(new_size_bytes)
+    print(f"Original:   {original_size_str}"); print(f"New:         {new_size_str}")
+    if original_size_bytes is not None and new_size_bytes is not None and original_size_bytes > 0:
+        difference_bytes = new_size_bytes - original_size_bytes; percentage_change = (difference_bytes / original_size_bytes) * 100
+        change_type = "increase" if difference_bytes >= 0 else "decrease"; difference_str = format_size(abs(difference_bytes))
+        print(f"Difference: {difference_str} ({abs(percentage_change):.2f}% {change_type})")
+    else: print("Difference: N/A")
+    print("-------------------------")
+
+def find_video_files(p, r):
+    vids = [];
+    if r: [vids.extend([os.path.join(root, f) for f in files if f.lower().endswith(VIDEO_EXTENSIONS)]) for root, _, files in os.walk(p)]
+    else: vids.extend([os.path.join(p, f) for f in os.listdir(p) if f.lower().endswith(VIDEO_EXTENSIONS)])
+    return vids
+
+def is_hevc(f):
+    if not os.path.exists(f): return False
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', f]
+    try: return 'hevc' in subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.lower()
+    except Exception: return False
+
+def print_ffmpeg_command(cmd):
+    """Prints the FFmpeg command for dry-run mode."""
+    print("\nExecuting FFmpeg command (Dry Run):")
+    print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
+
+# --- NEW: Function to embed chapters using mkvpropedit ---
+def embed_chapters_mkvpropedit(chapter_file, output_mkv):
+    """Embeds chapters into an existing MKV file using mkvpropedit."""
+    if not shutil.which('mkvpropedit'):
+        print("\nError: 'mkvpropedit' command not found. Please install MKVToolNix.", file=sys.stderr)
+        return False
+    if not os.path.exists(chapter_file):
+        print(f"\nError: Chapter file not found at '{chapter_file}'.", file=sys.stderr)
+        return False
+    if not os.path.exists(output_mkv):
+        print(f"\nError: Output MKV file '{output_mkv}' not found for chapter embedding.", file=sys.stderr)
+        return False
+
+    mkvpropedit_cmd = ['mkvpropedit', output_mkv, '--chapters', chapter_file]
+    print("\nExecuting mkvpropedit command:")
+    print(' '.join(f'"{a}"' if ' ' in a else a for a in mkvpropedit_cmd))
+
+    try:
+        # Capture output to check for errors/warnings
+        result = subprocess.run(mkvpropedit_cmd, check=True, capture_output=True, text=True)
+        # mkvpropedit often prints progress or confirmations to stdout/stderr even on success
+        if result.stdout: print("mkvpropedit output:", result.stdout)
+        if result.stderr: print("mkvpropedit errors/warnings:", result.stderr)
+        print(f"Successfully embedded chapters into '{os.path.basename(output_mkv)}'.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"\n--- mkvpropedit Error ---", file=sys.stderr)
+        print(f"Command failed with exit code {e.returncode}", file=sys.stderr)
+        if e.stdout: print("stdout:", e.stdout, file=sys.stderr)
+        if e.stderr: print("stderr:", e.stderr, file=sys.stderr)
+        print(f"-------------------------", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"\nAn unexpected error occurred running mkvpropedit: {e}", file=sys.stderr)
+        return False
+# --- END NEW FUNCTION ---
+
+def run_ffmpeg_command(cmd, source_file, delete_source, total_frames=None, permissions=None, chapter_file_to_embed=None):
+    """Executes FFmpeg, shows progress, verifies output, and optionally embeds chapters."""
+    print("\nExecuting FFmpeg command:")
+    print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
+    output_file = cmd[-1]
+    original_size_bytes = os.path.getsize(source_file) if os.path.exists(source_file) else None
+    
+    # --- FFmpeg Execution ---
+    ffmpeg_success = False
+    try:
+        if "-progress" not in cmd:
+            subprocess.run(cmd, check=True)
+        else:
+            if total_frames is None: print("\nWarning: Could not get total frames. Progress bar indeterminate.")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8')
+            with tqdm(total=total_frames, unit='frame', dynamic_ncols=True, desc="FFmpeg") as pbar:
+                for line in process.stdout:
+                    if line.strip().startswith("frame="):
+                        current_frame = int(line.strip().split("=")[1]); pbar.update(max(0, current_frame - pbar.n))
+            stderr_output = process.stderr.read(); process.wait()
+            if process.returncode != 0: raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_output)
+        ffmpeg_success = True
+    except (subprocess.CalledProcessError, FileNotFoundError, KeyboardInterrupt) as e:
+        if isinstance(e, subprocess.CalledProcessError): print(f"\n--- FFmpeg Error ---\n{e.stderr}\n--------------------", file=sys.stderr)
+        elif isinstance(e, FileNotFoundError): print("\nError: Required command not found (ffmpeg/stdbuf).", file=sys.stderr)
+        else: print("\nCancelled.", file=sys.stderr)
+        if 'process' in locals(): process.terminate()
+        sys.exit(1) # Exit immediately on FFmpeg failure
+
+    # --- Post-FFmpeg Verification ---
+    if not ffmpeg_success or not os.path.exists(output_file):
+        print(f"\nError: FFmpeg failed or output file '{output_file}' not created.", file=sys.stderr); sys.exit(1)
+    try:
+        new_size_bytes = os.path.getsize(output_file)
+        subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
+    except Exception:
+        print(f"\nError: Output file '{output_file}' appears invalid after FFmpeg.", file=sys.stderr); sys.exit(1)
+    
+    print(f"\nSuccessfully created and verified FFmpeg output '{output_file}'.")
+    
+    # --- Chapter Embedding (NEW STEP) ---
+    chapters_embedded_successfully = True # Assume success if not requested
+    if chapter_file_to_embed:
+        chapters_embedded_successfully = embed_chapters_mkvpropedit(chapter_file_to_embed, output_file)
+        if not chapters_embedded_successfully:
+            print(f"\nError: Failed to embed chapters using mkvpropedit. Output file '{output_file}' may be incomplete.", file=sys.stderr)
+            # Decide if you want to exit here or continue. For now, we continue but warn.
+            # sys.exit(1)
+    # --- END Chapter Embedding ---
+
+    # --- Permissions ---
+    if permissions:
+        try:
+            os.chown(output_file, permissions['uid'], permissions['gid']); os.chmod(output_file, permissions['mode'])
+            print(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
+        except OSError as e: print(f"\nWarning: Could not set permissions. Reason: {e}", file=sys.stderr)
+
+    print_size_summary(original_size_bytes, new_size_bytes)
+    
+    # --- Delete Source ---
+    # Only delete if BOTH FFmpeg AND chapter embedding (if requested) were successful
+    if delete_source and ffmpeg_success and chapters_embedded_successfully:
+        print(f"\nInfo: --delete flag set. Deleting source file...")
+        try:
+            os.remove(source_file); print(f"Successfully deleted: {source_file}")
+        except OSError as e: print(f"\nError: Could not delete source '{source_file}'. Reason: {e}", file=sys.stderr)
+    elif delete_source:
+         print(f"\nWarning: --delete flag ignored because chapter embedding failed.")
+
+# --- Main Logic ---
+def main():
+    print(f",hvec v{__version__}") # Print current version first
+
+    # --- Argument Parser ---
+    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R\n  ,hvec -i movie.mp4 -r -C chapters.txt")
+    parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
+    parser.add_argument("-o", "--output", help="Output MKV file (single file mode only).")
+    parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter streams (single file mode only).")
+    parser.add_argument("-D", "--delete", action="store_true", help="Delete original file after success.")
+    parser.add_argument("--out-dir", help="Output directory for batch processing.")
+    parser.add_argument("-R", "--recursive", action="store_true", help="Process subdirectories.")
+    parser.add_argument("-C", "--chapters", help="External chapter file (TXT/OGM or XML) to embed (requires MKVToolNix).")
+    parser.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed (single file mode only).")
+    parser.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
+    parser.add_argument("-Q", "--quality", type=int, default=24, help="Set VAAPI quality (1-51).")
+    parser.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.")
+    parser.add_argument("--acodec", help="Re-encode audio codec (e.g., 'aac', 'ac3'). Default: 'copy'.")
+    parser.add_argument("--abitrate", help="Set audio bitrate (e.g., '192k', '384k').")
+    parser.add_argument("--skip-hevc", action="store_true", help="Skip files that are already HEVC.")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
+    parser.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux (instead of transcode).")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg output.")
+    parser.add_argument("-v", "--version", action="store_true", help="Show version history and exit.")
+    
+    argcomplete.autocomplete(parser); args = parser.parse_args()
+    
+    if args.version: print(VERSION_HISTORY); sys.exit(0) # Handle --version flag
+
+    if not os.path.exists(args.input): print(f"Error: Input not found: {args.input}", file=sys.stderr); sys.exit(1)
+    
+    # --- File Processing Loop ---
+    files_to_process = find_video_files(args.input, args.recursive) if os.path.isdir(args.input) else [args.input]
+    if not files_to_process: print("No video files found to process."); sys.exit(0)
+
+    for i, input_file in enumerate(files_to_process, 1):
+        print(f"\n--- Processing file {i}/{len(files_to_process)}: {os.path.basename(input_file)} ---")
+        
+        # --- Chapter File Handling ---
+        # Store chapter file path separately, disable for batch unless explicitly handled later
+        chapter_file_for_this_run = args.chapters
+        if chapter_file_for_this_run and len(files_to_process) > 1:
+            print("Info: --chapters flag is ignored in batch/directory mode for now.")
+            chapter_file_for_this_run = None # Disable chapters for batch mode
+        if chapter_file_for_this_run and not os.path.exists(chapter_file_for_this_run):
+             print(f"Warning: Chapter file '{chapter_file_for_this_run}' not found. Skipping chapter embedding.")
+             chapter_file_for_this_run = None
+
+        # --- Permissions ---
+        permissions_to_apply = None
+        try:
+            stat_info = os.stat(input_file); input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
+            target_gid = input_gid
+            if input_group_name != 'jellyfin':
+                try:
+                    jellyfin_gid = grp.getgrnam('jellyfin').gr_gid
+                    response = input(f"Warning: Source group is '{input_group_name}'. Change output to 'jellyfin'? [Y/n]: ").lower().strip()
+                    if response in ('y', 'yes', ''): target_gid = jellyfin_gid; print("Info: Output group set to 'jellyfin'.")
+                except KeyError: print("Info: 'jellyfin' group not found. Preserving original.")
+                except (KeyboardInterrupt, EOFError): print("\nCancelled."); sys.exit(1)
+            permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
+        except (OSError, KeyError) as e: print(f"Warning: Could not read source permissions. Reason: {e}", file=sys.stderr)
+
+        # --- Skip HEVC Check ---
+        if args.skip_hevc and is_hevc(input_file): print("Already HEVC. Skipping."); continue
+
+        # --- Output Filename Generation ---
+        def generate_output_filename(base, is_remux, has_chapters): # <--- 1. ADD ARGUMENT
+            sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.') # Cleaner regex
+            suffix = ".REMUX" if is_remux else ".CONV"
+            chapter_suffix = ".CHAPTERS" if has_chapters else "" # <--- 2. ADD THIS LINE
+            # Ensure suffix isn't duplicated, handle case where base already ends with it
+            base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
+            return f"{base_no_suffix}{suffix}{chapter_suffix}.mkv" # <--- 3. ADD SUFFIX TO RETURN
+
+        is_remux_op = args.remux and not args.hvec
+        if args.output and len(files_to_process) == 1: output_file = args.output
+        else:
+            base, _ = os.path.splitext(os.path.basename(input_file));
+            # Check if chapters are being added for the filename suffix
+            has_chapters_flag = chapter_file_for_this_run is not None # <--- 1. ADD THIS LINE
+            new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag) # <--- 2. PASS FLAG
+            if args.out_dir:
+                relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input))
+                output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
+                output_file = os.path.join(output_dir, new_filename)
+            else: output_file = os.path.join(os.path.dirname(input_file), new_filename)
+        
+        # Prevent source overwrite
+        if os.path.abspath(output_file) == os.path.abspath(input_file):
+            base, ext = os.path.splitext(output_file); output_file = f"{base}.COPY{ext}"
+            print(f"Info: Output name identical to input. Using '{os.path.basename(output_file)}'")
+                    
+        # Overwrite check
+        if os.path.exists(output_file) and not args.dry_run:
+            try:
+                if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': print("Skipping."); continue
+            except KeyboardInterrupt: print("\nCancelled."); sys.exit(1)
+        
+        # --- FFmpeg Command Construction ---
+        total_frames = get_total_frames(input_file) if not (is_remux_op or args.quiet or args.dry_run) else None
+        ffmpeg_cmd = ['ffmpeg', '-y']
+        
+        # Progress/Verbosity
+        use_progress_bar = total_frames is not None and not (is_remux_op or args.quiet or args.dry_run)
+        if use_progress_bar:
+            if sys.platform != "win32": ffmpeg_cmd = ['stdbuf', '-o0'] + ffmpeg_cmd
+            ffmpeg_cmd.extend(['-progress', '-', '-nostats'])
+        elif args.quiet: ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
+        else: ffmpeg_cmd.extend(['-v', 'error', '-stats'])
+        
+        # Hardware Acceleration (only for transcode)
+        if not is_remux_op: ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
+        # Input Fixes
+        if input_file.lower().endswith('.avi'): ffmpeg_cmd.extend(['-fflags', '+genpts'])
+            
+        # --- Input Files ---
+        # NOTE: Chapter input is NOT added here anymore
+        ffmpeg_cmd.extend(['-i', input_file]) # Main video input is always index 0 now
+        
+        # Add subtitle inputs if provided (single file mode only)
+        subtitle_input_index = 1 # Starts after main video input
+        if args.subs and len(files_to_process) == 1:
+            valid_subs = []
+            for sub_file in args.subs:
+                if os.path.exists(sub_file):
+                    ffmpeg_cmd.extend(['-i', sub_file])
+                    valid_subs.append(sub_file)
+                else: print(f"Warning: Subtitle file not found: {sub_file}")
+            args.subs = valid_subs # Update args to only include valid subs found
+        
+        # --- Stream Mapping ---
+        if args.filter_streams and len(files_to_process) == 1:
+            all_streams = get_stream_info(input_file)
+            if all_streams is None: continue
+            s_keep, s_rem = plan_stream_selection(all_streams)
+            if not display_and_confirm_plan(s_keep, s_rem): print("Skipping file."); continue
+            # Map selected streams (always from input 0)
+            for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
+            # NOTE: Subtitle mapping (-s) is ignored if filtering (-k)
+            args.subs = [] # Disable subtitle embedding if filtering
+
+        elif args.subs: # Only map subs if -s was used and -k was not
+             # Map video/audio from main input (index 0)
+            ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
+            # Map subtitle streams from subtitle inputs (starting at index 1)
+            for j in range(len(args.subs)):
+                 ffmpeg_cmd.extend(['-map', f'{subtitle_input_index + j}:s:0', f'-metadata:s:s:{j}', 'language=eng'])
+        
+        else: # Default: Map all streams from main input
+            ffmpeg_cmd.extend(['-map', '0']) # Map all streams from input 0
+
+        # --- Codec Logic ---
+        if is_remux_op:
+            print("Mode: Lossless Remux");
+            ffmpeg_cmd.extend(['-c', 'copy']) # Global copy for remux
+            ffmpeg_cmd.extend(['-c:s', 'srt']) # Ensure subs are compatible
+        else: # Transcode
+            print("\nMode: VAAPI Transcode")
+            ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
+            ffmpeg_cmd.extend(['-c:a', args.acodec if args.acodec else 'copy'])
+            if args.acodec and args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
+            ffmpeg_cmd.extend(['-c:s', 'srt' if args.subs else 'copy']) # Convert embedded subs if -s used, else copy
+
+        ffmpeg_cmd.append(output_file) # Add output file path
+        
+        # --- Execute ---
+        if args.dry_run:
+            print_ffmpeg_command(ffmpeg_cmd)
+            # Optionally print mkvpropedit command in dry run too
+            if chapter_file_for_this_run:
+                 mkvpropedit_cmd = ['mkvpropedit', output_file, '--chapters', chapter_file_for_this_run]
+                 print("\nMKVPropEdit command (Dry Run):")
+                 print(' '.join(f'"{a}"' if ' ' in a else a for a in mkvpropedit_cmd))
+        else:
+            run_ffmpeg_command(
+                ffmpeg_cmd,
+                input_file,
+                args.delete,
+                total_frames=total_frames,
+                permissions=permissions_to_apply,
+                chapter_file_to_embed=chapter_file_for_this_run # Pass chapter file to runner function
+            )
+
+    print("\n--- All tasks complete. ---")
+
+if __name__ == "__main__":
+    main()
