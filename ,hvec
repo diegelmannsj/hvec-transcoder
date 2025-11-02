@@ -11,13 +11,27 @@ import re
 import shutil
 from tqdm import tqdm
 import grp # Added for group name resolution
+from typing import Dict, Any # Added for type hinting
 
 # --- Version History ---
-__version__ = "7.7"
+__version__ = "7.8"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v7.8    feat(normalize): Read data from ,audit_loudness log
+        
+        - The -N/--normalize flag can now optionally accept a
+          log file path (e.g., -N loudness_audit.log).
+        - If a log file is provided, ,hvec will load it into a
+          "loudness database" and skip its own Pass 1 analysis
+          if the file is found.
+        - If -N is used *without* a file, or if the input file
+          is not found in the log, it falls back to the
+          original behavior (running its own analysis).
+        - This allows reusing the scan from ,audit_loudness
+          to save time.
+
 v7.7    fix(remux): Apply -fflags +genpts to all .avi operations
 
         - The .avi timestamp fix (-fflags +genpts) was incorrectly
@@ -37,23 +51,7 @@ v7.6    fix(ffmpeg): Correct ffmpeg syntax for -vf filter
           and were in the wrong place in v7.5.
 
 v7.5    fix(ffmpeg): Add hwupload filter for software-decoded .avi
-        
-        - Fixes a filter crash when transcoding .avi files.
-        - When an .avi is software-decoded (CPU) and hardware-
-          encoded (VAAPI), we must now manually add a video
-          filter ('-vf format=nv12,hwupload') to upload the
-          CPU frame to the GPU for encoding.
-
 v7.4    feat(normalize): Print audio stats & use VBR for audio
-        fix(ffmpeg): Disable hwaccel decode for .avi files
-
-        - Audio normalization now prints the measured loudness (LUFS)
-          and true peak (dBTP) found during analysis.
-        - Switched normalization re-encode from CBR (-b:a 320k) to
-          VBR (-q:a 4) to prevent file size bloat.
-        - Fixed a bug where hwaccel decode was (incorrectly)
-          attempted on .avi files, causing a crash.
-
 v7.3    feat(normalize): Add .NORM suffix and update summary
 v7.2.2  fix(ffmpeg): Add -nostdin flag to disable interactive mode
 v7.2.1  fix(typo): Corrected 'add_ar_argument' to 'add_argument'
@@ -158,11 +156,10 @@ def print_ffmpeg_command(cmd):
     print("\nExecuting FFmpeg command (Dry Run):")
     print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
 
-def run_loudnorm_analysis(input_file):
+def run_loudnorm_analysis(input_file: str) -> Dict[str, float] or None:
     """
     Runs FFmpeg Pass 1 to analyze audio loudness and returns the parsed JSON data.
     """
-    print("Running audio normalization analysis (Pass 1)...")
     cmd = [
         'ffmpeg', '-nostdin', '-i', input_file, # Added -nostdin
         '-map', '0:a:0',  # Analyze the first audio stream
@@ -189,8 +186,16 @@ def run_loudnorm_analysis(input_file):
             
         json_text = stderr_output[start_index:end_index+1]
         data = json.loads(json_text)
-        print("Analysis complete.")
-        return data
+        
+        # Return the 4 required values in our standard dictionary format
+        loudness_data = {
+            'i': float(data['input_i']),
+            'tp': float(data['input_tp']),
+            'lra': float(data['input_lra']),
+            'thresh': float(data['input_thresh'])
+        }
+        return loudness_data
+        
     except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
         print(f"\nError during audio analysis: {e}", file=sys.stderr)
         if 'stderr_output' in locals():
@@ -304,12 +309,52 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     elif delete_source:
          print(f"\nWarning: --delete flag ignored because chapter embedding failed.")
 
+# --- NEW HELPER FUNCTION (v7.8) ---
+def load_loudness_db(log_file: str) -> Dict[str, Dict[str, float]]:
+    """
+    Reads a pipe-delimited loudness audit log file and returns a
+    dictionary mapping file paths to their normalization data.
+    """
+    db = {}
+    if not os.path.exists(log_file):
+        print(f"Warning: Loudness log not found at '{log_file}'. Will run analysis.", file=sys.stderr)
+        return db
+
+    print(f"Info: Loading loudness database from '{os.path.basename(log_file)}'...")
+    try:
+        with open(log_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith("Timestamp|Status"):
+                    continue
+                
+                try:
+                    parts = line.strip().split('|')
+                    if len(parts) >= 10 and parts[1] == 'SUCCESS':
+                        file_path = parts[2].strip()
+                        # Keys must match what run_loudnorm_analysis returns
+                        data = {
+                            'i': float(parts[5]),
+                            'tp': float(parts[7]),
+                            'lra': float(parts[8]),
+                            'thresh': float(parts[9])
+                        }
+                        db[file_path] = data
+                except (IndexError, ValueError):
+                    pass # Ignore malformed or non-SUCCESS lines
+    except Exception as e:
+        print(f"Error: Could not read loudness log '{log_file}': {e}", file=sys.stderr)
+    
+    print(f"Info: Loaded {len(db)} pre-analyzed entries.")
+    return db
+# --- END NEW HELPER FUNCTION ---
+
+
 # --- Main Logic ---
 def main():
     print(f",hvec v{__version__}") # Print current version first
 
     # --- Argument Parser ---
-    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R\n  ,hvec -i movie.mp4 -r -C chapters.txt")
+    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R\n  ,hvec -i movie.mp4 -r -C chapters.txt\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.log")
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
     parser.add_argument("-o", "--output", help="Output MKV file (single file mode only).")
     parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter streams (single file mode only).")
@@ -319,7 +364,19 @@ def main():
     parser.add_argument("-C", "--chapters", help="External chapter file (TXT/OGM or XML) to embed (requires MKVToolNix).")
     parser.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed (single file mode only).")
     parser.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
-    parser.add_argument("-N", "--normalize", action="store_true", help="Normalize audio to EBU R128 (-23 LUFS) standard (transcode mode only).")
+    
+    # --- MODIFIED: -N now optionally takes a value (v7.8) ---
+    parser.add_argument(
+        "-N", "--normalize", 
+        nargs='?', 
+        const=True, 
+        default=None, 
+        help="Normalize audio to EBU R128 (-23 LUFS). \n"
+             "Optionally provide a path to a loudness_audit.log file \n"
+             "to skip analysis and use pre-scanned values."
+    )
+    # --- END MODIFIED ---
+    
     parser.add_argument("-Q", "--quality", type=int, default=24, help="Set VAAPI quality (1-51).")
     parser.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.")
     parser.add_argument("--acodec", help="Re-encode audio codec (e.g., 'aac', 'ac3'). Default: 'copy'.")
@@ -335,6 +392,15 @@ def main():
     if args.version: print(VERSION_HISTORY); sys.exit(0) # Handle --version flag
 
     if not os.path.exists(args.input): print(f"Error: Input not found: {args.input}", file=sys.stderr); sys.exit(1)
+    
+    # --- MODIFIED: Load Loudness DB (v7.8) ---
+    loudness_db = {}
+    is_normalize_enabled = args.normalize is not None
+    
+    if isinstance(args.normalize, str):
+        # This means a log file path was provided, e.g., -N file.log
+        loudness_db = load_loudness_db(args.normalize)
+    # --- END MODIFIED ---
     
     # --- File Processing Loop ---
     files_to_process = find_video_files(args.input, args.recursive) if os.path.isdir(args.input) else [args.input]
@@ -378,18 +444,18 @@ def main():
             sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.') # Cleaner regex
             suffix = ".REMUX" if is_remux else ".CONV"
             chapter_suffix = ".CHAPTERS" if has_chapters else ""
-            norm_suffix = ".NORM" if is_normalized else "" # <--- NEW
+            norm_suffix = ".NORM" if is_normalized else "" # <--- Use our new flag
             # Ensure suffix isn't duplicated, handle case where base already ends with it
             base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
-            return f"{base_no_suffix}{suffix}{norm_suffix}{chapter_suffix}.mkv" # <--- MODIFIED
+            return f"{base_no_suffix}{suffix}{norm_suffix}{chapter_suffix}.mkv"
 
         if args.output and len(files_to_process) == 1: output_file = args.output
         else:
             base, _ = os.path.splitext(os.path.basename(input_file));
             # Check for suffixes
             has_chapters_flag = chapter_file_for_this_run is not None
-            has_normalized_flag = args.normalize # <--- NEW
-            new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag, has_normalized_flag) # <--- MODIFIED
+            has_normalized_flag = is_normalize_enabled # <--- Use our new flag
+            new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag, has_normalized_flag)
             
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input))
@@ -484,22 +550,37 @@ def main():
             ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
 
         # 2. AUDIO LOGIC
-        if args.normalize:
+        if is_normalize_enabled: # <--- Use our new flag
             if is_remux_op:
                 print("Info: Normalizing audio while remuxing video.")
             
-            analysis_data = run_loudnorm_analysis(input_file)
+            # --- MODIFIED: Loudness DB check (v7.8) ---
+            analysis_data = None
+            abs_input_file = os.path.abspath(input_file)
+            
+            if abs_input_file in loudness_db:
+                analysis_data = loudness_db[abs_input_file]
+                print("Info: Using pre-analyzed loudness data from log.")
+            else:
+                if isinstance(args.normalize, str):
+                    print(f"Info: File not found in log, running live analysis...")
+                print("Running audio normalization analysis (Pass 1)...")
+                analysis_data = run_loudnorm_analysis(input_file)
+                if analysis_data:
+                    print("Analysis complete.")
+            # --- END MODIFIED ---
+            
             if analysis_data:
                 try:
-                    measured_i = analysis_data['input_i']
-                    measured_tp = analysis_data['input_tp']
-                    measured_lra = analysis_data['input_lra']
-                    measured_thresh = analysis_data['input_thresh']
+                    measured_i = analysis_data['i']
+                    measured_tp = analysis_data['tp']
+                    measured_lra = analysis_data['lra']
+                    measured_thresh = analysis_data['thresh']
                     
                     # Print audio stats
                     print("Info: Audio analysis found:")
-                    print(f"  - Input Loudness: {measured_i} LUFS")
-                    print(f"  - Input True Peak: {measured_tp} dBTP")
+                    print(f"  - Input Loudness: {measured_i:.2f} LUFS")
+                    print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
                     
                     filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                     
@@ -510,7 +591,7 @@ def main():
                     print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams copied.")
                     audio_normalized = True # Mark as complete
                 except KeyError:
-                    print("Warning: Audio analysis JSON was incomplete. Falling back to default audio settings.", file=sys.stderr)
+                    print("Warning: Audio analysis data was incomplete. Falling back to default audio settings.", file=sys.stderr)
             else:
                 print("Warning: Audio normalization analysis failed. Falling back to default audio settings.", file=sys.stderr)
         
@@ -521,7 +602,7 @@ def main():
                 if args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
             else:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
-                if not args.normalize: # Don't print "copying" if we're here on a failed normalize
+                if not is_normalize_enabled: # Don't print "copying" if we're here on a failed normalize
                     print("Info: Copying all audio streams.")
 
         # 3. SUBTITLE LOGIC
