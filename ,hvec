@@ -13,11 +13,22 @@ from tqdm import tqdm
 import grp # Added for group name resolution
 
 # --- Version History ---
-__version__ = "7.6"
+__version__ = "7.7"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v7.7    fix(remux): Apply -fflags +genpts to all .avi operations
+
+        - The .avi timestamp fix (-fflags +genpts) was incorrectly
+          tied to the transcode logic in v7.6, which broke
+          .avi remuxing.
+        - This fix separates the logic, ensuring -fflags +genpts
+          is always applied to .avi inputs, fixing the
+          "Can't write packet with unknown timestamp" error.
+        - Cleaned up logic by using 'is_avi' and 'is_transcode'
+          variables.
+
 v7.6    fix(ffmpeg): Correct ffmpeg syntax for -vf filter
         
         - Moved the '-vf format=nv12,hwupload' filter to *after*
@@ -361,6 +372,8 @@ def main():
         if args.skip_hevc and is_hevc(input_file): print("Already HEVC. Skipping."); continue
 
         # --- Output Filename Generation ---
+        is_remux_op = args.remux and not args.hvec # <--- Moved this line up
+        
         def generate_output_filename(base, is_remux, has_chapters, is_normalized):
             sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.') # Cleaner regex
             suffix = ".REMUX" if is_remux else ".CONV"
@@ -370,7 +383,6 @@ def main():
             base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
             return f"{base_no_suffix}{suffix}{norm_suffix}{chapter_suffix}.mkv" # <--- MODIFIED
 
-        is_remux_op = args.remux and not args.hvec
         if args.output and len(files_to_process) == 1: output_file = args.output
         else:
             base, _ = os.path.splitext(os.path.basename(input_file));
@@ -409,14 +421,17 @@ def main():
         elif args.quiet: ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
         else: ffmpeg_cmd.extend(['-v', 'error', '-stats'])
         
-        # --- .avi HWACCEL FIX (v7.6) ---
-        is_avi_transcode = input_file.lower().endswith('.avi') and not is_remux_op
+        # --- HWACCEL & .avi FIX (v7.7) ---
+        is_avi = input_file.lower().endswith('.avi')
+        is_transcode = not is_remux_op
         
-        if is_avi_transcode:
-            # .avi files need this input flag (goes BEFORE -i)
+        if is_avi:
+            # .avi files almost always need this to fix broken timestamps,
+            # for both remuxing and transcoding.
             ffmpeg_cmd.extend(['-fflags', '+genpts'])
-        elif not is_remux_op:
-            # Use hwaccel decode for all other non-remux transcodes
+
+        if is_transcode and not is_avi:
+            # Use hwaccel decode ONLY for non-avi transcodes
             ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
         # --- END FIX ---
             
@@ -460,8 +475,8 @@ def main():
         else:
             print("\nMode: VAAPI Video Transcode")
             
-            # --- .avi HWACCEL FIX (v7.6) ---
-            if is_avi_transcode:
+            # --- .avi HWACCEL FIX (v7.7) ---
+            if is_transcode and is_avi:
                 # Add the manual hwupload filter (goes AFTER -i)
                 ffmpeg_cmd.extend(['-vf', 'format=nv12,hwupload'])
             # --- END FIX ---
