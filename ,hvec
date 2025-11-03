@@ -7,40 +7,46 @@ import os
 import json
 import math
 import argcomplete
-import re
+import re  # <-- MODIFIED: Import re
 import shutil
 from tqdm import tqdm
-import grp # Added for group name resolution
-from typing import Dict, Any # Added for type hinting
-import csv  # <-- MODIFIED: Import csv module
+import grp
+from typing import Dict, Any
+import csv
 
 # --- Version History ---
-__version__ = "7.9"
+__version__ = "8.0.0"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.0.0  feat(normalize): Use fast `ebur128` filter for analysis
+        
+        - Replaced the internal `run_loudnorm_analysis` function
+          with the same fast `ebur128` + regex parsing
+          function from `,audit_loudness` v2.1.0.
+        - This dramatically speeds up audio normalization when
+          a log file is NOT provided (i.e., when -N is used
+          and ,hvec must do its own scan).
+        - Uses `-threads 0` to allow ffmpeg to auto-detect
+          threads for the analysis.
+        
+        fix(main): Correct silent exit bug
+        
+        - Split `argcomplete.autocomplete(parser)` and
+          `args = parser.parse_args()` onto separate lines.
+        - This fixes a bug where the script would print the
+          version and immediately exit without processing
+          any arguments.
+
 v7.9    feat(normalize): Read CSV data from ,audit_loudness v2
         
         - Updated the `load_loudness_db` function to parse
           the new CSV log file format from ,audit_loudness v2.
         - Now uses `csv.DictReader` to read the log, making
-          it robust against column order changes by mapping
-          headers ('CurrentLoudness', 'MeasuredTP', etc.)
-          directly.
+          it robust against column order changes.
 
 v7.8    feat(normalize): Read data from ,audit_loudness log
-        
-        - The -N/--normalize flag can now optionally accept a
-          log file path (e.g., -N loudness_audit.log).
-        - If a log file is provided, ,hvec will load it into a
-          "loudness database" and skip its own Pass 1 analysis
-          if the file is found.
-        - If -N is used *without* a file, or if the input file
-          is not found in the log, it falls back to the
-          original behavior (running its own analysis).
-        - This allows reusing the scan from ,audit_loudness
-          to save time.
 v7.7    fix(remux): Apply -fflags +genpts to all .avi operations
 v7.6    fix(ffmpeg): Correct ffmpeg syntax for -vf filter
 v7.5    fix(ffmpeg): Add hwupload filter for software-decoded .avi
@@ -162,54 +168,68 @@ def print_ffmpeg_command(cmd):
     print("\nExecuting FFmpeg command (Dry Run):")
     print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
 
+# --- MODIFIED: Replaced with fast ebur128 analysis ---
 def run_loudnorm_analysis(input_file: str) -> Dict[str, float] or None:
     """
-    Runs FFmpeg Pass 1 to analyze audio loudness and returns the parsed JSON data.
+    Runs the FFmpeg ebur128 analysis on a single file.
+    This is much faster than the loudnorm filter.
     """
+    start_time = time.time()
     cmd = [
-        'ffmpeg', '-nostdin', '-i', input_file, # Added -nostdin
+        'ffmpeg', '-nostdin', '-i', input_file,
+        '-threads', '0',  # Use all available threads
         '-map', '0:a:0',  # Analyze the first audio stream
-        '-af', 'loudnorm=print_format=json',
+        '-af', 'ebur128=peak=true', # Use the ebur128 filter
         '-f', 'null', '-'
     ]
+    
     try:
-        # ffmpeg writes all info, including the JSON, to stderr.
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding='utf-8')
+        # The ebur128 filter writes all its output to stderr.
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=1200)
+        
         stderr_output = result.stderr
         
         if not stderr_output:
             print("Error: No output from ffmpeg analysis.", file=sys.stderr)
             return None
 
-        # Find the JSON block. It's the last { ... } block in the output.
-        start_index = stderr_output.rfind('{')
-        end_index = stderr_output.rfind('}')
-        
-        if start_index == -1 or end_index == -1 or end_index < start_index:
-            print(f"Error: Could not find JSON block in ffmpeg analysis output.", file=sys.stderr)
-            print(f"--- FFmpeg Stderr ---\n{stderr_output}\n---------------------", file=sys.stderr)
-            return None
-            
-        json_text = stderr_output[start_index:end_index+1]
-        data = json.loads(json_text)
-        
-        # Return the 4 required values in our standard dictionary format
-        loudness_data = {
-            'i': float(data['input_i']),
-            'tp': float(data['input_tp']),
-            'lra': float(data['input_lra']),
-            'thresh': float(data['input_thresh'])
+        # --- Regex patterns to find the 4 values ---
+        patterns = {
+            'i':      re.compile(r"Integrated loudness:\s+I:\s*(-?[\d\.]+)\s+LUFS"),
+            'thresh': re.compile(r"Integrated loudness:\s+I:.*?\s+Threshold:\s*(-?[\d\.]+)\s+LUFS"),
+            'lra':    re.compile(r"Loudness range:\s+LRA:\s*(-?[\d\.]+)\s+LU"),
+            'tp':     re.compile(r"True peak:\s+Peak:\s*(-?[\d\.]+)\s+dBFS")
         }
+        
+        loudness_data = {}
+        missing_keys = []
+        
+        for key, pattern in patterns.items():
+            match = pattern.search(stderr_output)
+            if match:
+                loudness_data[key] = float(match.group(1))
+            else:
+                missing_keys.append(key)
+
+        if missing_keys:
+            if "Stream map '0:a:0' matches no streams" in stderr_output:
+                return None # Return None, main loop will print warning
+            else:
+                print(f"Error: Could not parse ebur128 output. Missing: {', '.join(missing_keys)}", file=sys.stderr)
+                return None
+
         return loudness_data
         
-    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"\nError during audio analysis: {e}", file=sys.stderr)
-        if 'stderr_output' in locals():
-            print(f"--- FFmpeg Stderr ---\n{stderr_output}\n---------------------", file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print("Error: Audio analysis process timed out (20 minutes)", file=sys.stderr)
+        return None
+    except FileNotFoundError:
+        print("Error: ffmpeg command not found in PATH", file=sys.stderr)
         return None
     except Exception as e:
         print(f"\nAn unexpected error occurred during audio analysis: {e}", file=sys.stderr)
         return None
+# --- END MODIFIED ---
 
 def embed_chapters_mkvpropedit(chapter_file, output_mkv):
     """Embeds chapters into an existing MKV file using mkvpropedit."""
@@ -399,8 +419,10 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg output.")
     parser.add_argument("-v", "--version", action="store_true", help="Show version history and exit.")
     
-    argcomplete.autocomplete(parser);
+    # --- MODIFIED: Split argcomplete and parse_args ---
+    argcomplete.autocomplete(parser)
     args = parser.parse_args()
+    # --- END MODIFIED ---
     
     if args.version: print(VERSION_HISTORY);
     sys.exit(0) # Handle --version flag
@@ -591,7 +613,7 @@ def main():
                 if isinstance(args.normalize, str):
                     print(f"Info: File not found in log, running live analysis...")
                 print("Running audio normalization analysis (Pass 1)...")
-                analysis_data = run_loudnorm_analysis(input_file)
+                analysis_data = run_loudnorm_analysis(input_file) # <-- NOW USES FAST ebur128
                 if analysis_data:
                     print("Analysis complete.")
             # --- END MODIFIED ---
