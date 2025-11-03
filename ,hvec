@@ -12,39 +12,35 @@ import shutil
 from tqdm import tqdm
 import grp # Added for group name resolution
 from typing import Dict, Any # Added for type hinting
+import csv  # <-- MODIFIED: Import csv module
 
 # --- Version History ---
-__version__ = "8.0"
+__version__ = "7.9"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v8.0    feat(normalize): Add protected codec list
+v7.9    feat(normalize): Read CSV data from ,audit_loudness v2
         
-        - Added a "hands-off" list of protected audio codecs:
-          'dts', 'truehd', 'eac3', 'ac3', 'pcm'.
-        - When -N is used, the script now checks the source
-          audio codec first.
-        - If the codec is on the protected list, normalization
-          is skipped entirely, and the audio track is copied.
-        - The "smart" normalization logic and downmix-prompt
-          will now only apply to non-protected codecs
-          (like aac, mp3, vorbis, etc.).
-
-v7.9    feat(normalize): Add prompt before downmixing audio
-        feat(normalize): Use smart audio codec selection
-
-        - The -N (normalize) logic now first checks the input
-          audio stream.
-        - If normalization would result in a channel downmix
-          (e.g., 6.1 -> 5.1), it now prompts the user [N/y]
-          before continuing. If 'No', audio is copied.
-        - Implemented "smart" audio encoding for normalization:
-          - 2.0 (stereo) sources are encoded to VBR AAC 2.0.
-          - 5.1/6.1/7.1 (surround) sources are encoded to
-            AC3 5.1 @ 640k to preserve channels.
+        - Updated the `load_loudness_db` function to parse
+          the new CSV log file format from ,audit_loudness v2.
+        - Now uses `csv.DictReader` to read the log, making
+          it robust against column order changes by mapping
+          headers ('CurrentLoudness', 'MeasuredTP', etc.)
+          directly.
 
 v7.8    feat(normalize): Read data from ,audit_loudness log
+        
+        - The -N/--normalize flag can now optionally accept a
+          log file path (e.g., -N loudness_audit.log).
+        - If a log file is provided, ,hvec will load it into a
+          "loudness database" and skip its own Pass 1 analysis
+          if the file is found.
+        - If -N is used *without* a file, or if the input file
+          is not found in the log, it falls back to the
+          original behavior (running its own analysis).
+        - This allows reusing the scan from ,audit_loudness
+          to save time.
 v7.7    fix(remux): Apply -fflags +genpts to all .avi operations
 v7.6    fix(ffmpeg): Correct ffmpeg syntax for -vf filter
 v7.5    fix(ffmpeg): Add hwupload filter for software-decoded .avi
@@ -61,7 +57,6 @@ v7.0    refactor(chapters): Use mkvpropedit for chapter embedding
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
-PROTECTED_AUDIO_CODECS = ('dts', 'truehd', 'eac3', 'ac3', 'pcm') # (v8.0)
 
 # --- Helper Functions ---
 def get_total_frames(file_path):
@@ -73,6 +68,7 @@ def get_total_frames(file_path):
             return int(result.stdout.strip())
         except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
             pass
+  
     cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration,avg_frame_rate', '-of', 'json', file_path]
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -80,7 +76,8 @@ def get_total_frames(file_path):
         if 'duration' not in data or 'avg_frame_rate' not in data: return None
         duration, fr_str = float(data['duration']), data['avg_frame_rate']
         if '/' in fr_str:
-            n, d = map(int, fr_str.split('/')); frame_rate = n / d if d != 0 else 0
+            n, d = map(int, fr_str.split('/'));
+            frame_rate = n / d if d != 0 else 0
         else: frame_rate = float(fr_str)
         if duration <= 0 or frame_rate <= 0: return None
         return int(duration * frame_rate)
@@ -93,20 +90,25 @@ def get_stream_info(file_path):
         result = subprocess.run(ffprobe_cmd, check=True, capture_output=True, text=True)
         return json.loads(result.stdout).get('streams', [])
     except Exception:
-        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr); return None
+        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr);
+        return None
 
 def plan_stream_selection(streams):
     streams_to_keep, streams_to_remove = [], []
     for s in streams:
-        keep = False; stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); title = s.get('title', '').lower()
+        keep = False;
+        stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower();
+        title = s.get('title', '').lower()
         if stype == 'video' or (stype == 'audio' and (lang == 'eng' or 'commentary' in title or 'director' in title)) or (stype == 'subtitle' and lang == 'eng'): keep = True
         if keep: streams_to_keep.append(s)
         else: streams_to_remove.append(s)
     return streams_to_keep, streams_to_remove
 
 def display_and_confirm_plan(s_keep, s_rem):
-    print("\n--- Stream Selection Plan ---\nKEPT:"); [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep]
-    print("\nREMOVED:"); [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem]
+    print("\n--- Stream Selection Plan ---\nKEPT:");
+    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep]
+    print("\nREMOVED:");
+    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem]
     try: return input("Proceed? [y/N]: ").lower().strip() == 'y'
     except KeyboardInterrupt: return False
 
@@ -116,19 +118,25 @@ def format_size(size_bytes):
     if size_bytes == 0: return "0 B"
     size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
     try:
-        i = int(math.floor(math.log(size_bytes, 1024))); i = min(i, len(size_name) - 1)
-        p = math.pow(1024, i); s = round(size_bytes / p, 2)
+        i = int(math.floor(math.log(size_bytes, 1024)));
+        i = min(i, len(size_name) - 1)
+        p = math.pow(1024, i);
+        s = round(size_bytes / p, 2)
         return f"{s} {size_name[i]}"
     except (ValueError, TypeError): return "N/A"
 
 def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=False):
     """Prints a formatted summary of the file size change."""
     print("\n--- File Size Summary ---")
-    original_size_str = format_size(original_size_bytes); new_size_str = format_size(new_size_bytes)
-    print(f"Original:   {original_size_str}"); print(f"New:         {new_size_str}")
+    original_size_str = format_size(original_size_bytes);
+    new_size_str = format_size(new_size_bytes)
+    print(f"Original:   {original_size_str}");
+    print(f"New:         {new_size_str}")
     if original_size_bytes is not None and new_size_bytes is not None and original_size_bytes > 0:
-        difference_bytes = new_size_bytes - original_size_bytes; percentage_change = (difference_bytes / original_size_bytes) * 100
-        change_type = "increase" if difference_bytes >= 0 else "decrease"; difference_str = format_size(abs(difference_bytes))
+        difference_bytes = new_size_bytes - original_size_bytes;
+        percentage_change = (difference_bytes / original_size_bytes) * 100
+        change_type = "increase" if difference_bytes >= 0 else "decrease";
+        difference_str = format_size(abs(difference_bytes))
         print(f"Difference: {difference_str} ({abs(percentage_change):.2f}% {change_type})")
     else: print("Difference: N/A")
     
@@ -153,24 +161,6 @@ def print_ffmpeg_command(cmd):
     """Prints the FFmpeg command for dry-run mode."""
     print("\nExecuting FFmpeg command (Dry Run):")
     print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
-
-# --- NEW (v7.9): Helper to get audio info before analysis ---
-def get_audio_info(file_path: str) -> Dict[str, Any] or None:
-    """Probes the first audio stream for codec and channels."""
-    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a:0',
-           '-show_entries', 'stream=codec_name,channels',
-           '-of', 'json', file_path]
-    try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
-        data = json.loads(result.stdout)['streams'][0]
-        if 'codec_name' not in data or 'channels' not in data:
-            print("Warning: Could not get audio channels/codec from ffprobe.", file=sys.stderr)
-            return None
-        return {'codec': data['codec_name'], 'channels': int(data['channels'])}
-    except Exception as e:
-        print(f"Warning: Could not probe audio stream info: {e}", file=sys.stderr)
-        return None
-# --- END NEW (v7.9) ---
 
 def run_loudnorm_analysis(input_file: str) -> Dict[str, float] or None:
     """
@@ -287,12 +277,14 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
 
     # --- Post-FFmpeg Verification ---
     if not ffmpeg_success or not os.path.exists(output_file):
-        print(f"\nError: FFmpeg failed or output file '{output_file}' not created.", file=sys.stderr); sys.exit(1)
+        print(f"\nError: FFmpeg failed or output file '{output_file}' not created.", file=sys.stderr);
+        sys.exit(1)
     try:
         new_size_bytes = os.path.getsize(output_file)
         subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
     except Exception:
-        print(f"\nError: Output file '{output_file}' appears invalid after FFmpeg.", file=sys.stderr); sys.exit(1)
+        print(f"\nError: Output file '{output_file}' appears invalid after FFmpeg.", file=sys.stderr);
+        sys.exit(1)
     
     print(f"\nSuccessfully created and verified FFmpeg output '{output_file}'.")
     
@@ -309,7 +301,8 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     # --- Permissions ---
     if permissions:
         try:
-            os.chown(output_file, permissions['uid'], permissions['gid']); os.chmod(output_file, permissions['mode'])
+            os.chown(output_file, permissions['uid'], permissions['gid']);
+            os.chmod(output_file, permissions['mode'])
             print(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
         except OSError as e: print(f"\nWarning: Could not set permissions. Reason: {e}", file=sys.stderr)
 
@@ -320,15 +313,16 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     if delete_source and ffmpeg_success and chapters_embedded_successfully:
         print(f"\nInfo: --delete flag set. Deleting source file...")
         try:
-            os.remove(source_file); print(f"Successfully deleted: {source_file}")
+            os.remove(source_file);
+            print(f"Successfully deleted: {source_file}")
         except OSError as e: print(f"\nError: Could not delete source '{source_file}'. Reason: {e}", file=sys.stderr)
     elif delete_source:
          print(f"\nWarning: --delete flag ignored because chapter embedding failed.")
 
-# --- NEW HELPER FUNCTION (v7.8) ---
+# --- MODIFIED: Load CSV log using csv.DictReader (v7.9) ---
 def load_loudness_db(log_file: str) -> Dict[str, Dict[str, float]]:
     """
-    Reads a pipe-delimited loudness audit log file and returns a
+    Reads a CSV loudness audit log file and returns a
     dictionary mapping file paths to their normalization data.
     """
     db = {}
@@ -338,32 +332,33 @@ def load_loudness_db(log_file: str) -> Dict[str, Dict[str, float]]:
 
     print(f"Info: Loading loudness database from '{os.path.basename(log_file)}'...")
     try:
-        with open(log_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.startswith("Timestamp|Status"):
-                    continue
-                
+        with open(log_file, 'r', encoding='utf-8', newline='') as f:
+            # Use DictReader to read the log by header name
+            reader = csv.DictReader(f)
+            for row in reader:
                 try:
-                    parts = line.strip().split('|')
-                    # v1.8 log has 11 columns (10 pipes)
-                    if len(parts) >= 10 and parts[1] == 'SUCCESS':
-                        file_path = parts[2].strip()
+                    if row.get('Status') == 'SUCCESS':
+                        file_path = row.get('File', '').strip()
+                        if not file_path:
+                            continue
+                            
                         # Keys must match what run_loudnorm_analysis returns
                         data = {
-                            'i': float(parts[5]),
-                            'tp': float(parts[7]),
-                            'lra': float(parts[8]),
-                            'thresh': float(parts[9])
+                            'i': float(row['CurrentLoudness']),
+                            'tp': float(row['MeasuredTP']),
+                            'lra': float(row['MeasuredLRA']),
+                            'thresh': float(row['MeasuredThresh'])
                         }
                         db[file_path] = data
-                except (IndexError, ValueError):
-                    pass # Ignore malformed or non-SUCCESS lines
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    # Ignore malformed or non-SUCCESS lines
+                    pass
     except Exception as e:
         print(f"Error: Could not read loudness log '{log_file}': {e}", file=sys.stderr)
     
     print(f"Info: Loaded {len(db)} pre-analyzed entries.")
     return db
-# --- END NEW HELPER FUNCTION ---
+# --- END MODIFIED ---
 
 
 # --- Main Logic ---
@@ -371,7 +366,7 @@ def main():
     print(f",hvec v{__version__}") # Print current version first
 
     # --- Argument Parser ---
-    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R\n  ,hvec -i movie.mp4 -r -C chapters.txt\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.log")
+    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R\n  ,hvec -i movie.mp4 -r -C chapters.txt\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.csv") # <-- MODIFIED Example
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
     parser.add_argument("-o", "--output", help="Output MKV file (single file mode only).")
     parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter streams (single file mode only).")
@@ -388,8 +383,8 @@ def main():
         nargs='?', 
         const=True, 
         default=None, 
-        help="Normalize audio to EBU R128 (-23 LUFS). \n"
-             "Optionally provide a path to a loudness_audit.log file \n"
+        help="Normalize audio to EBU R128 (-23 LUFS).\n"
+             "Optionally provide a path to a loudness_audit.csv file \n" # <-- MODIFIED Example
              "to skip analysis and use pre-scanned values."
     )
     # --- END MODIFIED ---
@@ -404,11 +399,14 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg output.")
     parser.add_argument("-v", "--version", action="store_true", help="Show version history and exit.")
     
-    argcomplete.autocomplete(parser); args = parser.parse_args()
+    argcomplete.autocomplete(parser);
+    args = parser.parse_args()
     
-    if args.version: print(VERSION_HISTORY); sys.exit(0) # Handle --version flag
+    if args.version: print(VERSION_HISTORY);
+    sys.exit(0) # Handle --version flag
 
-    if not os.path.exists(args.input): print(f"Error: Input not found: {args.input}", file=sys.stderr); sys.exit(1)
+    if not os.path.exists(args.input): print(f"Error: Input not found: {args.input}", file=sys.stderr);
+    sys.exit(1)
     
     # --- MODIFIED: Load Loudness DB (v7.8) ---
     loudness_db = {}
@@ -421,7 +419,8 @@ def main():
     
     # --- File Processing Loop ---
     files_to_process = find_video_files(args.input, args.recursive) if os.path.isdir(args.input) else [args.input]
-    if not files_to_process: print("No video files found to process."); sys.exit(0)
+    if not files_to_process: print("No video files found to process.");
+    sys.exit(0)
 
     for i, input_file in enumerate(files_to_process, 1):
         print(f"\n--- Processing file {i}/{len(files_to_process)}: {os.path.basename(input_file)} ---")
@@ -439,20 +438,24 @@ def main():
         # --- Permissions ---
         permissions_to_apply = None
         try:
-            stat_info = os.stat(input_file); input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
+            stat_info = os.stat(input_file);
+            input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
             target_gid = input_gid
             if input_group_name != 'jellyfin':
                 try:
                     jellyfin_gid = grp.getgrnam('jellyfin').gr_gid
                     response = input(f"Warning: Source group is '{input_group_name}'. Change output to 'jellyfin'? [Y/n]: ").lower().strip()
-                    if response in ('y', 'yes', ''): target_gid = jellyfin_gid; print("Info: Output group set to 'jellyfin'.")
+                    if response in ('y', 'yes', ''): target_gid = jellyfin_gid;
+                    print("Info: Output group set to 'jellyfin'.")
                 except KeyError: print("Info: 'jellyfin' group not found. Preserving original.")
-                except (KeyboardInterrupt, EOFError): print("\nCancelled."); sys.exit(1)
+                except (KeyboardInterrupt, EOFError): print("\nCancelled.");
+                sys.exit(1)
             permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
         except (OSError, KeyError) as e: print(f"Warning: Could not read source permissions. Reason: {e}", file=sys.stderr)
 
         # --- Skip HEVC Check ---
-        if args.skip_hevc and is_hevc(input_file): print("Already HEVC. Skipping."); continue
+        if args.skip_hevc and is_hevc(input_file): print("Already HEVC. Skipping.");
+        continue
 
         # --- Output Filename Generation ---
         is_remux_op = args.remux and not args.hvec # <--- Moved this line up
@@ -476,20 +479,24 @@ def main():
             
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input))
-                output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
+                output_dir = os.path.join(args.out_dir, relative_path);
+                os.makedirs(output_dir, exist_ok=True)
                 output_file = os.path.join(output_dir, new_filename)
             else: output_file = os.path.join(os.path.dirname(input_file), new_filename)
         
         # Prevent source overwrite
         if os.path.abspath(output_file) == os.path.abspath(input_file):
-            base, ext = os.path.splitext(output_file); output_file = f"{base}.COPY{ext}"
+            base, ext = os.path.splitext(output_file);
+            output_file = f"{base}.COPY{ext}"
             print(f"Info: Output name identical to input. Using '{os.path.basename(output_file)}'")
                     
         # Overwrite check
         if os.path.exists(output_file) and not args.dry_run:
             try:
-                if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': print("Skipping."); continue
-            except KeyboardInterrupt: print("\nCancelled."); sys.exit(1)
+                if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': 
+                    print("Skipping."); continue
+            except KeyboardInterrupt: print("\nCancelled.");
+            sys.exit(1)
         
         # --- FFmpeg Command Construction ---
         total_frames = get_total_frames(input_file) if not (is_remux_op or args.quiet or args.dry_run) else None
@@ -537,139 +544,92 @@ def main():
             all_streams = get_stream_info(input_file)
             if all_streams is None: continue
             s_keep, s_rem = plan_stream_selection(all_streams)
-            if not display_and_confirm_plan(s_keep, s_rem): print("Skipping file."); continue
+            if not display_and_confirm_plan(s_keep, s_rem): print("Skipping file.");
+            continue
             for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
             args.subs = [] # Disable subtitle embedding if filtering
 
         elif args.subs: # Only map subs if -s was used and -k was not
             ffmpeg_cmd.extend(['-map', '0:v:0', '-map', '0:a?'])
             for j in range(len(args.subs)):
-                 ffmpeg_cmd.extend(['-map', f'{subtitle_input_index + j}:s:0', f'-metadata:s:s:{j}', 'language=eng'])
+                ffmpeg_cmd.extend(['-map', f'{subtitle_input_index + j}:s:0', f'-metadata:s:s:{j}', 'language=eng'])
         
         else: # Default: Map all streams from main input
             ffmpeg_cmd.extend(['-map', '0']) # Map all streams from input 0
 
-        # --- Codec Logic (Refactored for v8.0) ---
-        audio_normalized = False # Define here
-        run_normalization = is_normalize_enabled # Use a temp flag
-        
-        if is_normalize_enabled:
+        # --- Codec Logic (Refactored for v7.2) ---
+        audio_normalized = False # <--- MOVED: Define here for later use
+
+        # 1. VIDEO LOGIC
+        if is_remux_op:
+            print("Mode: Lossless Video Remux");
+            ffmpeg_cmd.extend(['-c:v', 'copy'])
+        else:
+            print("\nMode: VAAPI Video Transcode")
+            
+            # --- .avi HWACCEL FIX (v7.7) ---
+            if is_transcode and is_avi:
+                # Add the manual hwupload filter (goes AFTER -i)
+                ffmpeg_cmd.extend(['-vf', 'format=nv12,hwupload'])
+            # --- END FIX ---
+                
+            ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
+
+        # 2. AUDIO LOGIC
+        if is_normalize_enabled: # <--- Use our new flag
             if is_remux_op:
                 print("Info: Normalizing audio while remuxing video.")
             
-            # --- NEW (v8.0): Check for protected codecs ---
-            audio_info = get_audio_info(input_file)
+            # --- MODIFIED: Loudness DB check (v7.8) ---
+            analysis_data = None
+            abs_input_file = os.path.abspath(input_file)
             
-            if audio_info and audio_info['codec'] in PROTECTED_AUDIO_CODECS:
-                print(f"Info: Skipping normalization for protected audio format ({audio_info['codec'].upper()}). Audio will be copied.")
-                run_normalization = False # Skip the rest of the normalization logic
-            # --- END NEW (v8.0) ---
-            
-            if run_normalization:
-                # --- NEW (v7.9): Plan audio output and prompt for downmixing ---
-                output_codec = "aac" # Default
-                output_bitrate_args = ["-q:a:0", "4"] # Default (VBR)
-                
-                if audio_info:
-                    source_codec = audio_info['codec']
-                    source_channels = audio_info['channels']
-                    output_channels = 2 # Default
-
-                    if source_channels > 2: # 5.1, 6.1, 7.1
-                        output_codec = "ac3"
-                        output_channels = 6 # Preserve 5.1, downmix 6.1/7.1
-                        output_bitrate_args = ["-b:a:0", "640k"]
-                    else: # 1.0, 2.0
-                        output_codec = "aac"
-                        output_channels = 2 # Preserve 2.0, upmix 1.0
-                        output_bitrate_args = ["-q:a:0", "4"]
-
-                    # Now, check if we're downmixing and prompt
-                    if source_channels > output_channels:
-                        print(f"\nWarning: Source audio is {source_codec.upper()} {source_channels}.0 channels.")
-                        print(f"         Normalization will DOWNMIX to {output_codec.upper()} {output_channels}.0 channels.")
-                        try:
-                            response = input("         Continue with normalization? [N/y]: ").lower().strip()
-                            if response not in ('y', 'yes'):
-                                run_normalization = False
-                        except KeyboardInterrupt:
-                            print("\nSkipping normalization.")
-                            run_normalization = False
-
-                    if not run_normalization:
-                        print("Info: Skipping normalization, audio will be copied.")
-                
-                else:
-                    print("Warning: Could not get audio info. Defaulting to AAC 2.0 normalization.")
-                # --- END NEW (v7.9) ---
-
-            if run_normalization:
-                # --- MODIFIED: Loudness DB check (v7.8) ---
-                # (This block only runs if run_normalization is still True)
-                analysis_data = None
-                abs_input_file = os.path.abspath(input_file)
-                
-                if abs_input_file in loudness_db:
-                    analysis_data = loudness_db[abs_input_file]
-                    print("Info: Using pre-analyzed loudness data from log.")
-                else:
-                    if isinstance(args.normalize, str):
-                        print(f"Info: File not found in log, running live analysis...")
-                    print("Running audio normalization analysis (Pass 1)...")
-                    analysis_data = run_loudnorm_analysis(input_file)
-                    if analysis_data:
-                        print("Analysis complete.")
-                # --- END MODIFIED ---
-                
+            if abs_input_file in loudness_db:
+                analysis_data = loudness_db[abs_input_file]
+                print("Info: Using pre-analyzed loudness data from log.")
+            else:
+                if isinstance(args.normalize, str):
+                    print(f"Info: File not found in log, running live analysis...")
+                print("Running audio normalization analysis (Pass 1)...")
+                analysis_data = run_loudnorm_analysis(input_file)
                 if analysis_data:
-                    try:
-                        measured_i = analysis_data['i']
-                        measured_tp = analysis_data['tp']
-                        measured_lra = analysis_data['lra']
-                        measured_thresh = analysis_data['thresh']
-                        
-                        # Print audio stats
-                        print("Info: Audio analysis found:")
-                        print(f"  - Input Loudness: {measured_i:.2f} LUFS")
-                        print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
-                        
-                        filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
-                        
-                        # Apply normalization to first audio stream, copy others
-                        # --- MODIFIED (v7.9): Use smart codec/bitrate ---
-                        ffmpeg_cmd.extend(['-c:a', 'copy', '-c:a:0', output_codec] + output_bitrate_args + ['-af:a:0', filter_string])
-                        
-                        print(f"Info: Audio stream 0 will be normalized (to {output_codec.upper()}). Other audio streams copied.")
-                        audio_normalized = True # Mark as complete
-                    except KeyError:
-                        print("Warning: Audio analysis data was incomplete. Falling back to default audio settings.", file=sys.stderr)
-                else:
-                    print("Warning: Audio normalization analysis failed. Falling back to default audio settings.", file=sys.stderr)
+                    print("Analysis complete.")
+            # --- END MODIFIED ---
+            
+            if analysis_data:
+                try:
+                    measured_i = analysis_data['i']
+                    measured_tp = analysis_data['tp']
+                    measured_lra = analysis_data['lra']
+                    measured_thresh = analysis_data['thresh']
+                    
+                    # Print audio stats
+                    print("Info: Audio analysis found:")
+                    print(f"  - Input Loudness: {measured_i:.2f} LUFS")
+                    print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
+                    
+                    filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
+                    
+                    # Apply normalization to first audio stream, copy others
+                    # Use VBR mode -q:a:0 4 to save space
+                    ffmpeg_cmd.extend(['-c:a', 'copy', '-c:a:0', 'aac', '-q:a:0', '4', '-af:a:0', filter_string])
+                    
+                    print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams copied.")
+                    audio_normalized = True # Mark as complete
+                except KeyError:
+                    print("Warning: Audio analysis data was incomplete. Falling back to default audio settings.", file=sys.stderr)
+            else:
+                print("Warning: Audio normalization analysis failed. Falling back to default audio settings.", file=sys.stderr)
         
         if not audio_normalized:
-            # This block now handles:
-            # 1. Normalization was OFF
-            # 2. Normalization was ON but codec was PROTECTED
-            # 3. Normalization was ON but user said NO to downmix
-            # 4. Normalization was ON but FAILED (e.g. analysis failed)
-            
+            # Run this block if --normalize=False OR if --normalize=True but it failed
             if args.acodec:
                 ffmpeg_cmd.extend(['-c:a', args.acodec])
-                if args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
+            if args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
             else:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
-                
-                # Print a helpful "copying" message if we haven't already
-                if not is_normalize_enabled:
+                if not is_normalize_enabled: # Don't print "copying" if we're here on a failed normalize
                     print("Info: Copying all audio streams.")
-                elif not run_normalization:
-                    # We already printed a "Skipping" message, so just pass
-                    pass
-                else:
-                    # This means normalization was on, run_normalization was true,
-                    # but it failed (audio_normalized=False)
-                    print("Info: Copying all audio streams due to normalization failure.")
-
 
         # 3. SUBTITLE LOGIC
         # Always convert to srt for max compatibility (per v6.3 fix)
