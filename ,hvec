@@ -6,7 +6,7 @@ import sys
 import os
 import json
 import math
-# import argcomplete  # <-- MODIFIED: Removed
+# import argcomplete  # Removed in 8.0.1
 import re
 import shutil
 from tqdm import tqdm
@@ -15,31 +15,29 @@ from typing import Dict, Any
 import csv
 
 # --- Version History ---
-__version__ = "8.0.1"
+__version__ = "8.0.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.0.2  fix(main): Correct indentation error on sys.exit()
+        
+        - The `sys.exit(0)` call after the `args.version`
+          check was not indented, causing the script to
+          exit immediately after parsing arguments every time.
+        - This has been corrected.
+
 v8.0.1  fix(main): Remove argcomplete to fix silent exit
         
         - Removed the `argcomplete.autocomplete(parser)` line
-          as it appears to be causing the script to exit
-          silently in some shell environments.
+          as it was the suspected cause of a silent exit.
 
 v8.0.0  feat(normalize): Use fast `ebur128` filter for analysis
         
         - Replaced the internal `run_loudnorm_analysis` function
-          with the same fast `ebur128` + regex parsing
-          function from `,audit_loudness` v2.1.0.
-        - This dramatically speeds up audio normalization when
-          a log file is NOT provided (i.e., when -N is used
-          and ,hvec must do its own scan).
+          with the fast `ebur128` + regex parsing from
+          ,audit_loudness v2.1.0.
         
-        fix(main): Correct silent exit bug (v8.0.0 attempt)
-        
-        - Split `argcomplete.autocomplete(parser)` and
-          `args = parser.parse_args()` onto separate lines.
-
 v7.9    feat(normalize): Read CSV data from ,audit_loudness v2
 v7.8    feat(normalize): Read data from ,audit_loudness log
 v7.7    fix(remux): Apply -fflags +genpts to all .avi operations
@@ -414,13 +412,15 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg output.")
     parser.add_argument("-v", "--version", action="store_true", help="Show version history and exit.")
     
-    # --- MODIFIED: Removed argcomplete ---
-    # argcomplete.autocomplete(parser)
+    # --- MODIFIED: Removed argcomplete (v8.0.1) ---
     args = parser.parse_args()
     # --- END MODIFIED ---
     
-    if args.version: print(VERSION_HISTORY);
-    sys.exit(0) # Handle --version flag
+    # --- MODIFIED: Corrected indentation (v8.0.2) ---
+    if args.version:
+        print(VERSION_HISTORY)
+        sys.exit(0) # Handle --version flag
+    # --- END MODIFIED ---
 
     if not os.path.exists(args.input): print(f"Error: Input not found: {args.input}", file=sys.stderr);
     sys.exit(1)
