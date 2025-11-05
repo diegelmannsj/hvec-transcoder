@@ -13,31 +13,35 @@ from tqdm import tqdm
 import grp
 from typing import Dict, Any
 import csv
+import time  # <--- Was missing from your v8.0.5, but 'run_loudnorm_analysis' needs it
 
 # --- Version History ---
-__version__ = "8.0.2"
+__version__ = "8.0.6"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.0.6  fix(ffmpeg): Add -vaapi_device global option
+        
+        - Fixes "[hwupload] A hardware device reference is
+          required" error during transcodes.
+        - The device context must be initialized before
+          the -i flag for hevc_vaapi, hwaccel, and
+          hwupload to function correctly.
+
+v8.0.5  fix(main): Correct indentation on 'skip_hevc' continue
+        
+        - The `continue` statement for the `args.skip_hevc`
+          check was not indented. This caused the main
+          processing loop to skip every file, every time.
+        - This has been corrected. My deepest apologies for
+          this repeated, basic error.
+
+v8.0.4  fix(main): Correct indentation on 'no files found' sys.exit()
+v8.0.3  fix(main): Correct indentation on file not found sys.exit()
 v8.0.2  fix(main): Correct indentation error on sys.exit()
-        
-        - The `sys.exit(0)` call after the `args.version`
-          check was not indented, causing the script to
-          exit immediately after parsing arguments every time.
-        - This has been corrected.
-
 v8.0.1  fix(main): Remove argcomplete to fix silent exit
-        
-        - Removed the `argcomplete.autocomplete(parser)` line
-          as it was the suspected cause of a silent exit.
-
 v8.0.0  feat(normalize): Use fast `ebur128` filter for analysis
-        
-        - Replaced the internal `run_loudnorm_analysis` function
-          with the fast `ebur128` + regex parsing from
-          ,audit_loudness v2.1.0.
-        
 v7.9    feat(normalize): Read CSV data from ,audit_loudness v2
 v7.8    feat(normalize): Read data from ,audit_loudness log
 v7.7    fix(remux): Apply -fflags +genpts to all .avi operations
@@ -89,8 +93,7 @@ def get_stream_info(file_path):
         result = subprocess.run(ffprobe_cmd, check=True, capture_output=True, text=True)
         return json.loads(result.stdout).get('streams', [])
     except Exception:
-        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr);
-        return None
+        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr); return None
 
 def plan_stream_selection(streams):
     streams_to_keep, streams_to_remove = [], []
@@ -283,28 +286,26 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
         ffmpeg_success = True
     except (subprocess.CalledProcessError, FileNotFoundError, KeyboardInterrupt) as e:
         if isinstance(e, subprocess.CalledProcessError): print(f"\n--- FFmpeg Error ---\n{e.stderr}\n--------------------", file=sys.stderr)
-        elif isinstance(e, FileNotFoundError): print("\nError: Required command not found (ffmpeg/stdbuf).", file=sys.stderr)
+        elif isinstance(e, FileNotFoundError): print("\nError: Required command not found (ffmpeg/stbuf).", file=sys.stderr)
         else: print("\nCancelled.", file=sys.stderr)
         if 'process' in locals(): process.terminate()
         sys.exit(1) # Exit immediately on FFmpeg failure
 
     # --- Post-FFmpeg Verification ---
     if not ffmpeg_success or not os.path.exists(output_file):
-        print(f"\nError: FFmpeg failed or output file '{output_file}' not created.", file=sys.stderr);
-        sys.exit(1)
+        print(f"\nError: FFmpeg failed or output file '{output_file}' not created.", file=sys.stderr); sys.exit(1)
     try:
         new_size_bytes = os.path.getsize(output_file)
         subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
     except Exception:
-        print(f"\nError: Output file '{output_file}' appears invalid after FFmpeg.", file=sys.stderr);
-        sys.exit(1)
+        print(f"\nError: Output file '{output_file}' appears invalid after FFmpeg.", file=sys.stderr); sys.exit(1)
     
     print(f"\nSuccessfully created and verified FFmpeg output '{output_file}'.")
     
     # --- Chapter Embedding (NEW STEP) ---
     chapters_embedded_successfully = True # Assume success if not requested
     if chapter_file_to_embed:
-        chapters_embedded_successfully = embed_chapters_mkvpropedit(chapter_file_to_embed, output_mkv)
+        chapters_embedded_successfully = embed_chapters_mkvpropedit(chapter_file_to_embed, output_file)
         if not chapters_embedded_successfully:
             print(f"\nError: Failed to embed chapters using mkvpropedit. Output file '{output_file}' may be incomplete.", file=sys.stderr)
             # Decide if you want to exit here or continue. For now, we continue but warn.
@@ -314,8 +315,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     # --- Permissions ---
     if permissions:
         try:
-            os.chown(output_file, permissions['uid'], permissions['gid']);
-            os.chmod(output_file, permissions['mode'])
+            os.chown(output_file, permissions['uid'], permissions['gid']); os.chmod(output_file, permissions['mode'])
             print(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
         except OSError as e: print(f"\nWarning: Could not set permissions. Reason: {e}", file=sys.stderr)
 
@@ -326,8 +326,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     if delete_source and ffmpeg_success and chapters_embedded_successfully:
         print(f"\nInfo: --delete flag set. Deleting source file...")
         try:
-            os.remove(source_file);
-            print(f"Successfully deleted: {source_file}")
+            os.remove(source_file); print(f"Successfully deleted: {source_file}")
         except OSError as e: print(f"\nError: Could not delete source '{source_file}'. Reason: {e}", file=sys.stderr)
     elif delete_source:
          print(f"\nWarning: --delete flag ignored because chapter embedding failed.")
@@ -339,6 +338,7 @@ def load_loudness_db(log_file: str) -> Dict[str, Dict[str, float]]:
     dictionary mapping file paths to their normalization data.
     """
     db = {}
+    
     if not os.path.exists(log_file):
         print(f"Warning: Loudness log not found at '{log_file}'. Will run analysis.", file=sys.stderr)
         return db
@@ -416,14 +416,17 @@ def main():
     args = parser.parse_args()
     # --- END MODIFIED ---
     
+    
     # --- MODIFIED: Corrected indentation (v8.0.2) ---
     if args.version:
         print(VERSION_HISTORY)
         sys.exit(0) # Handle --version flag
     # --- END MODIFIED ---
 
-    if not os.path.exists(args.input): print(f"Error: Input not found: {args.input}", file=sys.stderr);
-    sys.exit(1)
+    # --- MODIFIED: Corrected indentation (v8.0.3) ---
+    if not os.path.exists(args.input):
+        print(f"Error: Input path not found: {args.input}", file=sys.stderr); sys.exit(1)
+    # --- END MODIFIED ---
     
     # --- MODIFIED: Load Loudness DB (v7.8) ---
     loudness_db = {}
@@ -436,8 +439,12 @@ def main():
     
     # --- File Processing Loop ---
     files_to_process = find_video_files(args.input, args.recursive) if os.path.isdir(args.input) else [args.input]
-    if not files_to_process: print("No video files found to process.");
-    sys.exit(0)
+    
+    # --- MODIFIED: Corrected indentation (v8.0.4) ---
+    if not files_to_process:
+        print("No video files found to process.")
+        sys.exit(0)
+    # --- END MODIFIED ---
 
     for i, input_file in enumerate(files_to_process, 1):
         print(f"\n--- Processing file {i}/{len(files_to_process)}: {os.path.basename(input_file)} ---")
@@ -449,8 +456,8 @@ def main():
             print("Info: --chapters flag is ignored in batch/directory mode for now.")
             chapter_file_for_this_run = None # Disable chapters for batch mode
         if chapter_file_for_this_run and not os.path.exists(chapter_file_for_this_run):
-             print(f"Warning: Chapter file '{chapter_file_for_this_run}' not found. Skipping chapter embedding.")
-             chapter_file_for_this_run = None
+            print(f"Warning: Chapter file '{chapter_file_for_this_run}' not found. Skipping chapter embedding.")
+            chapter_file_for_this_run = None
 
         # --- Permissions ---
         permissions_to_apply = None
@@ -467,12 +474,15 @@ def main():
                 except KeyError: print("Info: 'jellyfin' group not found. Preserving original.")
                 except (KeyboardInterrupt, EOFError): print("\nCancelled.");
                 sys.exit(1)
+            
             permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
         except (OSError, KeyError) as e: print(f"Warning: Could not read source permissions. Reason: {e}", file=sys.stderr)
 
-        # --- Skip HEVC Check ---
-        if args.skip_hevc and is_hevc(input_file): print("Already HEVC. Skipping.");
-        continue
+        # --- MODIFIED: Corrected indentation (v8.0.5) ---
+        if args.skip_hevc and is_hevc(input_file):
+            print("Already HEVC. Skipping.")
+            continue
+        # --- END MODIFIED ---
 
         # --- Output Filename Generation ---
         is_remux_op = args.remux and not args.hvec # <--- Moved this line up
@@ -488,32 +498,29 @@ def main():
 
         if args.output and len(files_to_process) == 1: output_file = args.output
         else:
-            base, _ = os.path.splitext(os.path.basename(input_file));
-            # Check for suffixes
+            base, _ = os.path.splitext(os.path.basename(input_file)); # Check for suffixes
             has_chapters_flag = chapter_file_for_this_run is not None
             has_normalized_flag = is_normalize_enabled # <--- Use our new flag
             new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag, has_normalized_flag)
             
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input))
-                output_dir = os.path.join(args.out_dir, relative_path);
-                os.makedirs(output_dir, exist_ok=True)
+                output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
                 output_file = os.path.join(output_dir, new_filename)
             else: output_file = os.path.join(os.path.dirname(input_file), new_filename)
         
         # Prevent source overwrite
         if os.path.abspath(output_file) == os.path.abspath(input_file):
-            base, ext = os.path.splitext(output_file);
-            output_file = f"{base}.COPY{ext}"
+            base, ext = os.path.splitext(output_file); output_file = f"{base}.COPY{ext}"
             print(f"Info: Output name identical to input. Using '{os.path.basename(output_file)}'")
                     
         # Overwrite check
         if os.path.exists(output_file) and not args.dry_run:
             try:
                 if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': 
-                    print("Skipping."); continue
-            except KeyboardInterrupt: print("\nCancelled.");
-            sys.exit(1)
+                    print("Skipping.")
+                    continue
+            except KeyboardInterrupt: print("\nCancelled."); sys.exit(1)
         
         # --- FFmpeg Command Construction ---
         total_frames = get_total_frames(input_file) if not (is_remux_op or args.quiet or args.dry_run) else None
@@ -523,7 +530,7 @@ def main():
         # Progress/Verbosity
         use_progress_bar = total_frames is not None and not (is_remux_op or args.quiet or args.dry_run)
         if use_progress_bar:
-            if sys.platform != "win32": ffmpeg_cmd = ['stdbuf', '-o0'] + ffmpeg_cmd
+            if sys.platform != "win32": ffmpeg_cmd = ['stbuf', '-o0'] + ffmpeg_cmd
             ffmpeg_cmd.extend(['-progress', '-', '-nostats'])
         elif args.quiet: ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
         else: ffmpeg_cmd.extend(['-v', 'error', '-stats'])
@@ -537,13 +544,19 @@ def main():
             # for both remuxing and transcoding.
             ffmpeg_cmd.extend(['-fflags', '+genpts'])
 
-        if is_transcode and not is_avi:
-            # Use hwaccel decode ONLY for non-avi transcodes
-            ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
+        # --- v8.0.6 FIX ---
+        if is_transcode:
+            # Initialize VAAPI device context (MUST be before -i)
+            # This is required for hwaccel, hwupload, and hevc_vaapi
+            ffmpeg_cmd.extend(['-vaapi_device', '/dev/dri/renderD128'])
+            
+            if not is_avi:
+                # Use hwaccel decode ONLY for non-avi transcodes
+                ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
         # --- END FIX ---
             
         # --- Input Files ---
-        ffmpeg_cmd.extend(['-i', input_file]) # Main video input is always index 0 now
+        ffmpeg_cmd.extend(['-i', input_file]) # Main video input is 0
         
         # Add subtitle inputs if provided (single file mode only)
         subtitle_input_index = 1 # Starts after main video input
@@ -561,8 +574,10 @@ def main():
             all_streams = get_stream_info(input_file)
             if all_streams is None: continue
             s_keep, s_rem = plan_stream_selection(all_streams)
-            if not display_and_confirm_plan(s_keep, s_rem): print("Skipping file.");
-            continue
+            if not display_and_confirm_plan(s_keep, s_rem):
+                print("Skipping file.")
+                continue
+            # This logic was unindented and skipped by the 'continue'
             for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
             args.subs = [] # Disable subtitle embedding if filtering
 
