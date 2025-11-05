@@ -13,14 +13,23 @@ from tqdm import tqdm
 import grp
 from typing import Dict, Any
 import csv
-import time  # <--- Was missing from your v8.0.5, but 'run_loudnorm_analysis' needs it
+import time
 
 # --- Version History ---
-__version__ = "8.0.6"
+__version__ = "8.0.7"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.0.7  fix(deps): Use shutil.which to find 'stbuf'
+        
+        - Fixes "Error: Required command not found (ffmpeg/stbuf)"
+          by explicitly finding the full path to 'stbuf'.
+        - If 'stbuf' isn't found, print a warning and
+          continue without it (progress bar may lag).
+        - Improved the FileNotFoundError message to be
+          more specific about what command failed.
+
 v8.0.6  fix(ffmpeg): Add -vaapi_device global option
         
         - Fixes "[hwupload] A hardware device reference is
@@ -30,30 +39,11 @@ v8.0.6  fix(ffmpeg): Add -vaapi_device global option
           hwupload to function correctly.
 
 v8.0.5  fix(main): Correct indentation on 'skip_hevc' continue
-        
-        - The `continue` statement for the `args.skip_hevc`
-          check was not indented. This caused the main
-          processing loop to skip every file, every time.
-        - This has been corrected. My deepest apologies for
-          this repeated, basic error.
-
 v8.0.4  fix(main): Correct indentation on 'no files found' sys.exit()
 v8.0.3  fix(main): Correct indentation on file not found sys.exit()
 v8.0.2  fix(main): Correct indentation error on sys.exit()
 v8.0.1  fix(main): Remove argcomplete to fix silent exit
 v8.0.0  feat(normalize): Use fast `ebur128` filter for analysis
-v7.9    feat(normalize): Read CSV data from ,audit_loudness v2
-v7.8    feat(normalize): Read data from ,audit_loudness log
-v7.7    fix(remux): Apply -fflags +genpts to all .avi operations
-v7.6    fix(ffmpeg): Correct ffmpeg syntax for -vf filter
-v7.5    fix(ffmpeg): Add hwupload filter for software-decoded .avi
-v7.4    feat(normalize): Print audio stats & use VBR for audio
-v7.3    feat(normalize): Add .NORM suffix and update summary
-v7.2.2  fix(ffmpeg): Add -nostdin flag to disable interactive mode
-v7.2.1  fix(typo): Corrected 'add_ar_argument' to 'add_argument'
-v7.2    fix(logic): Allow --normalize and --remux to work together
-v7.1    feat(audio): Add -N/--normalize flag for 2-pass loudnorm
-v7.0    refactor(chapters): Use mkvpropedit for chapter embedding
         ...
 """
 # --- MODIFICATION END ---
@@ -262,6 +252,7 @@ def embed_chapters_mkvpropedit(chapter_file, output_mkv):
         print(f"\nAn unexpected error occurred running mkvpropedit: {e}", file=sys.stderr)
         return False
 
+# --- MODIFIED v8.0.7 ---
 def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None):
     """Executes FFmpeg, shows progress, verifies output, and optionally embeds chapters."""
     print("\nExecuting FFmpeg command:")
@@ -286,10 +277,14 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
         ffmpeg_success = True
     except (subprocess.CalledProcessError, FileNotFoundError, KeyboardInterrupt) as e:
         if isinstance(e, subprocess.CalledProcessError): print(f"\n--- FFmpeg Error ---\n{e.stderr}\n--------------------", file=sys.stderr)
-        elif isinstance(e, FileNotFoundError): print("\nError: Required command not found (ffmpeg/stbuf).", file=sys.stderr)
+        elif isinstance(e, FileNotFoundError):
+            failed_cmd = cmd[0]
+            print(f"\nError: Required command not found: '{failed_cmd}'.", file=sys.stderr)
+            print("Please ensure it is installed and in your system's PATH.", file=sys.stderr)
         else: print("\nCancelled.", file=sys.stderr)
         if 'process' in locals(): process.terminate()
         sys.exit(1) # Exit immediately on FFmpeg failure
+# --- END MODIFIED ---
 
     # --- Post-FFmpeg Verification ---
     if not ffmpeg_success or not os.path.exists(output_file):
@@ -527,13 +522,20 @@ def main():
         
         ffmpeg_cmd = ['ffmpeg', '-y', '-nostdin']
         
+        # --- MODIFIED v8.0.7 ---
         # Progress/Verbosity
         use_progress_bar = total_frames is not None and not (is_remux_op or args.quiet or args.dry_run)
         if use_progress_bar:
-            if sys.platform != "win32": ffmpeg_cmd = ['stbuf', '-o0'] + ffmpeg_cmd
+            stbuf_path = shutil.which('stbuf')
+            if sys.platform != "win32" and stbuf_path:
+                ffmpeg_cmd = [stbuf_path, '-o0'] + ffmpeg_cmd
+            elif sys.platform != "win32":
+                print("Warning: 'stbuf' not found in PATH. Progress bar may not update in real-time.", file=sys.stderr)
+            
             ffmpeg_cmd.extend(['-progress', '-', '-nostats'])
         elif args.quiet: ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
         else: ffmpeg_cmd.extend(['-v', 'error', '-stats'])
+        # --- END MODIFIED ---
         
         # --- HWACCEL & .avi FIX (v7.7) ---
         is_avi = input_file.lower().endswith('.avi')
@@ -657,7 +659,7 @@ def main():
             # Run this block if --normalize=False OR if --normalize=True but it failed
             if args.acodec:
                 ffmpeg_cmd.extend(['-c:a', args.acodec])
-            if args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
+            if args.abitrate: ffmpeg_extend(['-b:a', args.abitrate])
             else:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
                 if not is_normalize_enabled: # Don't print "copying" if we're here on a failed normalize
