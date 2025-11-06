@@ -15,32 +15,29 @@ from typing import Dict, Any, List
 import csv
 
 # --- Version History ---
-__version__ = "8.0.9"
+__version__ = "8.1.0"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.1.0  feat(log): Add -V/--verbose flag for detailed output
+        
+        - Added a `-V, --verbose` flag.
+        - Most "Info: ..." print statements are now
+          conditional on this flag being used.
+        - Default output is now much quieter.
+        - Added *new* verbose output to the sidecar subtitle
+          scan, which now prints the directory and base
+          filename it is searching for, satisfying the
+          user's request.
+
 v8.0.9  feat(subs): Auto-detect and embed sidecar subtitles
         
-        - The script now automatically scans the input file's
-          directory for matching subtitle files (.srt, .ass, .sub).
-        - If found, these are automatically added to the
-          ffmpeg command, embedding them into the output.
-        - This removes the need to manually use the -s flag
-          for sidecar files downloaded by Jellyfin.
-        - The stream mapping logic was updated to map:
-          - all video (0:v)
-          - all audio (0:a?)
-          - all embedded subtitles (0:s?)
-          - all newly found external subtitles (1:s?, 2:s?, etc.)
-        - Attempts to guess language code from filename (e.g., .en.srt).
+        - Automatically scans for and embeds matching
+          .srt, .ass, or .sub files.
+        - Updated mapping logic to handle new external inputs.
 
 v8.0.8  fix(remux): Use -c:s copy when in remux mode
-        
-        - The script was hard-coded to use `-c:s srt`,
-          which is incorrect for remuxing image-based subs.
-        - Now uses `-c:s copy` for remux and `-c:s srt` for transcode.
-
 v8.0.5  fix(main): Correct indentation on 'skip_hevc' continue
 v8.0.4  fix(main): Correct indentation on 'no files found' sys.exit()
 v8.0.3  fix(main): Correct indentation on file not found sys.exit()
@@ -65,7 +62,7 @@ v7.0    refactor(chapters): Use mkvpropedit for chapter embedding
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
-SUBTITLE_EXTENSIONS = ('.srt', '.ass', '.sub') # <-- MODIFIED: Added for auto-detect
+SUBTITLE_EXTENSIONS = ('.srt', '.ass', '.sub')
 
 # --- Helper Functions ---
 def get_total_frames(file_path):
@@ -269,7 +266,8 @@ def embed_chapters_mkvpropedit(chapter_file, output_file):
         print(f"\nAn unexpected error occurred running mkvpropedit: {e}", file=sys.stderr)
         return False
 
-def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None):
+# --- MODIFIED: Added args.verbose to signature (v8.1.0) ---
+def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False):
     """Executes FFmpeg, shows progress, verifies output, and optionally embeds chapters."""
     print("\nExecuting FFmpeg command:")
     print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
@@ -326,7 +324,9 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
         try:
             os.chown(output_file, permissions['uid'], permissions['gid']);
             os.chmod(output_file, permissions['mode'])
-            print(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
+            # --- MODIFIED: Added verbose check (v8.1.0) ---
+            if verbose:
+                print(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
         except OSError as e: print(f"\nWarning: Could not set permissions. Reason: {e}", file=sys.stderr)
 
     print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=audio_normalized)
@@ -342,8 +342,8 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     elif delete_source:
          print(f"\nWarning: --delete flag ignored because chapter embedding failed.")
 
-# --- MODIFIED: Load CSV log using csv.DictReader (v7.9) ---
-def load_loudness_db(log_file: str) -> Dict[str, Dict[str, float]]:
+# --- MODIFIED: Added args.verbose to signature (v8.1.0) ---
+def load_loudness_db(log_file: str, verbose=False) -> Dict[str, Dict[str, float]]:
     """
     Reads a CSV loudness audit log file and returns a
     dictionary mapping file paths to their normalization data.
@@ -353,7 +353,9 @@ def load_loudness_db(log_file: str) -> Dict[str, Dict[str, float]]:
         print(f"Warning: Loudness log not found at '{log_file}'. Will run analysis.", file=sys.stderr)
         return db
 
-    print(f"Info: Loading loudness database from '{os.path.basename(log_file)}'...")
+    # --- MODIFIED: Added verbose check (v8.1.0) ---
+    if verbose:
+        print(f"Info: Loading loudness database from '{os.path.basename(log_file)}'...")
     try:
         with open(log_file, 'r', encoding='utf-8', newline='') as f:
             # Use DictReader to read the log by header name
@@ -379,7 +381,9 @@ def load_loudness_db(log_file: str) -> Dict[str, Dict[str, float]]:
     except Exception as e:
         print(f"Error: Could not read loudness log '{log_file}': {e}", file=sys.stderr)
     
-    print(f"Info: Loaded {len(db)} pre-analyzed entries.")
+    # --- MODIFIED: Added verbose check (v8.1.0) ---
+    if verbose:
+        print(f"Info: Loaded {len(db)} pre-analyzed entries.")
     return db
 # --- END MODIFIED ---
 
@@ -422,9 +426,16 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg output.")
     parser.add_argument("-v", "--version", action="store_true", help="Show version history and exit.")
     
+    # --- MODIFIED: Added verbose flag (v8.1.0) ---
+    parser.add_argument("-V", "--verbose", action="store_true", help="Print detailed information during processing.")
+    
     # --- MODIFIED: Removed argcomplete (v8.0.1) ---
     args = parser.parse_args()
     # --- END MODIFIED ---
+    
+    # --- MODIFIED: Added verbose check (v8.1.0) ---
+    if args.verbose:
+        print("Info: Verbose mode enabled.")
     
     # --- MODIFIED: Corrected indentation (v8.0.2) ---
     if args.version:
@@ -443,8 +454,8 @@ def main():
     is_normalize_enabled = args.normalize is not None
     
     if isinstance(args.normalize, str):
-        # This means a log file path was provided, e.g., -N file.log
-        loudness_db = load_loudness_db(args.normalize)
+        # --- MODIFIED: Pass verbose flag (v8.1.0) ---
+        loudness_db = load_loudness_db(args.normalize, args.verbose)
     # --- END MODIFIED ---
     
     # --- File Processing Loop ---
@@ -463,7 +474,9 @@ def main():
         # Store chapter file path separately, disable for batch unless explicitly handled later
         chapter_file_for_this_run = args.chapters
         if chapter_file_for_this_run and len(files_to_process) > 1:
-            print("Info: --chapters flag is ignored in batch/directory mode for now.")
+            # --- MODIFIED: Added verbose check (v8.1.0) ---
+            if args.verbose:
+                print("Info: --chapters flag is ignored in batch/directory mode for now.")
             chapter_file_for_this_run = None # Disable chapters for batch mode
         if chapter_file_for_this_run and not os.path.exists(chapter_file_for_this_run):
              print(f"Warning: Chapter file '{chapter_file_for_this_run}' not found. Skipping chapter embedding.")
@@ -479,9 +492,15 @@ def main():
                 try:
                     jellyfin_gid = grp.getgrnam('jellyfin').gr_gid
                     response = input(f"Warning: Source group is '{input_group_name}'. Change output to 'jellyfin'? [Y/n]: ").lower().strip()
-                    if response in ('y', 'yes', ''): target_gid = jellyfin_gid;
-                    print("Info: Output group set to 'jellyfin'.")
-                except KeyError: print("Info: 'jellyfin' group not found. Preserving original.")
+                    if response in ('y', 'yes', ''): 
+                        target_gid = jellyfin_gid;
+                        # --- MODIFIED: Added verbose check (v8.1.0) ---
+                        if args.verbose:
+                            print("Info: Output group set to 'jellyfin'.")
+                except KeyError: 
+                    # --- MODIFIED: Added verbose check (v8.1.0) ---
+                    if args.verbose:
+                        print("Info: 'jellyfin' group not found. Preserving original.")
                 except (KeyboardInterrupt, EOFError): print("\nCancelled.");
                 sys.exit(1)
             permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
@@ -524,7 +543,9 @@ def main():
         if os.path.abspath(output_file) == os.path.abspath(input_file):
             base, ext = os.path.splitext(output_file);
             output_file = f"{base}.COPY{ext}"
-            print(f"Info: Output name identical to input. Using '{os.path.basename(output_file)}'")
+            # --- MODIFIED: Added verbose check (v8.1.0) ---
+            if args.verbose:
+                print(f"Info: Output name identical to input. Using '{os.path.basename(output_file)}'")
                     
         # Overwrite check
         if os.path.exists(output_file) and not args.dry_run:
@@ -580,6 +601,12 @@ def main():
             input_dir = os.path.dirname(input_file)
             input_base = os.path.splitext(os.path.basename(input_file))[0]
             
+            # --- MODIFIED: Added verbose output (v8.1.0) ---
+            if args.verbose:
+                print("Info: Scanning for sidecar subtitles...")
+                print(f"      - In directory: {input_dir}")
+                print(f"      - For base name: {input_base}")
+            
             try:
                 for item in os.listdir(input_dir):
                     item_path = os.path.join(input_dir, item)
@@ -589,10 +616,15 @@ def main():
                     if item_ext.lower() in SUBTITLE_EXTENSIONS and item_base.startswith(input_base):
                         abs_item_path = os.path.abspath(item_path)
                         if abs_item_path not in external_sub_files:
-                            print(f"Info: Auto-detected sidecar subtitle: {item}")
+                            if args.verbose:
+                                print(f"Info: Found sidecar: {item}")
                             external_sub_files.append(abs_item_path)
             except OSError as e:
                 print(f"Warning: Could not scan for sidecar subtitles: {e}", file=sys.stderr)
+            
+            if args.verbose and not external_sub_files and not args.subs:
+                print("Info: No sidecar or manual subtitles found.")
+            # --- END MODIFIED (v8.1.0) ---
 
         # 2. Add all inputs to ffmpeg command
         ffmpeg_cmd.extend(['-i', input_file]) # Main video input (index 0)
@@ -615,12 +647,16 @@ def main():
         
         else: 
             # Default auto-mapping logic
+            if args.verbose:
+                print("Info: Mapping all video (0:v), audio (0:a?), and embedded subs (0:s?).")
+                
             ffmpeg_cmd.extend(['-map', '0:v', '-map', '0:a?']) # Map all video & audio from input 0
             ffmpeg_cmd.extend(['-map', '0:s?']) # Map all *embedded* subs from input 0
             
             # Now map all *external* subs we just added
             if external_sub_files:
-                print(f"Info: Auto-embedding {len(external_sub_files)} external subtitle stream(s).")
+                if args.verbose:
+                    print(f"Info: Mapping {len(external_sub_files)} external subtitle stream(s).")
                 embedded_sub_count = 0 # Track output sub index
                 
                 # We need to find out how many embedded subs there are to offset the metadata index
@@ -681,7 +717,8 @@ def main():
                 print("Info: Using pre-analyzed loudness data from log.")
             else:
                 if isinstance(args.normalize, str):
-                    print(f"Info: File not found in log, running live analysis...")
+                    if args.verbose:
+                        print(f"Info: File not found in log, running live analysis...")
                 print("Running audio normalization analysis (Pass 1)...")
                 analysis_data = run_loudnorm_analysis(input_file) # <-- NOW USES FAST ebur128
                 if analysis_data:
@@ -721,15 +758,20 @@ def main():
             else:
                 ffmpeg_cmd.extend(['-c:a', 'copy'])
                 if not is_normalize_enabled: # Don't print "copying" if we're here on a failed normalize
-                    print("Info: Copying all audio streams.")
+                    # --- MODIFIED: Added verbose check (v8.1.0) ---
+                    if args.verbose:
+                        print("Info: Copying all audio streams.")
 
         # --- MODIFIED: Subtitle logic now conditional (v8.0.8) ---
         if is_remux_op:
             # For remux, copy subtitles as-is
-            print("Info: Copying all subtitle streams.")
+            if args.verbose:
+                print("Info: Copying all subtitle streams.")
             ffmpeg_cmd.extend(['-c:s', 'copy'])
         else:
             # For transcode, convert to srt for max compatibility
+            if args.verbose:
+                print("Info: Converting all subtitle streams to SRT.")
             ffmpeg_cmd.extend(['-c:s', 'srt'])
         # --- END MODIFIED ---
         
@@ -749,10 +791,11 @@ def main():
                 ffmpeg_cmd,
                 input_file,
                 args.delete,
-                audio_normalized=audio_normalized, # <--- MODMODIFIED
+                audio_normalized=audio_normalized, # <--- MODIFIED
                 total_frames=total_frames,
                 permissions=permissions_to_apply,
-                chapter_file_to_embed=chapter_file_for_this_run
+                chapter_file_to_embed=chapter_file_for_this_run,
+                verbose=args.verbose # <-- MODIFIED: Pass verbose flag
             )
 
     print("\n--- All tasks complete. ---")
