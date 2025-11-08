@@ -16,25 +16,21 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.1.8"
+__version__ = "8.1.9"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v8.1.8  fix(ffmpeg): Use global 'copy' and override streams
+v8.1.9  fix(main): Correct indentation on overwrite check sys.exit()
         
-        - The mapping logic in v8.1.7 was still flawed and
-          would have failed to copy video/audio during remux.
-        - The logic is now much simpler and more robust:
-          1. Map ALL streams from all inputs (`-map 0`, `-map 1`...).
-          2. Set the default codec for ALL streams to `copy` (`-c copy`).
-          3. *Override* specific streams as needed:
-             - `-c:v hevc_vaapi` (if transcoding video)
-             - `-c:a:0 aac...` (if normalizing audio)
-             - `-c:s srt` (if transcoding subtitles)
-        - This correctly copies all chapters, attachments, and
-          other streams by default, fixing the bug.
+        - The `sys.exit(1)` call after the overwrite-check
+          `try/except` block was NOT indented.
+        - This caused the script to exit immediately after
+          the user typed 'y' to overwrite a file.
+        - This has been corrected. My apologies for this
+          repeated, basic error.
 
+v8.1.8  fix(ffmpeg): Use global 'copy' and override streams
 v8.1.7  fix(ffmpeg): (Failed attempt) Map *all* streams
 v8.1.6  fix(ffmpeg): *Actually* fix contradictory audio codec/filter logic
 v8.1.5  fix(ffmpeg): (Failed attempt) Correct contradictory audio logic
@@ -240,7 +236,7 @@ def embed_chapters_mkvpropedit(chapter_file, output_file):
 
     mkvpropedit_cmd = ['mkvpropedit', output_file, '--chapters', chapter_file]
     print("\nExecuting mkvpropedit command:")
-    print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
+    print(' '.join(f'"{a}"' if ' ' in a else a for a in mkvpropedit_cmd))
 
     try:
         # Capture output to check for errors/warnings
@@ -563,14 +559,17 @@ def main():
             if args.verbose:
                 print(f"Info: Output name identical to input. Using '{os.path.basename(output_file)}'")
                     
+        # --- MODIFIED: Corrected indentation (v8.1.9) ---
         # Overwrite check
         if os.path.exists(output_file) and not args.dry_run:
             try:
                 if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': 
                     print("Skipping.")
                     continue
-            except KeyboardInterrupt: print("\nCancelled.");
-            sys.exit(1)
+            except KeyboardInterrupt:
+                print("\nCancelled.")
+                sys.exit(1)
+        # --- END MODIFIED ---
         
         # --- FFmpeg Command Construction ---
         total_frames = get_total_frames(input_file) if not (is_remux_op or args.quiet or args.dry_run) else None
@@ -757,7 +756,10 @@ def main():
                 
                 filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                 
-                # Override stream 0 to re-encode and apply the filter
+                # *** THIS IS THE FIX (v8.1.6) ***
+                # The buggy -c:a copy line was here and is now removed.
+                
+                # NOW, override stream 0 to re-encode and apply the filter
                 ffmpeg_cmd.extend(['-c:a:0', 'aac', '-q:a:0', '4', '-af:a:0', filter_string])
                 
                 print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams copied.")
@@ -775,6 +777,13 @@ def main():
         if is_normalize_enabled and not analysis_data:
              print("Warning: Audio normalization analysis failed. Falling back to copy.", file=sys.stderr)
 
+        if not audio_normalized and not args.acodec:
+             # This is the catch-all. If we aren't normalizing AND we
+             # aren't re-encoding to a specific codec, the default
+             # '-c copy' we set earlier will handle all audio streams.
+             if args.verbose:
+                print("Info: Copying all audio streams.")
+        
         # 3. SUBTITLE OVERRIDE
         if is_transcode_op:
             # For transcode, convert text subs to srt, but copy image subs
