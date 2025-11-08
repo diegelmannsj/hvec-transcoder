@@ -13,34 +13,26 @@ from tqdm import tqdm
 import grp
 from typing import Dict, Any, List
 import csv
-import time  # <-- MODIFIED: Added missing import
+import time
 
 # --- Version History ---
-__version__ = "8.1.3"
+__version__ = "8.1.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.1.4  feat(normalize): Add fallback search for default log file
+        
+        - When using -N (with no path), the script now
+          searches for the audit log in a specific order:
+          1. `audit_loudness.csv` in the Current Directory.
+          2. `~/.hvec/audit_loudness.csv` (the new default).
+        - If found in either, it's used.
+        - If found in neither, it falls back to live analysis.
+
 v8.1.3  fix(main): Add missing 'import time'
-        
-        - The `run_loudnorm_analysis` function calls
-          `time.time()`, which was causing a NameError.
-        - Added `import time` to the script's imports.
-
 v8.1.2  feat(main): Re-enable argcomplete
-        
-        - Added back `import argcomplete` and the
-          `argcomplete.autocomplete(parser)` call to
-          re-enable bash tab-completion.
-
 v8.1.1  fix(subs): Use absolute path for sidecar subtitle scan
-        
-        - The auto-detect feature failed when using a
-          relative input path (e.g., -i ./movie.mkv).
-        - The script now uses `os.path.abspath(input_file)`
-          to ensure it can always find the correct
-          directory to scan.
-
 v8.1.0  feat(log): Add -V/--verbose flag for detailed output
 v8.0.9  feat(subs): Auto-detect and embed sidecar subtitles
 v8.0.8  fix(remux): Use -c:s copy when in remux mode
@@ -58,6 +50,13 @@ v7.9    feat(normalize): Read CSV data from ,audit_loudness v2
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm')
 SUBTITLE_EXTENSIONS = ('.srt', '.ass', '.sub')
+
+# --- MODIFIED: Define default log paths (v8.1.4) ---
+DEFAULT_LOG_BASENAME = 'audit_loudness.csv'
+DEFAULT_LOG_DIR = os.path.expanduser('~/.hvec')
+DEFAULT_LOG_PATH = os.path.join(DEFAULT_LOG_DIR, DEFAULT_LOG_BASENAME)
+CWD_LOG_PATH = os.path.abspath(DEFAULT_LOG_BASENAME)
+# --- END MODIFIED ---
 
 # --- Helper Functions ---
 def get_total_frames(file_path):
@@ -445,13 +444,31 @@ def main():
         sys.exit(1)
     # --- END MODIFIED ---
     
-    # --- MODIFIED: Load Loudness DB (v7.8) ---
+    # --- MODIFIED: Load Loudness DB (v8.1.4) ---
     loudness_db = {}
     is_normalize_enabled = args.normalize is not None
     
     if isinstance(args.normalize, str):
-        # --- MODIFIED: Pass verbose flag (v8.1.0) ---
+        # Path provided, e.g., -N /path/to/log.csv
+        if args.verbose:
+            print(f"Info: User specified loudness log: {args.normalize}")
         loudness_db = load_loudness_db(args.normalize, args.verbose)
+    
+    elif is_normalize_enabled:
+        # No path provided, e.g., -N
+        # Check CWD first
+        if os.path.exists(CWD_LOG_PATH):
+            if args.verbose:
+                print(f"Info: Found loudness log in CWD: {CWD_LOG_PATH}")
+            loudness_db = load_loudness_db(CWD_LOG_PATH, args.verbose)
+        # If not in CWD, check default ~/.hvec path
+        elif os.path.exists(DEFAULT_LOG_PATH):
+            if args.verbose:
+                print(f"Info: Found loudness log in default path: {DEFAULT_LOG_PATH}")
+            loudness_db = load_loudness_db(DEFAULT_LOG_PATH, args.verbose)
+        else:
+            if args.verbose:
+                print(f"Info: No loudness log found in CWD or default path. Will run live analysis.")
     # --- END MODIFIED ---
     
     # --- File Processing Loop ---
