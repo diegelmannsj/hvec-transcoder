@@ -757,7 +757,6 @@ def main():
                 filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                 
                 # Set ALL OTHER audio streams to copy first
-                ffmpeg_cmd.extend(['-c:a', 'copy'])
                 # NOW, override stream 0 to re-encode and apply the filter
                 ffmpeg_cmd.extend(['-c:a:0', 'aac', '-q:a:0', '4', '-af:a:0', filter_string])
                 
