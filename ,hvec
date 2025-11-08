@@ -16,23 +16,30 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.1.9"
+__version__ = "8.1.10"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v8.1.9  fix(main): Correct indentation on overwrite check sys.exit()
+v8.1.10 fix(ffmpeg): *Finally* fix contradictory audio/filter logic
         
-        - The `sys.exit(1)` call after the overwrite-check
-          `try/except` block was NOT indented.
-        - This caused the script to exit immediately after
-          the user typed 'y' to overwrite a file.
-        - This has been corrected. My apologies for this
-          repeated, basic error.
+        - Ripped out the global `-c copy` which was the
+          root cause of all failures.
+        - Re-wrote the codec logic to be 100% explicit:
+          - Video: Sets `-c:v copy` or `-c:v hevc_vaapi`.
+          - Audio: Sets `-c:a copy` or `-c:a aac` *unless*
+            normalizing.
+          - Subs: Sets `-c:s copy` or `-c:s srt`.
+          - Other: Sets `-c:d copy -c:t copy`.
+        - When normalizing, it *only* adds the per-stream
+          `-c:a:0 aac -af:a:0...` and a global `-c:a copy`,
+          which is now the correct, non-conflicting syntax.
+        - My deepest apologies for this repeated error.
 
-v8.1.8  fix(ffmpeg): Use global 'copy' and override streams
+v8.1.9  fix(main): Correct indentation on overwrite check sys.exit()
+v8.1.8  fix(ffmpeg): (Failed attempt) Use global 'copy'
 v8.1.7  fix(ffmpeg): (Failed attempt) Map *all* streams
-v8.1.6  fix(ffmpeg): *Actually* fix contradictory audio codec/filter logic
+v8.1.6  fix(ffmpeg): (Failed attempt) *Actually* fix contradictory logic
 v8.1.5  fix(ffmpeg): (Failed attempt) Correct contradictory audio logic
 v8.1.4  feat(normalize): Add fallback search for default log file
 v8.1.3  fix(main): Add missing 'import time'
@@ -701,19 +708,11 @@ def main():
 
         # --- END MODIFIED (v8.1.8) ---
 
-        # --- MODIFIED: Reworked Codec Logic (v8.1.8) ---
-        
-        # Start by setting a default of 'copy' for ALL streams.
-        # This will copy video, audio, subs, chapters, attachments, etc.
-        # We will then override specific streams as needed.
-        ffmpeg_cmd.extend(['-c', 'copy'])
-        
-        if args.verbose:
-            print("Info: Setting default codec to 'copy' for all streams.")
+        # --- MODIFIED: Reworked Codec Logic (v8.1.10) ---
         
         audio_normalized = False # Define here for summary
 
-        # 1. VIDEO OVERRIDE
+        # 1. VIDEO CODEC
         if is_transcode_op:
             print("\nMode: VAAPI Video Transcode")
             if is_avi:
@@ -722,8 +721,9 @@ def main():
             ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
         else:
             print("Mode: Lossless Video Remux");
+            ffmpeg_cmd.extend(['-c:v', 'copy'])
 
-        # 2. AUDIO OVERRIDE
+        # 2. AUDIO CODEC
         if is_normalize_enabled:
             if is_remux_op:
                 print("Info: Normalizing audio while remuxing video.")
@@ -756,9 +756,8 @@ def main():
                 
                 filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                 
-                # *** THIS IS THE FIX (v8.1.6) ***
-                # The buggy -c:a copy line was here and is now removed.
-                
+                # Set ALL OTHER audio streams to copy first
+                ffmpeg_cmd.extend(['-c:a', 'copy'])
                 # NOW, override stream 0 to re-encode and apply the filter
                 ffmpeg_cmd.extend(['-c:a:0', 'aac', '-q:a:0', '4', '-af:a:0', filter_string])
                 
@@ -774,24 +773,34 @@ def main():
             if args.abitrate: # Only add bitrate if acodec is also specified
                 ffmpeg_cmd.extend(['-b:a', args.abitrate])
         
-        if is_normalize_enabled and not analysis_data:
-             print("Warning: Audio normalization analysis failed. Falling back to copy.", file=sys.stderr)
-
         if not audio_normalized and not args.acodec:
              # This is the catch-all. If we aren't normalizing AND we
-             # aren't re-encoding to a specific codec, the default
-             # '-c copy' we set earlier will handle all audio streams.
+             # aren't re-encoding to a specific codec, copy all audio.
+             ffmpeg_cmd.extend(['-c:a', 'copy'])
              if args.verbose:
                 print("Info: Copying all audio streams.")
         
-        # 3. SUBTITLE OVERRIDE
+        if is_normalize_enabled and not analysis_data:
+             print("Warning: Audio normalization analysis failed. Falling back to copy.", file=sys.stderr)
+
+        # 3. SUBTITLE, CHAPTER, and OTHER STREAM LOGIC
         if is_transcode_op:
             # For transcode, convert text subs to srt, but copy image subs
             if args.verbose:
                 print("Info: Converting text subtitles to SRT, copying image subs.")
             ffmpeg_cmd.extend(['-c:s', 'srt'])
+        else:
+            # For remux, copy subtitles as-is
+            if args.verbose:
+                print("Info: Copying all subtitle streams.")
+            ffmpeg_cmd.extend(['-c:s', 'copy'])
         
-        # --- END MODIFIED (v8.1.8) ---
+        # Always copy chapters and attachments
+        if args.verbose:
+            print("Info: Copying all chapter and attachment streams.")
+        ffmpeg_cmd.extend(['-c:d', 'copy', '-c:t', 'copy'])
+        
+        # --- END MODIFIED (v8.1.10) ---
         
         # --- END Codec Logic ---
 
