@@ -710,7 +710,7 @@ def main():
 
         # --- END MODIFIED (v8.1.8) ---
 
-        # --- MODIFIED: Reworked Codec Logic (v8.1.11) ---
+        # --- MODIFIED: Reworked Codec Logic (v8.1.12) ---
         
         audio_normalized = False # Define here for summary
 
@@ -758,22 +758,10 @@ def main():
                 
                 filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                 
-                # Get all audio streams
-                all_streams = get_stream_info(input_file) or []
-                audio_streams = [s for s in all_streams if s.get('codec_type') == 'audio']
-
-                if not audio_streams:
-                    if args.verbose:
-                        print("Info: No audio streams found to process.")
-                
-                # Explicitly set codec for *each* audio stream
-                for i in range(len(audio_streams)):
-                    if i == 0:
-                        # This is the stream to normalize
-                        ffmpeg_cmd.extend([f'-c:a:{i}', 'aac', '-q:a:0', '4', f'-af:a:{i}', filter_string])
-                    else:
-                        # Copy all other audio streams
-                        ffmpeg_cmd.extend([f'-c:a:{i}', 'copy'])
+                # Set ALL OTHER audio streams to copy first
+                ffmpeg_cmd.extend(['-c:a', 'copy'])
+                # NOW, override stream 0 to re-encode and apply the filter
+                ffmpeg_cmd.extend(['-c:a:0', 'aac', '-q:a:0', '4', '-af:a:0', filter_string])
                 
                 print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams copied.")
                 audio_normalized = True # Mark as complete
@@ -814,7 +802,7 @@ def main():
             print("Info: Copying all chapter and attachment streams.")
         ffmpeg_cmd.extend(['-c:d', 'copy', '-c:t', 'copy'])
         
-        # --- END MODIFIED (v8.1.11) ---
+        # --- END MODIFIED (v8.1.12) ---
         
         # --- END Codec Logic ---
 
