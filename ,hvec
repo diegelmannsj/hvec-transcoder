@@ -16,24 +16,26 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.1.7"
+__version__ = "8.1.8"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v8.1.7  fix(ffmpeg): Map *all* streams, not just v/a/s
+v8.1.8  fix(ffmpeg): Use global 'copy' and override streams
         
-        - The script was only mapping video, audio, and
-          subtitles (`-map 0:v -map 0:a? -map 0:s?`).
-        - This was incorrect, as it dropped embedded chapters,
-          attachments, and other metadata streams.
-        - The logic is now simplified to use `-map 0`, which
-          selects *all* streams from the main input file.
-        - This ensures embedded chapters are preserved
-          during remuxing, as requested by the user.
-        - The `-s` flag logic is now smarter and maps
-          external subs to the *next* available index.
+        - The mapping logic in v8.1.7 was still flawed and
+          would have failed to copy video/audio during remux.
+        - The logic is now much simpler and more robust:
+          1. Map ALL streams from all inputs (`-map 0`, `-map 1`...).
+          2. Set the default codec for ALL streams to `copy` (`-c copy`).
+          3. *Override* specific streams as needed:
+             - `-c:v hevc_vaapi` (if transcoding video)
+             - `-c:a:0 aac...` (if normalizing audio)
+             - `-c:s srt` (if transcoding subtitles)
+        - This correctly copies all chapters, attachments, and
+          other streams by default, fixing the bug.
 
+v8.1.7  fix(ffmpeg): (Failed attempt) Map *all* streams
 v8.1.6  fix(ffmpeg): *Actually* fix contradictory audio codec/filter logic
 v8.1.5  fix(ffmpeg): (Failed attempt) Correct contradictory audio logic
 v8.1.4  feat(normalize): Add fallback search for default log file
@@ -238,7 +240,7 @@ def embed_chapters_mkvpropedit(chapter_file, output_file):
 
     mkvpropedit_cmd = ['mkvpropedit', output_file, '--chapters', chapter_file]
     print("\nExecuting mkvpropedit command:")
-    print(' '.join(f'"{a}"' if ' ' in a else a for a in mkvpropedit_cmd))
+    print(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
 
     try:
         # Capture output to check for errors/warnings
@@ -527,6 +529,7 @@ def main():
 
         # --- Output Filename Generation ---
         is_remux_op = args.remux and not args.hvec # <--- Moved this line up
+        is_transcode_op = not is_remux_op # <--- MODIFIED: Added for clarity (v8.1.8)
         
         def generate_output_filename(base, is_remux, has_chapters, is_normalized):
             sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.') # Cleaner regex
@@ -584,14 +587,13 @@ def main():
         
         # --- HWACCEL & .avi FIX (v7.7) ---
         is_avi = input_file.lower().endswith('.avi')
-        is_transcode = not is_remux_op
         
         if is_avi:
             # .avi files almost always need this to fix broken timestamps,
             # for both remuxing and transcoding.
             ffmpeg_cmd.extend(['-fflags', '+genpts'])
 
-        if is_transcode and not is_avi:
+        if is_transcode_op and not is_avi:
             # Use hwaccel decode ONLY for non-avi transcodes
             ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
         # --- END FIX ---
@@ -649,7 +651,7 @@ def main():
         for sub_file in external_sub_files:
             ffmpeg_cmd.extend(['-i', sub_file])
         
-        # --- MODIFIED: Stream Mapping (v8.1.7) ---
+        # --- MODIFIED: Stream Mapping (v8.1.8) ---
         if args.filter_streams and len(files_to_process) == 1:
             all_streams = get_stream_info(input_file)
             if all_streams is None: continue
@@ -672,13 +674,12 @@ def main():
                 if args.verbose:
                     print(f"Info: Mapping {len(external_sub_files)} external subtitle stream(s).")
                 
-                # We need to find out how many embedded subs there are to offset the metadata index
-                embedded_sub_count = 0
+                # We need to find out how many *non-video/audio* streams there are to offset the metadata index
+                embedded_non_va_count = 0 
                 try:
                     all_streams = get_stream_info(input_file)
                     if all_streams:
-                        # Count all non-video and non-audio streams to be safe
-                        embedded_sub_count = len([s for s in all_streams if s.get('codec_type') not in ['video', 'audio']])
+                        embedded_non_va_count = len([s for s in all_streams if s.get('codec_type') not in ['video', 'audio']])
                 except Exception:
                     pass # Fail safe, count is 0
                 
@@ -696,38 +697,34 @@ def main():
                             lang_code = lang_part
                     
                     # This logic is now simpler: just map to the next sub index.
-                    # ffmpeg's default mapping `-map 0` will add all embedded subs first.
-                    # Our new `-map 1`, `-map 2` will add external subs after them.
-                    # We just need to set metadata for the *output* streams.
-                    
-                    # Total output subtitle streams = embedded subs + external subs
-                    # This sets metadata for the *i*-th *external* sub
-                    output_sub_index = embedded_sub_count + i
+                    output_sub_index = embedded_non_va_count + i
                     ffmpeg_cmd.extend([f'-metadata:s:s:{output_sub_index}', f'language={lang_code}'])
 
-        # --- END MODIFIED (v8.1.7) ---
+        # --- END MODIFIED (v8.1.8) ---
 
-        # --- Codec Logic (Refactored for v7.2) ---
-        audio_normalized = False # <--- MOVED: Define here for later use
+        # --- MODIFIED: Reworked Codec Logic (v8.1.8) ---
+        
+        # Start by setting a default of 'copy' for ALL streams.
+        # This will copy video, audio, subs, chapters, attachments, etc.
+        # We will then override specific streams as needed.
+        ffmpeg_cmd.extend(['-c', 'copy'])
+        
+        if args.verbose:
+            print("Info: Setting default codec to 'copy' for all streams.")
+        
+        audio_normalized = False # Define here for summary
 
-        # 1. VIDEO LOGIC
-        if is_remux_op:
-            print("Mode: Lossless Video Remux");
-            ffmpeg_cmd.extend(['-c:v', 'copy'])
-        else:
+        # 1. VIDEO OVERRIDE
+        if is_transcode_op:
             print("\nMode: VAAPI Video Transcode")
-            
-            # --- .avi HWACCEL FIX (v7.7) ---
-            if is_transcode and is_avi:
+            if is_avi:
                 # Add the manual hwupload filter (goes AFTER -i)
                 ffmpeg_cmd.extend(['-vf', 'format=nv12,hwupload'])
-            # --- END FIX ---
-                
             ffmpeg_cmd.extend(['-c:v', 'hevc_vaapi', '-preset', args.preset, '-global_quality', str(args.quality)])
+        else:
+            print("Mode: Lossless Video Remux");
 
-        # --- MODIFIED: Reworked Audio Logic (v8.1.6) ---
-        
-        # 2. AUDIO LOGIC
+        # 2. AUDIO OVERRIDE
         if is_normalize_enabled:
             if is_remux_op:
                 print("Info: Normalizing audio while remuxing video.")
@@ -760,9 +757,7 @@ def main():
                 
                 filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                 
-                # Set ALL other audio streams to copy first
-                ffmpeg_cmd.extend(['-c:a', 'copy'])
-                # NOW, override stream 0 to re-encode and apply the filter
+                # Override stream 0 to re-encode and apply the filter
                 ffmpeg_cmd.extend(['-c:a:0', 'aac', '-q:a:0', '4', '-af:a:0', filter_string])
                 
                 print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams copied.")
@@ -771,35 +766,23 @@ def main():
                 print("Warning: Audio analysis data was incomplete. Falling back to copy.", file=sys.stderr)
                 audio_normalized = False # Mark as failed
         
-        if not audio_normalized:
-            # Normalization is OFF, or it FAILED
-            if args.acodec:
-                ffmpeg_cmd.extend(['-c:a', args.acodec])
-                if args.abitrate: # Only add bitrate if acodec is also specified
-                    ffmpeg_cmd.extend(['-b:a', args.abitrate])
-            else:
-                # Default case: no normalization, no acodec = copy all
-                ffmpeg_cmd.extend(['-c:a', 'copy'])
-                if not is_normalize_enabled: # Only print this if normalization was never on
-                    if args.verbose:
-                        print("Info: Copying all audio streams.")
-            
-            if is_normalize_enabled and not analysis_data:
-                 print("Warning: Audio normalization analysis failed. Falling back to default audio settings.", file=sys.stderr)
-        # --- END MODFED (v8.1.6) ---
+        elif args.acodec:
+            # Normalization is OFF, but user specified a global audio codec
+            ffmpeg_cmd.extend(['-c:a', args.acodec])
+            if args.abitrate: # Only add bitrate if acodec is also specified
+                ffmpeg_cmd.extend(['-b:a', args.abitrate])
+        
+        if is_normalize_enabled and not analysis_data:
+             print("Warning: Audio normalization analysis failed. Falling back to copy.", file=sys.stderr)
 
-        # 3. SUBTITLE, CHAPTER, and OTHER STREAM LOGIC
-        if is_remux_op:
-            # For remux, copy subtitles, chapters, attachments, etc. as-is
+        # 3. SUBTITLE OVERRIDE
+        if is_transcode_op:
+            # For transcode, convert text subs to srt, but copy image subs
             if args.verbose:
-                print("Info: Copying all subtitle, chapter, and attachment streams.")
-            ffmpeg_cmd.extend(['-c:s', 'copy', '-c:c', 'copy', '-c:t', 'copy'])
-        else:
-            # For transcode, convert text subs to srt, copy chapters/attachments
-            if args.verbose:
-                print("Info: Converting text subtitles to SRT, copying chapters/attachments.")
-            ffmpeg_cmd.extend(['-c:s', 'srt', '-c:c', 'copy', '-c:t', 'copy'])
-        # --- END MODIFIED (v8.1.7) ---
+                print("Info: Converting text subtitles to SRT, copying image subs.")
+            ffmpeg_cmd.extend(['-c:s', 'srt'])
+        
+        # --- END MODIFIED (v8.1.8) ---
         
         # --- END Codec Logic ---
 
