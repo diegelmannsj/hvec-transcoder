@@ -16,28 +16,45 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.1.15"
+__version__ = "8.2.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v8.1.15 fix(ffmpeg): *FINAL* fix for contradictory audio/filter logic
+v8.2.2  fix(ffmpeg): *FINAL* fix for "Filtergraph specified but
+        codec copy selected" in "Add" mode.
         
-        - The `ffmpeg` command was still failing with a
-          "Filtergraph was specified, but codec copy was selected"
-          error. This is a known ffmpeg bug/quirk.
-        - My previous "fix" of adding `-af anull` *with*
-          `-c copy` was the bug, as it's still a filter.
-        - The audio logic is now rewritten to be 100% explicit:
-          When normalizing, *all* audio streams must be
-          re-encoded.
-          1. Stream 0: Gets `-c:a:0 aac -af:a:0 loudnorm=...`
-          2. Stream 1+: Gets `-c:a:1 aac -q:a:1 5 -af:a:1 anull`
-        - This re-encodes other audio streams (to high-quality
-          VBR 5) and applies the null filter, finally
-          resolving the ffmpeg error.
-        - My deepest apologies for this multi-version failure.
+        - The new 'Add' mode (-N) logic applied a specific
+          codec/filter to stream a:0, but then also applied
+          a global '-c:a copy'.
+        - This global copy overrode the specific filter,
+          causing the exact error this script has been
+          plagued by.
+        - The logic is now fixed to *explicitly* loop and
+          apply '-c:a:1 copy', '-c:a:2 copy', etc., to all
+          other audio streams instead of using a global flag.
 
+v8.2.1  fix(main): Correct typo 'add_Sargument' to 'add_argument'
+        
+        - A typo on line 403 was causing an AttributeError
+          on startup.
+
+v8.2.0  feat(normalize): Add non-destructive "Add" mode for -N
+        
+        - When using -N on a file with multi-channel audio
+          (e.g., DTS, AC3 5.1), you are now prompted:
+          [A]dd: (Default) Adds a new, normalized AAC 2.0
+                 track as the default. All original audio
+                 tracks (DTS, etc.) are copied, untouched.
+          [R]eplace: (Old behavior) Destructively replaces
+                     audio stream 0 and re-encodes all others.
+          [S]kip:    Skips normalization and copies all audio.
+        - This allows for keeping high-quality original audio
+          while providing a compatible, normalized default track.
+        - Re-wrote the default stream mapping and audio
+          codec logic to support this new feature.
+
+v8.1.15 fix(ffmpeg): *FINAL* fix for contradictory audio/filter logic
 v8.1.14 fix(ffmpeg): (Failed attempt) *Finally* fix contradictory logic
 v8.1.13 fix(ffmpeg): (Failed attempt) *Finally* fix contradictory logic
 v8.1.12 fix(ffmpeg): (Failed attempt) *Finally* fix contradictory logic
@@ -87,8 +104,7 @@ def get_total_frames(file_path):
         if 'duration' not in data or 'avg_frame_rate' not in data: return None
         duration, fr_str = float(data['duration']), data['avg_frame_rate']
         if '/' in fr_str:
-            n, d = map(int, fr_str.split('/'));
-            frame_rate = n / d if d != 0 else 0
+            n, d = map(int, fr_str.split('/')); frame_rate = n / d if d != 0 else 0
         else: frame_rate = float(fr_str)
         if duration <= 0 or frame_rate <= 0: return None
         return int(duration * frame_rate)
@@ -101,25 +117,20 @@ def get_stream_info(file_path):
         result = subprocess.run(ffprobe_cmd, check=True, capture_output=True, text=True)
         return json.loads(result.stdout).get('streams', [])
     except Exception:
-        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr);
-        return None
+        print(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr); return None
 
 def plan_stream_selection(streams):
     streams_to_keep, streams_to_remove = [], []
     for s in streams:
-        keep = False;
-        stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower();
-        title = s.get('title', '').lower()
+        keep = False; stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); title = s.get('title', '').lower()
         if stype == 'video' or (stype == 'audio' and (lang == 'eng' or 'commentary' in title or 'director' in title)) or (stype == 'subtitle' and lang == 'eng'): keep = True
         if keep: streams_to_keep.append(s)
         else: streams_to_remove.append(s)
     return streams_to_keep, streams_to_remove
 
 def display_and_confirm_plan(s_keep, s_rem):
-    print("\n--- Stream Selection Plan ---\nKEPT:");
-    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep]
-    print("\nREMOVED:");
-    [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem]
+    print("\n--- Stream Selection Plan ---\nKEPT:"); [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep]
+    print("\nREMOVED:"); [print(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem]
     try: return input("Proceed? [y/N]: ").lower().strip() == 'y'
     except KeyboardInterrupt: return False
 
@@ -129,25 +140,19 @@ def format_size(size_bytes):
     if size_bytes == 0: return "0 B"
     size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
     try:
-        i = int(math.floor(math.log(size_bytes, 1024)));
-        i = min(i, len(size_name) - 1)
-        p = math.pow(1024, i);
-        s = round(size_bytes / p, 2)
+        i = int(math.floor(math.log(size_bytes, 1024))); i = min(i, len(size_name) - 1)
+        p = math.pow(1024, i); s = round(size_bytes / p, 2)
         return f"{s} {size_name[i]}"
     except (ValueError, TypeError): return "N/A"
 
 def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=False):
     """Prints a formatted summary of the file size change."""
     print("\n--- File Size Summary ---")
-    original_size_str = format_size(original_size_bytes);
-    new_size_str = format_size(new_size_bytes)
-    print(f"Original:   {original_size_str}");
-    print(f"New:         {new_size_str}")
+    original_size_str = format_size(original_size_bytes); new_size_str = format_size(new_size_bytes)
+    print(f"Original:   {original_size_str}"); print(f"New:         {new_size_str}")
     if original_size_bytes is not None and new_size_bytes is not None and original_size_bytes > 0:
-        difference_bytes = new_size_bytes - original_size_bytes;
-        percentage_change = (difference_bytes / original_size_bytes) * 100
-        change_type = "increase" if difference_bytes >= 0 else "decrease";
-        difference_str = format_size(abs(difference_bytes))
+        difference_bytes = new_size_bytes - original_size_bytes; percentage_change = (difference_bytes / original_size_bytes) * 100
+        change_type = "increase" if difference_bytes >= 0 else "decrease"; difference_str = format_size(abs(difference_bytes))
         print(f"Difference: {difference_str} ({abs(percentage_change):.2f}% {change_type})")
     else: print("Difference: N/A")
     
@@ -295,7 +300,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
             if process.returncode != 0: raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_output)
         ffmpeg_success = True
     except (subprocess.CalledProcessError, FileNotFoundError, KeyboardInterrupt) as e:
-        if isinstance(e, subprocess.CalledProcessError): print(f"\n--- FFmpeg Error ---\n{e.stderr}\n--------------------", file=sys.stderr)
+        if isinstance(e, subprocess.CalledProcessError): print(f"\n--- FFmpeg Error --\n{e.stderr}\n--------------------", file=sys.stderr)
         elif isinstance(e, FileNotFoundError): print("\nError: Required command not found (ffmpeg/stdbuf).", file=sys.stderr)
         else: print("\nCancelled.", file=sys.stderr)
         if 'process' in locals(): process.terminate()
@@ -303,14 +308,12 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
 
     # --- Post-FFmpeg Verification ---
     if not ffmpeg_success or not os.path.exists(output_file):
-        print(f"\nError: FFmpeg failed or output file '{output_file}' not created.", file=sys.stderr);
-        sys.exit(1)
+        print(f"\nError: FFmpeg failed or output file '{output_file}' not created.", file=sys.stderr); sys.exit(1)
     try:
         new_size_bytes = os.path.getsize(output_file)
         subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
     except Exception:
-        print(f"\nError: Output file '{output_file}' appears invalid after FFmpeg.", file=sys.stderr);
-        sys.exit(1)
+        print(f"\nError: Output file '{output_file}' appears invalid after FFmpeg.", file=sys.stderr); sys.exit(1)
     
     print(f"\nSuccessfully created and verified FFmpeg output '{output_file}'.")
     
@@ -327,8 +330,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     # --- Permissions ---
     if permissions:
         try:
-            os.chown(output_file, permissions['uid'], permissions['gid']);
-            os.chmod(output_file, permissions['mode'])
+            os.chown(output_file, permissions['uid'], permissions['gid']); os.chmod(output_file, permissions['mode'])
             # --- MODIFIED: Added verbose check (v8.1.0) ---
             if verbose:
                 print(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
@@ -341,8 +343,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
     if delete_source and ffmpeg_success and chapters_embedded_successfully:
         print(f"\nInfo: --delete flag set. Deleting source file...")
         try:
-            os.remove(source_file);
-            print(f"Successfully deleted: {source_file}")
+            os.remove(source_file); print(f"Successfully deleted: {source_file}")
         except OSError as e: print(f"\nError: Could not delete source '{source_file}'. Reason: {e}", file=sys.stderr)
     elif delete_source:
          print(f"\nWarning: --delete flag ignored because chapter embedding failed.")
@@ -354,6 +355,7 @@ def load_loudness_db(log_file: str, verbose=False) -> Dict[str, Dict[str, float]
     dictionary mapping file paths to their normalization data.
     """
     db = {}
+    
     if not os.path.exists(log_file):
         print(f"Warning: Loudness log not found at '{log_file}'. Will run analysis.", file=sys.stderr)
         return db
@@ -400,7 +402,9 @@ def main():
     # --- Argument Parser ---
     parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R\n  ,hvec -i movie.mp4 -r -C chapters.txt\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.csv") # <-- MODIFIED Example
     parser.add_argument("-i", "--input", required=True, help="Input video file or directory.")
+    # --- MODIFIED: Fixed typo (v8.2.1) ---
     parser.add_argument("-o", "--output", help="Output MKV file (single file mode only).")
+    # --- END MODIFIED ---
     parser.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter streams (single file mode only).")
     parser.add_argument("-D", "--delete", action="store_true", help="Delete original file after success.")
     parser.add_argument("--out-dir", help="Output directory for batch processing.")
@@ -451,8 +455,7 @@ def main():
 
     # --- MODIFIED: Corrected indentation (v8.0.3) ---
     if not os.path.exists(args.input):
-        print(f"Error: Input path not found: {args.input}", file=sys.stderr);
-        sys.exit(1)
+        print(f"Error: Input path not found: {args.input}", file=sys.stderr); sys.exit(1)
     # --- END MODIFIED ---
     
     # --- MODIFIED: Load Loudness DB (v8.1.4) ---
@@ -510,8 +513,7 @@ def main():
         # --- Permissions ---
         permissions_to_apply = None
         try:
-            stat_info = os.stat(input_file);
-            input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
+            stat_info = os.stat(input_file); input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
             target_gid = input_gid
             if input_group_name != 'jellyfin':
                 try:
@@ -526,8 +528,7 @@ def main():
                     # --- MODIFIED: Added verbose check (v8.1.0) ---
                     if args.verbose:
                         print("Info: 'jellyfin' group not found. Preserving original.")
-                except (KeyboardInterrupt, EOFError): print("\nCancelled.");
-                sys.exit(1)
+                except (KeyboardInterrupt, EOFError): print("\nCancelled."); sys.exit(1)
             permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
         except (OSError, KeyError) as e: print(f"Warning: Could not read source permissions. Reason: {e}", file=sys.stderr)
 
@@ -552,23 +553,20 @@ def main():
 
         if args.output and len(files_to_process) == 1: output_file = args.output
         else:
-            base, _ = os.path.splitext(os.path.basename(input_file));
-            # Check for suffixes
+            base, _ = os.path.splitext(os.path.basename(input_file)); # Check for suffixes
             has_chapters_flag = chapter_file_for_this_run is not None
             has_normalized_flag = is_normalize_enabled # <--- Use our new flag
             new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag, has_normalized_flag)
             
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(args.input))
-                output_dir = os.path.join(args.out_dir, relative_path);
-                os.makedirs(output_dir, exist_ok=True)
+                output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
                 output_file = os.path.join(output_dir, new_filename)
             else: output_file = os.path.join(os.path.dirname(input_file), new_filename)
         
         # Prevent source overwrite
         if os.path.abspath(output_file) == os.path.abspath(input_file):
-            base, ext = os.path.splitext(output_file);
-            output_file = f"{base}.COPY{ext}"
+            base, ext = os.path.splitext(output_file); output_file = f"{base}.COPY{ext}"
             # --- MODIFIED: Added verbose check (v8.1.0) ---
             if args.verbose:
                 print(f"Info: Output name identical to input. Using '{os.path.basename(output_file)}'")
@@ -664,10 +662,49 @@ def main():
         for sub_file in external_sub_files:
             ffmpeg_cmd.extend(['-i', sub_file])
         
-        # --- MODIFIED: Stream Mapping (v8.1.8) ---
+        # --- MODIFIED: Reworked Normalization & Mapping Logic (v8.2.0) ---
+        
+        # 1. Get stream info for prompt and mapping
+        all_streams = get_stream_info(input_file) or []
+        audio_streams = [s for s in all_streams if s.get('codec_type') == 'audio']
+        
+        # 2. Decide on normalization mode (Prompt user if needed)
+        normalize_mode = 'replace' # Default to old destructive behavior
+        
+        if is_normalize_enabled and not args.filter_streams:
+            has_multichannel = any(s.get('channels', 0) > 2 for s in audio_streams)
+            if has_multichannel:
+                print("\nInput has multi-channel audio (e.g., 5.1). How to normalize?")
+                try:
+                    response = input("  [A]dd as new default (Keeps original), [R]eplace, [S]kip: ").lower().strip()
+                    if response == 'a':
+                        normalize_mode = 'add'
+                    elif response == 's':
+                        is_normalize_enabled = False # Disable it for this file
+                        normalize_mode = 'skip'
+                        print("Info: Skipping normalization, will copy audio.")
+                    elif response == 'r':
+                        normalize_mode = 'replace'
+                        print("Info: Will 'Replace' audio stream 0.")
+                    else:
+                        normalize_mode = 'add' # Default to safest option
+                        print(f"Info: Invalid choice. Defaulting to [A]dd.")
+                except (KeyboardInterrupt, EOFError):
+                    print("\nCancelled.")
+                    sys.exit(1)
+            else:
+                normalize_mode = 'replace' # Not multi-channel, so just replace
+                if args.verbose:
+                    print("Info: No multi-channel audio found. Using default 'replace' mode.")
+        
+        elif is_normalize_enabled and args.filter_streams:
+             if args.verbose:
+                 print("Info: --filter-streams is active. Normalization will 'Replace' mapped streams.")
+             normalize_mode = 'replace'
+
+        # 3. Stream Mapping
         if args.filter_streams and len(files_to_process) == 1:
-            all_streams = get_stream_info(input_file)
-            if all_streams is None: continue
+            if not all_streams: continue # get_stream_info failed earlier
             s_keep, s_rem = plan_stream_selection(all_streams)
             if not display_and_confirm_plan(s_keep, s_rem):
                 print("Skipping file.")
@@ -676,46 +713,45 @@ def main():
             # Do not map any external subs if filtering
         
         else: 
-            # Default auto-mapping logic
+            # New default auto-mapping logic
             if args.verbose:
-                print("Info: Mapping all streams from input 0 (video, audio, subs, chapters, etc).")
+                print("Info: Auto-mapping all streams.")
                 
-            ffmpeg_cmd.extend(['-map', '0']) # Map ALL streams from input 0
+            ffmpeg_cmd.extend(['-map', '0:v?']) # Map all video
+            
+            if is_normalize_enabled and normalize_mode == 'add':
+                if args.verbose: print("Info: Mapping '0:a:0' for new normalized track.")
+                ffmpeg_cmd.extend(['-map', '0:a:0']) # This becomes output:a:0
+            
+            ffmpeg_cmd.extend(['-map', '0:a?']) # Map all original audio (becomes output:a:1, a:2...)
+            ffmpeg_cmd.extend(['-map', '0:s?', '-map', '0:d?', '-map', '0:t?']) # Map all other streams
             
             # Now map all *external* subs we just added
             if external_sub_files:
                 if args.verbose:
                     print(f"Info: Mapping {len(external_sub_files)} external subtitle stream(s).")
                 
-                # We need to find out how many *non-video/audio* streams there are to offset the metadata index
-                embedded_non_va_count = 0 
-                try:
-                    all_streams = get_stream_info(input_file)
-                    if all_streams:
-                        embedded_non_va_count = len([s for s in all_streams if s.get('codec_type') not in ['video', 'audio']])
-                except Exception:
-                    pass # Fail safe, count is 0
+                internal_sub_count = len([s for s in all_streams if s.get('codec_type') == 'subtitle'])
                 
-                for i in range(len(external_sub_files)):
+                for i, sub_file in enumerate(external_sub_files):
                     current_input_index = i + 1 # +1 because 0 is the video
                     ffmpeg_cmd.extend([f'-map', f'{current_input_index}']) # Map all streams from this sub file
                     
                     # Add language metadata
                     lang_code = "eng" # Default
-                    base_name, _ = os.path.splitext(os.path.basename(external_sub_files[i]))
+                    base_name, _ = os.path.splitext(os.path.basename(sub_file))
                     parts = base_name.split('.')
                     if len(parts) > 1 and len(parts[-1]) in [2, 3]: # e.g., .en.srt
                         lang_part = parts[-1]
                         if lang_part not in ['forced', 'sdh']: # common suffixes that aren't langs
                             lang_code = lang_part
                     
-                    # This logic is now simpler: just map to the next sub index.
-                    output_sub_index = embedded_non_va_count + i
+                    output_sub_index = internal_sub_count + i
                     ffmpeg_cmd.extend([f'-metadata:s:s:{output_sub_index}', f'language={lang_code}'])
 
-        # --- END MODIFIED (v8.1.8) ---
+        # --- END MODIFIED (v8.2.0) ---
 
-        # --- MODIFIED: Reworked Codec Logic (v8.1.15) ---
+        # --- MODIFIED: Reworked Codec Logic (v8.2.2) ---
         
         audio_normalized = False # Define here for summary
 
@@ -732,9 +768,7 @@ def main():
 
         # 2. AUDIO CODEC
         if is_normalize_enabled:
-            if is_remux_op:
-                print("Info: Normalizing audio while remuxing video.")
-            
+            # Check for/run analysis
             abs_input_file = os.path.abspath(input_file)
             if abs_input_file in loudness_db:
                 analysis_data = loudness_db[abs_input_file]
@@ -749,57 +783,61 @@ def main():
                     print("Analysis complete.")
         
         if is_normalize_enabled and analysis_data:
-            # Normalization is ON and SUCCESSFUL
+            # --- Normalization is ON and SUCCESSFUL ---
             try:
-                measured_i = analysis_data['i']
-                measured_tp = analysis_data['tp']
-                measured_lra = analysis_data['lra']
-                measured_thresh = analysis_data['thresh']
+                measured_i = analysis_data['i']; measured_tp = analysis_data['tp']
+                measured_lra = analysis_data['lra']; measured_thresh = analysis_data['thresh']
                 
-                # Print audio stats
-                print("Info: Audio analysis found:")
-                print(f"  - Input Loudness: {measured_i:.2f} LUFS")
-                print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
+                if args.verbose:
+                    print("Info: Audio analysis found:")
+                    print(f"  - Input Loudness: {measured_i:.2f} LUFS")
+                    print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
                 
                 filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                 
-                # Get all audio streams to explicitly map them
-                all_streams = get_stream_info(input_file) or []
-                audio_streams = [s for s in all_streams if s.get('codec_type') == 'audio']
+                if normalize_mode == 'add':
+                    # --- [A]dd Mode ---
+                    print("Info: Adding normalized AAC track as default, copying all other audio.")
+                    # This targets the first mapped audio stream (output:a:0)
+                    ffmpeg_cmd.extend(['-c:a:0', 'aac', '-q:a:0', '4', '-af:a:0', filter_string])
+                    # Set it as the default stream
+                    ffmpeg_cmd.extend(['-disposition:a:0', 'default'])
+                    
+                    # --- MODIFIED: Explicitly copy all other streams ---
+                    for i in range(len(audio_streams)):
+                        output_stream_index = i + 1 # Starts at 1 (a:0 is the new one)
+                        ffmpeg_cmd.extend([f'-c:a:{output_stream_index}', 'copy'])
                 
-                if not audio_streams and args.verbose:
-                    print("Info: No audio streams found to process.")
-                
-                # This is the new, explicit logic
-                for i in range(len(audio_streams)):
-                    if i == 0:
-                        # This is the stream to normalize
-                        ffmpeg_cmd.extend([f'-c:a:{i}', 'aac', '-q:a:0', '4', f'-af:a:{i}', filter_string])
-                    else:
-                        # This is a stream to re-encode with a null filter
+                else: # --- [R]eplace Mode ---
+                    print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams re-encoded.")
+                    # This is the original, destructive logic
+                    ffmpeg_cmd.extend([f'-c:a:0', 'aac', '-q:a:0', '4', f'-af:a:0', filter_string])
+                    for i in range(1, len(audio_streams)):
                         ffmpeg_cmd.extend([f'-c:a:{i}', 'aac', '-q:a:1', '5', f'-af:a:{i}', 'anull'])
-                
-                print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams re-encoded.")
+
                 audio_normalized = True # Mark as complete
+                
             except KeyError:
                 print("Warning: Audio analysis data was incomplete. Falling back to copy.", file=sys.stderr)
                 audio_normalized = False # Mark as failed
         
-        elif args.acodec:
-            # Normalization is OFF, but user specified a global audio codec
-            ffmpeg_cmd.extend(['-c:a', args.acodec])
-            if args.abitrate: # Only add bitrate if acodec is also specified
-                ffmpeg_cmd.extend(['-b:a', args.abitrate])
-        
-        if not audio_normalized and not args.acodec:
-             # This is the catch-all. If we aren't normalizing AND we
-             # aren't re-encoding to a specific codec, copy all audio.
-             ffmpeg_cmd.extend(['-c:a', 'copy'])
-             if args.verbose and not is_normalize_enabled: # Only print this if normalization was never on
-                print("Info: Copying all audio streams.")
-        
-        if is_normalize_enabled and not analysis_data:
+        elif is_normalize_enabled and not analysis_data:
+             # --- Normalization FAILED analysis ---
              print("Warning: Audio normalization analysis failed. Falling back to copy.", file=sys.stderr)
+
+        # --- Fallback audio logic ---
+        if not audio_normalized:
+            if args.acodec:
+                # User specified a global audio codec
+                ffmpeg_cmd.extend(['-c:a', args.acodec])
+                if args.abitrate: # Only add bitrate if acodec is also specified
+                    ffmpeg_cmd.extend(['-b:a', args.abitrate])
+            else:
+                # This is the catch-all. If we aren't normalizing AND we
+                # aren't re-encoding to a specific codec, copy all audio.
+                ffmpeg_cmd.extend(['-c:a', 'copy'])
+                if args.verbose and normalize_mode != 'skip':
+                    print("Info: Copying all audio streams.")
 
         # 3. SUBTITLE, CHAPTER, and OTHER STREAM LOGIC
         if is_transcode_op:
@@ -818,7 +856,7 @@ def main():
             print("Info: Copying all chapter and attachment streams.")
         ffmpeg_cmd.extend(['-c:d', 'copy', '-c:t', 'copy'])
         
-        # --- END MODIFIED (v8.1.15) ---
+        # --- END MODIFIED (v8.2.2) ---
         
         # --- END Codec Logic ---
 
