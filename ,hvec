@@ -16,11 +16,32 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.2.5"
+__version__ = "8.2.7"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.2.7  fix(ffmpeg): Remove explicit chapter map
+        
+        - The previous fix added '-map 0:c?' to copy
+          chapters.
+        - This fails on files where chapters are container
+          metadata (e.g., 'Menu' in 'mediainfo') and
+          not a dedicated stream.
+        - This was causing an 'Invalid argument' error.
+        - Removed the explicit '-map 0:c?' and '-c:c copy'.
+        - FFmpeg auto-copies chapters by default when
+          transcoding from MKV to MKV.
+
+v8.2.6  fix(ffmpeg): Add missing chapter mapping and codec
+        
+        - The auto-mapping logic was missing '-map 0:c?'
+          (map all chapters).
+        - The codec logic was missing '-c:c copy'
+          (copy all chapters).
+        - This was causing chapters to be dropped during
+          transcodes. Both flags have been added.
+
 v8.2.5  fix(ffmpeg): *Always* copy subtitle streams
         
         - A bug in the transcode logic was forcing subtitle
@@ -37,11 +58,6 @@ v8.2.4  fix(ffmpeg): *FINAL* explicit copy for -filter_complex
         
         - This is the final fix for the "Filter/Copy"
           conflict in "Add" mode.
-        - The previous version (8.2.3) correctly used
-          -filter_complex but re-introduced a global
-          '-c:a copy' flag.
-        - This global flag conflicted with the input stream
-          [0:a:0] which was being used in the filter.
         - The logic now combines both fixes:
           1. Uses '-filter_complex ... [a_norm]'
           2. Maps '[a_norm]' to 'a:0'
@@ -180,7 +196,7 @@ def run_loudnorm_analysis(input_file: str) -> Dict[str, float] or None:
     
     try:
         # The ebur128 filter writes all its output to stderr.
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=1200)
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', timeout=1200)
         
         stderr_output = result.stderr
         
@@ -647,7 +663,7 @@ def main():
         for sub_file in external_sub_files:
             ffmpeg_cmd.extend(['-i', sub_file])
         
-        # --- MODIFIED: Reworked Normalization & Mapping Logic (v8.2.4) ---
+        # --- MODIFIED: Reworked Normalization & Mapping Logic (v8.2.7) ---
         
         # 1. Get stream info for prompt and mapping
         all_streams = get_stream_info(input_file) or []
@@ -740,6 +756,7 @@ def main():
                 ffmpeg_cmd.extend(['-map', '[a_norm]']) # This becomes output:a:0
             
             ffmpeg_cmd.extend(['-map', '0:a?']) # Map all original audio
+            # --- MODIFIED: Removed chapters (v8.2.7) ---
             ffmpeg_cmd.extend(['-map', '0:s?', '-map', '0:d?', '-map', '0:t?']) # Map all other streams
             
             # Now map all *external* subs we just added
@@ -765,9 +782,9 @@ def main():
                     output_sub_index = internal_sub_count + i
                     ffmpeg_cmd.extend([f'-metadata:s:s:{output_sub_index}', f'language={lang_code}'])
 
-        # --- END MODIFIED (v8.2.4) ---
+        # --- END MODIFIED (v8.2.7) ---
 
-        # --- MODIFIED: Reworked Codec Logic (v8.2.5) ---
+        # --- MODIFIED: Reworked Codec Logic (v8.2.7) ---
         
         audio_normalized = False # Define here for summary
 
@@ -834,18 +851,18 @@ def main():
 
         # 3. SUBTITLE, CHAPTER, and OTHER STREAM LOGIC
         
-        # --- MODIFIED: Always copy subtitles for MKV output ---
+        # --- MODIFIED: Always copy subtitles for MKV output (v8.2.5) ---
         # This handles both bitmap (PGS) and text (SRT, ASS)
         if args.verbose:
             print("Info: Copying all subtitle streams (text and bitmap).")
         ffmpeg_cmd.extend(['-c:s', 'copy'])
         
-        # Always copy chapters and attachments
+        # --- MODIFIED: Removed explicit chapter copy (v8.2.7) ---
         if args.verbose:
-            print("Info: Copying all chapter and attachment streams.")
+            print("Info: Copying all attachment streams (chapters auto-copy).")
         ffmpeg_cmd.extend(['-c:d', 'copy', '-c:t', 'copy'])
         
-        # --- END MODIFIED (v8.2.5) ---
+        # --- END MODIFIED (v8.2.7) ---
         
         # --- END Codec Logic ---
 
