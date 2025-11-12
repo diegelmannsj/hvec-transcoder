@@ -16,11 +16,23 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.2.9"
+__version__ = "8.2.10"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.2.10 feat(normalize): Always show loudness data when -N is used
+        
+        - When -N is used, the script now centralizes the
+          audio analysis logic.
+        - If a match is found in the loudness log, it now
+          *always* prints the pre-analyzed stats
+          (Input Loudness, True Peak, and filter settings)
+          instead of only in verbose mode.
+        - If a live scan is run, it will print the stats
+          it found.
+        - This makes the -N flag much more informative.
+
 v8.2.9  feat(main): Add confirm prompt for -m/--mediainfo
         
         - If ,hvec is run with *only* -i and -m,
@@ -33,24 +45,7 @@ v8.2.9  feat(main): Add confirm prompt for -m/--mediainfo
           continues processing without a prompt, as before.
 
 v8.2.8  feat(main): Add -m/--mediainfo flag
-        
-        - Adds a new flag to show the 'mediainfo' output
-          of the input file before any processing begins.
-        - This only runs in single-file mode and checks
-          if 'mediainfo' is installed first.
-
 v8.2.7  fix(ffmpeg): Remove explicit chapter map
-        
-        - The previous fix added '-map 0:c?' to copy
-          chapters.
-        - This fails on files where chapters are container
-          metadata (e.g., 'Menu' in 'mediainfo') and
-          not a dedicated stream.
-        - This was causing an 'Invalid argument' error.
-        - Removed the explicit '-map 0:c?' and '-c:c copy'.
-        - FFmpeg auto-copies chapters by default when
-          transcoding from MKV to MKV.
-
 v8.2.6  fix(ffmpeg): Add missing chapter mapping and codec
 v8.2.5  fix(ffmpeg): *Always* copy subtitle streams
 v8.2.4  fix(ffmpeg): *FINAL* explicit copy for -filter_complex
@@ -705,7 +700,7 @@ def main():
         for sub_file in external_sub_files:
             ffmpeg_cmd.extend(['-i', sub_file])
         
-        # --- MODIFIED: Reworked Normalization & Mapping Logic (v8.2.7) ---
+        # --- MODIFIED: Reworked Normalization & Mapping Logic (v8.2.10) ---
         
         # 1. Get stream info for prompt and mapping
         all_streams = get_stream_info(input_file) or []
@@ -747,12 +742,15 @@ def main():
 
         # 3. Check for/run analysis (MUST be done before mapping)
         filter_string_for_complex = None
+        filter_string_for_simple = None
+        
         if is_normalize_enabled:
+            found_in_log = False
             abs_input_file = os.path.abspath(input_file)
             if abs_input_file in loudness_db:
                 analysis_data = loudness_db[abs_input_file]
-                if args.verbose:
-                    print("Info: Using pre-analyzed loudness data from log.")
+                print("Info: Found pre-analyzed data in loudness log.") # Always print
+                found_in_log = True
             else:
                 if isinstance(args.normalize, str) and args.verbose:
                     print(f"Info: File not found in log, running live analysis...")
@@ -760,21 +758,38 @@ def main():
                 analysis_data = run_loudnorm_analysis(input_file)
                 if analysis_data:
                     print("Analysis complete.")
-        
-            if analysis_data and normalize_mode == 'add':
+
+            if analysis_data:
                 try:
                     measured_i = analysis_data['i']; measured_tp = analysis_data['tp']
                     measured_lra = analysis_data['lra']; measured_thresh = analysis_data['thresh']
-                    filter_string_for_complex = f"[0:a:0]loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}[a_norm]"
-                    ffmpeg_cmd.extend(['-filter_complex', filter_string_for_complex])
+                    
+                    # Pre-generate both filter types
+                    filter_string_for_simple = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
+                    filter_string_for_complex = f"[0:a:0]{filter_string_for_simple}[a_norm]"
+
+                    # If we used the log, print the info user requested
+                    if found_in_log:
+                        print(f"  - Input Loudness: {measured_i:.2f} LUFS")
+                        print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
+                        print(f"  - Applying Filter: loudnorm=I=-23:LRA=7:tp=-2")
+                    else:
+                         # This info is from a live scan, print it anyway
+                        print("Info: Audio analysis found:")
+                        print(f"  - Input Loudness: {measured_i:.2f} LUFS")
+                        print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
+
                 except KeyError:
                     print("Warning: Audio analysis data was incomplete. Will copy.", file=sys.stderr)
                     analysis_data = None # Mark as failed
                     is_normalize_enabled = False
             
             if not analysis_data and is_normalize_enabled:
-                print("Warning: Audio normalization analysis failed. Falling back to copy.", file=sys.stderr)
-                is_normalize_enabled = False # Disable it for this file
+                 print("Warning: Audio normalization analysis failed. Falling back to copy.", file=sys.stderr)
+                 is_normalize_enabled = False # Disable it for this file
+        
+            if analysis_data and normalize_mode == 'add':
+                ffmpeg_cmd.extend(['-filter_complex', filter_string_for_complex])
 
         # 4. Stream Mapping
         if args.filter_streams and len(files_to_process) == 1:
@@ -824,9 +839,9 @@ def main():
                     output_sub_index = internal_sub_count + i
                     ffmpeg_cmd.extend([f'-metadata:s:s:{output_sub_index}', f'language={lang_code}'])
 
-        # --- END MODIFIED (v8.2.7) ---
+        # --- END MODIFIED (v8.2.10) ---
 
-        # --- MODIFIED: Reworked Codec Logic (v8.2.7) ---
+        # --- MODIFIED: Reworked Codec Logic (v8.2.10) ---
         
         audio_normalized = False # Define here for summary
 
@@ -860,21 +875,13 @@ def main():
             
             else: # --- [R]eplace Mode ---
                 print("Info: Audio stream 0 will be normalized (EBU R128). Other audio streams re-encoded.")
-                try:
-                    measured_i = analysis_data['i']; measured_tp = analysis_data['tp']
-                    measured_lra = analysis_data['lra']; measured_thresh = analysis_data['thresh']
-                    filter_string = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
-                    
-                    # This is the original, destructive logic
-                    # It applies to output:a:0 (from input:a:0)
-                    ffmpeg_cmd.extend([f'-c:a:0', 'aac', '-q:a:0', '4', f'-af:a:0', filter_string])
-                    # It applies to output:a:1, output:a:2...
-                    for i in range(1, len(audio_streams)):
-                        ffmpeg_cmd.extend([f'-c:a:{i}', 'aac', '-q:a:1', '5', f'-af:a:{i}', 'anull'])
-                    audio_normalized = True
-                except KeyError:
-                    print("Warning: Audio analysis data was incomplete. Falling back to copy.", file=sys.stderr)
-                    audio_normalized = False
+                # This is the original, destructive logic
+                # It applies to output:a:0 (from input:a:0)
+                ffmpeg_cmd.extend([f'-c:a:0', 'aac', '-q:a:0', '4', f'-af:a:0', filter_string_for_simple])
+                # It applies to output:a:1, output:a:2...
+                for i in range(1, len(audio_streams)):
+                    ffmpeg_cmd.extend([f'-c:a:{i}', 'aac', '-q:a:1', '5', f'-af:a:{i}', 'anull'])
+                audio_normalized = True
         
         # --- Fallback audio logic ---
         if not audio_normalized:
