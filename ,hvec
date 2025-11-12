@@ -16,11 +16,21 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.2.10"
+__version__ = "8.2.11"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.2.11 feat(normalize): Show loudness change (quieter/louder)
+        
+        - When -N is used, the script now calculates the
+          difference between the input loudness and the
+          -23.0 LUFS target.
+        - It prints a new "Action:" line that explicitly
+          states if the audio is being made "quieter" or
+          "louder" and by how many LUFS.
+          (e.g., "Action: Making audio 4.80 LUFS quieter.")
+
 v8.2.10 feat(normalize): Always show loudness data when -N is used
         
         - When -N is used, the script now centralizes the
@@ -34,16 +44,6 @@ v8.2.10 feat(normalize): Always show loudness data when -N is used
         - This makes the -N flag much more informative.
 
 v8.2.9  feat(main): Add confirm prompt for -m/--mediainfo
-        
-        - If ,hvec is run with *only* -i and -m,
-          it will now display the mediainfo and then
-          prompt the user "Continue with default transcode? [y/N]:"
-        - If 'y' is pressed, it proceeds.
-        - If 'n' or anything else is pressed, it aborts.
-        - If any other flags (-N, -r, etc.) are used
-          alongside -m, it prints the mediainfo and
-          continues processing without a prompt, as before.
-
 v8.2.8  feat(main): Add -m/--mediainfo flag
 v8.2.7  fix(ffmpeg): Remove explicit chapter map
 v8.2.6  fix(ffmpeg): Add missing chapter mapping and codec
@@ -68,6 +68,11 @@ DEFAULT_LOG_BASENAME = 'audit_loudness.csv'
 DEFAULT_LOG_DIR = os.path.expanduser('~/.hvec')
 DEFAULT_LOG_PATH = os.path.join(DEFAULT_LOG_DIR, DEFAULT_LOG_BASENAME)
 CWD_LOG_PATH = os.path.abspath(DEFAULT_LOG_BASENAME)
+
+# --- MODIFIED: Added target (v8.2.11) ---
+TARGET_LOUDNESS = -23.0
+TARGET_TRUE_PEAK = -2.0
+TARGET_LRA = 7
 
 # --- Helper Functions ---
 def get_total_frames(file_path):
@@ -140,7 +145,7 @@ def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=Fal
     else: print("Difference: N/A")
     
     if audio_normalized:
-        print("Audio:      Normalized (EBU R128)")
+        print(f"Audio:      Normalized (EBU R128 {TARGET_LOUDNESS} LUFS)")
     
     print("-------------------------")
 
@@ -403,8 +408,8 @@ def main():
         nargs='?', 
         const=True, 
         default=None, 
-        help="Normalize audio to EBU R128 (-23 LUFS).\n"
-             "Optionally provide a path to a loudness_audit.csv file \n" # <-- MODIFIED Example
+        help=f"Normalize audio to EBU R128 ({TARGET_LOUDNESS} LUFS).\n" # <-- MODIFIED (v8.2.11)
+             "Optionally provide a path to a loudness_audit.csv file \n" 
              "to skip analysis and use pre-scanned values."
     )
     # --- END MODIFIED ---
@@ -700,7 +705,7 @@ def main():
         for sub_file in external_sub_files:
             ffmpeg_cmd.extend(['-i', sub_file])
         
-        # --- MODIFIED: Reworked Normalization & Mapping Logic (v8.2.10) ---
+        # --- MODIFIED: Reworked Normalization & Mapping Logic (v8.2.11) ---
         
         # 1. Get stream info for prompt and mapping
         all_streams = get_stream_info(input_file) or []
@@ -764,20 +769,25 @@ def main():
                     measured_i = analysis_data['i']; measured_tp = analysis_data['tp']
                     measured_lra = analysis_data['lra']; measured_thresh = analysis_data['thresh']
                     
+                    # --- MODIFIED: Added (v8.2.11) ---
+                    difference = measured_i - TARGET_LOUDNESS
+                    
                     # Pre-generate both filter types
-                    filter_string_for_simple = f"loudnorm=I=-23:LRA=7:tp=-2:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
+                    filter_string_for_simple = f"loudnorm=I={TARGET_LOUDNESS}:LRA={TARGET_LRA}:tp={TARGET_TRUE_PEAK}:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                     filter_string_for_complex = f"[0:a:0]{filter_string_for_simple}[a_norm]"
 
-                    # If we used the log, print the info user requested
-                    if found_in_log:
-                        print(f"  - Input Loudness: {measured_i:.2f} LUFS")
-                        print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
-                        print(f"  - Applying Filter: loudnorm=I=-23:LRA=7:tp=-2")
+                    # Print analysis data
+                    print(f"  - Input Loudness: {measured_i:.2f} LUFS")
+                    print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
+                    
+                    # --- MODIFIED: New Action printout (v8.2.11) ---
+                    if abs(difference) < 0.1: # Consider it no change if within 0.1 LUFS
+                        print(f"  - Action: No change needed (already at {TARGET_LOUDNESS} LUFS target).")
+                    elif difference > 0:
+                        print(f"  - Action: Making audio {difference:.2f} LUFS **quieter**.")
                     else:
-                         # This info is from a live scan, print it anyway
-                        print("Info: Audio analysis found:")
-                        print(f"  - Input Loudness: {measured_i:.2f} LUFS")
-                        print(f"  - Input True Peak: {measured_tp:.2f} dBTP")
+                        print(f"  - Action: Making audio {abs(difference):.2f} LUFS **louder**.")
+                    # --- END MODIFIED ---
 
                 except KeyError:
                     print("Warning: Audio analysis data was incomplete. Will copy.", file=sys.stderr)
@@ -839,9 +849,9 @@ def main():
                     output_sub_index = internal_sub_count + i
                     ffmpeg_cmd.extend([f'-metadata:s:s:{output_sub_index}', f'language={lang_code}'])
 
-        # --- END MODIFIED (v8.2.10) ---
+        # --- END MODIFIED (v8.2.11) ---
 
-        # --- MODIFIED: Reworked Codec Logic (v8.2.10) ---
+        # --- MODIFIED: Reworked Codec Logic (v8.2.11) ---
         
         audio_normalized = False # Define here for summary
 
