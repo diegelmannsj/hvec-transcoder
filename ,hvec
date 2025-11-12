@@ -16,11 +16,22 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.2.8"
+__version__ = "8.2.9"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.2.9  feat(main): Add confirm prompt for -m/--mediainfo
+        
+        - If ,hvec is run with *only* -i and -m,
+          it will now display the mediainfo and then
+          prompt the user "Continue with default transcode? [y/N]:"
+        - If 'y' is pressed, it proceeds.
+        - If 'n' or anything else is pressed, it aborts.
+        - If any other flags (-N, -r, etc.) are used
+          alongside -m, it prints the mediainfo and
+          continues processing without a prompt, as before.
+
 v8.2.8  feat(main): Add -m/--mediainfo flag
         
         - Adds a new flag to show the 'mediainfo' output
@@ -41,39 +52,8 @@ v8.2.7  fix(ffmpeg): Remove explicit chapter map
           transcoding from MKV to MKV.
 
 v8.2.6  fix(ffmpeg): Add missing chapter mapping and codec
-        
-        - The auto-mapping logic was missing '-map 0:c?'
-          (map all chapters).
-        - The codec logic was missing '-c:c copy'
-          (copy all chapters).
-        - This was causing chapters to be dropped during
-          transcodes. Both flags have been added.
-
 v8.2.5  fix(ffmpeg): *Always* copy subtitle streams
-        
-        - A bug in the transcode logic was forcing subtitle
-          conversion with '-c:s srt'.
-        - This failed on bitmap (image) subtitles like
-          PGS or VobSub, which cannot be converted to
-          text-based SRT.
-        - The logic is now fixed to *always* use
-          '-c:s copy' for both transcode and remux
-          operations, as MKV containers can store all
-          subtitle types.
-
 v8.2.4  fix(ffmpeg): *FINAL* explicit copy for -filter_complex
-        
-        - This is the final fix for the "Filter/Copy"
-          conflict in "Add" mode.
-        - The logic now combines both fixes:
-          1. Uses '-filter_complex ... [a_norm]'
-          2. Maps '[a_norm]' to 'a:0'
-          3. Maps '0:a?' to 'a:1', 'a:2', etc.
-          4. Applies the 'aac' codec *only* to 'a:0'.
-          5. *Explicitly* loops and applies '-c:a:1 copy',
-             '-c:a:2 copy', etc. to all other streams.
-        - This finally resolves the conflict.
-
 v8.2.3  fix(ffmpeg): (Failed attempt) *FINAL* fix for "Filter/Copy"
         conflict using -filter_complex for "Add" mode.
 v8.2.2  fix(ffmpeg): (Failed attempt) *FINAL* fix for "Filtergraph
@@ -467,7 +447,33 @@ def main():
         print(f"Error: Input path not found: {args.input}", file=sys.stderr); sys.exit(1)
     # --- END MODIFIED ---
     
-    # --- MODIFIED: Show mediainfo if -m is used (v8.2.8) ---
+    # --- MODIFIED: Show mediainfo and prompt if -m is used (v8.2.9) ---
+    is_mediainfo_prompt_mode = False
+    if args.mediainfo:
+        # Check if all other *processing* flags are at their defaults
+        is_default = (
+            args.output is None and
+            not args.filter_streams and
+            not args.delete and
+            args.out_dir is None and
+            not args.recursive and
+            args.chapters is None and
+            args.subs is None and
+            not args.hvec and
+            args.normalize is None and
+            args.quality == 24 and
+            args.preset == 'medium' and
+            args.acodec is None and
+            args.abitrate is None and
+            not args.skip_hevc and
+            not args.dry_run and
+            not args.remux and
+            not args.quiet and
+            not args.verbose
+        )
+        if is_default:
+            is_mediainfo_prompt_mode = True
+
     if args.mediainfo:
         if not shutil.which('mediainfo'):
             print("Warning: 'mediainfo' command not found. Cannot display info.", file=sys.stderr)
@@ -481,6 +487,18 @@ def main():
             except Exception as e:
                 print(f"Error: Could not run mediainfo: {e}", file=sys.stderr)
             print("------------------------")
+
+        # If we are in the special prompt mode, show the prompt and exit if "n"
+        if is_mediainfo_prompt_mode:
+            try:
+                response = input("\nContinue with default transcode? [y/N]: ").lower().strip()
+                if response != 'y':
+                    print("Aborting.")
+                    sys.exit(0)
+                # If 'y', just continue on
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled.")
+                sys.exit(1)
     # --- END MODIFIED ---
     
     # --- MODIFIED: Load Loudness DB (v8.1.4) ---
