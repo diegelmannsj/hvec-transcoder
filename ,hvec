@@ -16,11 +16,23 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.2.12"
+__version__ = "8.2.13"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.2.13 feat(main): Add temp dir workflow for -S/--sync-filename
+        
+        - When -S is used, the script now writes to a temporary
+          directory (default: /storage/temp/) instead of directly
+          to the destination.
+        - Upon success, the temp file is moved to replace/overwrite
+          the target file.
+        - This allows for safe "in-place" replacements (e.g. 
+          movie.mkv -> movie.mkv) without triggering the 
+          safety .COPY renaming logic.
+        - Added --temp-dir flag to customize the temp location.
+
 v8.2.12 feat(main): Add -S/--sync-filename flag
         
         - Adds the ability to force the output filename to match
@@ -414,6 +426,10 @@ def main():
     # --- MODIFIED: Added -S/--sync-filename (v8.2.12) ---
     parser.add_argument("-S", "--sync-filename", action="store_true", help="Output filename will match input filename (extension changed to .mkv).")
     # --- END MODIFIED ---
+    
+    # --- MODIFIED: Added --temp-dir (v8.2.13) ---
+    parser.add_argument("--temp-dir", default="/storage/temp/", help="Temporary directory for operations using -S.")
+    # --- END MODIFIED ---
 
     # --- MODIFIED: -N now optionally takes a value (v7.8) ---
     parser.add_argument(
@@ -600,11 +616,6 @@ def main():
         is_transcode_op = not is_remux_op # <--- MODIFIED: Added for clarity (v8.1.8)
         
         def generate_output_filename(base, is_remux, has_chapters, is_normalized):
-            # --- MODIFIED: Added sync-filename check (v8.2.12) ---
-            if args.sync_filename:
-                return f"{base}.mkv"
-            # --- END MODIFIED ---
-
             sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.') # Cleaner regex
             suffix = ".REMUX" if is_remux else ".CONV"
             chapter_suffix = ".CHAPTERS" if has_chapters else ""
@@ -613,31 +624,58 @@ def main():
             base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
             return f"{base_no_suffix}{suffix}{norm_suffix}{chapter_suffix}.mkv"
 
-        if args.output and len(files_to_process) == 1: output_file = args.output
+        # --- MODIFIED: Reworked Output Logic for -S (v8.2.13) ---
+        
+        # 1. Determine FINAL destination
+        if args.output and len(files_to_process) == 1: 
+            final_output_file = args.output
+        elif args.sync_filename:
+            # -S active: Keep basename, force .mkv
+            base, _ = os.path.splitext(os.path.basename(input_file))
+            final_output_file = os.path.join(os.path.dirname(input_file), f"{base}.mkv")
         else:
-            base, _ = os.path.splitext(os.path.basename(input_file)); # Check for suffixes
+            # Standard: Generate new name with suffixes
+            base, _ = os.path.splitext(os.path.basename(input_file))
             has_chapters_flag = chapter_file_for_this_run is not None
-            has_normalized_flag = is_normalize_enabled # <--- Use our new flag
+            has_normalized_flag = is_normalize_enabled
             new_filename = generate_output_filename(base, is_remux_op, has_chapters_flag, has_normalized_flag)
             
             if args.out_dir:
                 relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(input_file))
                 output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
-                output_file = os.path.join(output_dir, new_filename)
-            else: output_file = os.path.join(os.path.dirname(input_file), new_filename)
-        
-        # Prevent source overwrite
-        if os.path.abspath(output_file) == os.path.abspath(input_file):
-            base, ext = os.path.splitext(output_file); output_file = f"{base}.COPY{ext}"
-            # --- MODIFIED: Added verbose check (v8.1.0) ---
-            if args.verbose:
-                print(f"Info: Output name identical to input. Using '{os.path.basename(output_file)}'")
-                    
-        # --- MODIFIED: Corrected indentation (v8.1.9) ---
-        # Overwrite check
-        if os.path.exists(output_file) and not args.dry_run:
+                final_output_file = os.path.join(output_dir, new_filename)
+            else: 
+                final_output_file = os.path.join(os.path.dirname(input_file), new_filename)
+
+        # 2. Determine WORKING output (Temp vs Direct)
+        if args.sync_filename:
+            # Use temp directory workflow
             try:
-                if input(f"Output '{os.path.basename(output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': 
+                os.makedirs(args.temp_dir, exist_ok=True)
+            except OSError as e:
+                print(f"Error: Could not create temp dir '{args.temp_dir}': {e}", file=sys.stderr)
+                sys.exit(1)
+            
+            working_basename = os.path.basename(final_output_file)
+            working_output_file = os.path.join(args.temp_dir, working_basename)
+            
+            if args.verbose:
+                print(f"Info: Using temp file '{working_output_file}' for processing.")
+        else:
+            # Direct output
+            working_output_file = final_output_file
+            
+            # Prevent source overwrite (Only needed if NOT using temp workflow)
+            if os.path.abspath(working_output_file) == os.path.abspath(input_file):
+                base, ext = os.path.splitext(working_output_file)
+                working_output_file = f"{base}.COPY{ext}"
+                if args.verbose:
+                    print(f"Info: Output name identical to input. Using '{os.path.basename(working_output_file)}'")
+
+        # 3. Overwrite Check (Skip if -S is active, as we assume replacement)
+        if not args.sync_filename and os.path.exists(working_output_file) and not args.dry_run:
+            try:
+                if input(f"Output '{os.path.basename(working_output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': 
                     print("Skipping.")
                     continue
             except KeyboardInterrupt:
@@ -944,13 +982,13 @@ def main():
         
         # --- END Codec Logic ---
 
-        ffmpeg_cmd.append(output_file) # Add output file path
+        ffmpeg_cmd.append(working_output_file) # Add output file path (WORKING path, i.e. temp if -S)
         
         # --- Execute ---
         if args.dry_run:
             print_ffmpeg_command(ffmpeg_cmd)
             if chapter_file_for_this_run:
-                 mkvpropedit_cmd = ['mkvpropedit', output_file, '--chapters', chapter_file_for_this_run]
+                 mkvpropedit_cmd = ['mkvpropedit', working_output_file, '--chapters', chapter_file_for_this_run]
                  print("\nMKVPropEdit command (Dry Run):")
                  print(' '.join(f'"{a}"' if ' ' in a else a for a in mkvpropedit_cmd))
         else:
@@ -964,6 +1002,16 @@ def main():
                 chapter_file_to_embed=chapter_file_for_this_run,
                 verbose=args.verbose # <-- MODIFIED: Pass verbose flag
             )
+            
+            # --- MODIFIED: Post-Processing Move for -S (v8.2.13) ---
+            if args.sync_filename and os.path.exists(working_output_file):
+                print(f"Info: Moving temp file to '{final_output_file}'...")
+                try:
+                    shutil.move(working_output_file, final_output_file)
+                    print(f"Successfully replaced/created '{os.path.basename(final_output_file)}'.")
+                except OSError as e:
+                    print(f"Error: Could not move temp file to final destination: {e}", file=sys.stderr)
+            # --- END MODIFIED ---
 
     print("\n--- All tasks complete. ---")
 
