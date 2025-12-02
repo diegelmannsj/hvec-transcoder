@@ -16,11 +16,20 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.2.11"
+__version__ = "8.2.12"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.2.12 feat(main): Add -S/--sync-filename flag
+        
+        - Adds the ability to force the output filename to match
+          the input filename (changing extension to .mkv).
+        - Bypasses default name sanitization and suffix generation
+          (.REMUX, .CONV, etc.).
+        - Useful for "in-place" replacement workflows (when used
+          with -D).
+
 v8.2.11 feat(normalize): Show loudness change (quieter/louder)
         
         - When -N is used, the script now calculates the
@@ -402,6 +411,10 @@ def main():
     # --- MODIFIED: Added -m/--mediainfo (v8.2.8) ---
     parser.add_argument("-m", "--mediainfo", action="store_true", help="Show mediainfo of the input file before processing (single file mode only).")
     
+    # --- MODIFIED: Added -S/--sync-filename (v8.2.12) ---
+    parser.add_argument("-S", "--sync-filename", action="store_true", help="Output filename will match input filename (extension changed to .mkv).")
+    # --- END MODIFIED ---
+
     # --- MODIFIED: -N now optionally takes a value (v7.8) ---
     parser.add_argument(
         "-N", "--normalize", 
@@ -469,7 +482,8 @@ def main():
             not args.dry_run and
             not args.remux and
             not args.quiet and
-            not args.verbose
+            not args.verbose and
+            not args.sync_filename # Added to check
         )
         if is_default:
             is_mediainfo_prompt_mode = True
@@ -586,6 +600,11 @@ def main():
         is_transcode_op = not is_remux_op # <--- MODIFIED: Added for clarity (v8.1.8)
         
         def generate_output_filename(base, is_remux, has_chapters, is_normalized):
+            # --- MODIFIED: Added sync-filename check (v8.2.12) ---
+            if args.sync_filename:
+                return f"{base}.mkv"
+            # --- END MODIFIED ---
+
             sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.') # Cleaner regex
             suffix = ".REMUX" if is_remux else ".CONV"
             chapter_suffix = ".CHAPTERS" if has_chapters else ""
