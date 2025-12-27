@@ -16,11 +16,17 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.2.14"
+__version__ = "8.2.15"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.2.15 feat(main): Show default temp dir in help
+
+        - Updated the --temp-dir help string to explicitly
+          display the current default value (e.g. /storage/temp/)
+          when running --help.
+
 v8.2.14 feat(main): Add .iso support
 
         - Added .iso to the list of accepted VIDEO_EXTENSIONS.
@@ -433,7 +439,7 @@ def main():
     # --- END MODIFIED ---
 
     # --- MODIFIED: Added --temp-dir (v8.2.13) ---
-    parser.add_argument("--temp-dir", default="/storage/temp/", help="Temporary directory for operations using -S.")
+    parser.add_argument("--temp-dir", default="/storage/temp/", help="Temporary directory for operations using -S. (default: %(default)s)")
     # --- END MODIFIED ---
 
     # --- MODIFIED: -N now optionally takes a value (v7.8) ---
