@@ -16,21 +16,20 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.2.16"
+__version__ = "8.2.17"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.2.17 feat(subs): Prompt to replace existing subtitles
+
+        - When adding external subtitles (via -s or sidecar),
+          if the source file already has embedded subtitles,
+          the script now prompts the user.
+        - Option 'y': Removes existing subtitles, keeps only new.
+        - Option 'N': Appends new subtitles (default/old behavior).
+
 v8.2.16 feat(normalize): Append live analysis to audit log
-
-        - When running -N (normalize) on a file that isn't in
-          the audit log, the script now performs the analysis
-          and *appends* the result to the log file (default:
-          ~/.hvec/audit_loudness.csv).
-        - This ensures subsequent runs or other tools (like
-          ,audit_loudness) recognize the file as already scanned.
-
-v8.2.15 feat(main): Show default temp dir in help
         ...
 """
 
@@ -781,6 +780,38 @@ def main():
         all_streams = get_stream_info(input_file) or []
         audio_streams = [s for s in all_streams if s.get('codec_type') == 'audio']
 
+        # --- NEW: Subtitle Replacement Prompt (v8.2.17) ---
+        map_original_subs = True
+        if external_sub_files and not args.filter_streams:
+            existing_subs = [s for s in all_streams if s.get('codec_type') == 'subtitle']
+            if existing_subs:
+                print("\n--- Subtitle Conflict ---")
+                print(f"File: {os.path.basename(input_file)}")
+                print("Existing embedded subtitles:")
+                for s in existing_subs:
+                    tags = s.get('tags', {})
+                    lang = tags.get('language', 'und')
+                    title = tags.get('title', 'N/A')
+                    codec = s.get('codec_name', 'unknown')
+                    print(f"  Stream #{s['index']}: {lang} ({codec}) - {title}")
+
+                print(f"External subtitles to add: {len(external_sub_files)}")
+                for f in external_sub_files:
+                    print(f"  + {os.path.basename(f)}")
+
+                try:
+                    # Default is N (Keep existing)
+                    resp = input("Remove existing subtitles and only use external ones? [y/N]: ").lower().strip()
+                    if resp == 'y':
+                        map_original_subs = False
+                        print("Action: Removing existing subtitles.")
+                    else:
+                        print("Action: Appending external subtitles to existing ones.")
+                except (KeyboardInterrupt, EOFError):
+                    print("\nCancelled.")
+                    sys.exit(1)
+        # --- END NEW ---
+
         # 2. Decide on normalization mode (Prompt user if needed)
         normalize_mode = 'replace' # Default to old destructive behavior
 
@@ -898,8 +929,12 @@ def main():
                 ffmpeg_cmd.extend(['-map', '[a_norm]']) # This becomes output:a:0
 
             ffmpeg_cmd.extend(['-map', '0:a?']) # Map all original audio
-            # --- MODIFIED: Removed chapters (v8.2.7) ---
-            ffmpeg_cmd.extend(['-map', '0:s?', '-map', '0:d?', '-map', '0:t?']) # Map all other streams
+            # --- MODIFIED: Conditional subtitle mapping (v8.2.17) ---
+            if map_original_subs:
+                ffmpeg_cmd.extend(['-map', '0:s?'])
+
+            ffmpeg_cmd.extend(['-map', '0:d?', '-map', '0:t?']) # Map all other streams
+            # --- END MODIFIED ---
 
             # Now map all *external* subs we just added
             if external_sub_files:
