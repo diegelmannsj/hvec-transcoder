@@ -16,11 +16,16 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.3.1"
+__version__ = "8.3.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.3.2 feat(sys): Add auto-priority adjustment
+        - Script now auto-downgrades to Nice 19 (CPU) and Class 3 (Disk IO)
+          to prevent server lag during encoding.
+        - Fixed SyntaxError from previous bash snippet injection.
+
 v8.3.1 feat(ui): Add Batch ETA and rename progress labels
         - Added persistent 'Total' progress bar with ETA for batch jobs.
         - Renamed 'FFmpeg' bar to 'Current Video'.
@@ -34,6 +39,40 @@ v8.3.0 feat(presets): Add 'upgrade' profile and smart audio
           (Copies Safe Codecs, Transcodes TrueHD/DTS -> EAC3).
         - Metadata cleaning is now DEFAULT.
 """
+
+# --- PRIORITY CONTROL (Python Native) ---
+# Check if we are already running at lowest priority (19).
+# If not, restart the script with 'nice' (CPU) and 'ionice' (Disk) adjustments.
+def enforce_background_priority():
+    if not sys.platform.startswith('linux'):
+        return
+
+    try:
+        # os.nice(0) returns the current nice value
+        current_nice = os.nice(0)
+
+        # If we are not yet at the lowest priority (19)
+        if current_nice < 19:
+            # We print to stderr to avoid confusing any piped output,
+            # but we can print a clean message to stdout if preferred.
+            print("Auto-adjusting priority: Switching to Background Mode (Nice 19, IO Idle)...")
+            sys.stdout.flush()
+
+            # Construct the new command line
+            # nice -n 19 ionice -c 3 [python script] [args...]
+            new_args = ['nice', '-n', '19', 'ionice', '-c', '3'] + sys.argv
+
+            # Replace the current process with the new prioritized one
+            # sys.argv[0] is the script name itself
+            os.execvp('nice', new_args)
+
+    except Exception as e:
+        # If ionice/nice are missing or fail, we warn but continue running
+        print(f"Warning: Could not auto-adjust priority: {e}", file=sys.stderr)
+
+# Execute priority check immediately
+enforce_background_priority()
+
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm', '.iso')
