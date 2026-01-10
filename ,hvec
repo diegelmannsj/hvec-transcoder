@@ -16,34 +16,33 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.3.2"
+__version__ = "8.3.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.3.4 feat(ui): Smart Progress Bars & Priority Toggle
+        - Added --no-nice flag to disable auto-priority adjustment.
+        - UI Fix: 'Total' progress bar is now hidden for single-file jobs.
+        - UI Fix: 'Current Video' bar dynamically adjusts position (0 or 1).
+
 v8.3.2 feat(sys): Add auto-priority adjustment
         - Script now auto-downgrades to Nice 19 (CPU) and Class 3 (Disk IO)
           to prevent server lag during encoding.
-        - Fixed SyntaxError from previous bash snippet injection.
 
 v8.3.1 feat(ui): Add Batch ETA and rename progress labels
         - Added persistent 'Total' progress bar with ETA for batch jobs.
         - Renamed 'FFmpeg' bar to 'Current Video'.
-        - Switched labels as requested (Batch->Total, FFmpeg->Current Video).
-
-v8.3.0 feat(presets): Add 'upgrade' profile and smart audio
-        - Added --profile upgrade:
-          (Recursive + Replace + Delete + Skip HEVC).
-          (Auto-renames 'x264/h264/avc' in filename to 'x265').
-        - Added --smart-audio:
-          (Copies Safe Codecs, Transcodes TrueHD/DTS -> EAC3).
-        - Metadata cleaning is now DEFAULT.
 """
 
 # --- PRIORITY CONTROL (Python Native) ---
 # Check if we are already running at lowest priority (19).
 # If not, restart the script with 'nice' (CPU) and 'ionice' (Disk) adjustments.
 def enforce_background_priority():
+    # If the user explicitly asked to disable nice/priority adjustment, skip this whole block.
+    if '--no-nice' in sys.argv:
+        return
+
     if not sys.platform.startswith('linux'):
         return
 
@@ -53,8 +52,7 @@ def enforce_background_priority():
 
         # If we are not yet at the lowest priority (19)
         if current_nice < 19:
-            # We print to stderr to avoid confusing any piped output,
-            # but we can print a clean message to stdout if preferred.
+            # We print to stderr to avoid confusing any piped output
             print("Auto-adjusting priority: Switching to Background Mode (Nice 19, IO Idle)...")
             sys.stdout.flush()
 
@@ -63,7 +61,6 @@ def enforce_background_priority():
             new_args = ['nice', '-n', '19', 'ionice', '-c', '3'] + sys.argv
 
             # Replace the current process with the new prioritized one
-            # sys.argv[0] is the script name itself
             os.execvp('nice', new_args)
 
     except Exception as e:
@@ -253,7 +250,7 @@ def embed_chapters_mkvpropedit(chapter_file, output_file):
     except Exception as e:
         tqdm.write(f"\nAn unexpected error occurred running mkvpropedit: {e}", file=sys.stderr); return False
 
-def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False):
+def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False, bar_position=0):
     """Executes FFmpeg, shows progress, verifies output, and optionally embeds chapters."""
     tqdm.write("\nExecuting FFmpeg command:")
     tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
@@ -267,8 +264,8 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
         else:
             if total_frames is None: tqdm.write("\nWarning: Could not get total frames. Progress bar indeterminate.")
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8')
-            # --- Position 1 for inner bar, renamed to 'Current Video' ---
-            with tqdm(total=total_frames, unit='frame', dynamic_ncols=True, desc="Current Video", position=1, leave=True) as pbar:
+            # --- Position logic: 0 for single file (bottom), 1 for batch (below Total bar) ---
+            with tqdm(total=total_frames, unit='frame', dynamic_ncols=True, desc="Current Video", position=bar_position, leave=True) as pbar:
                 for line in process.stdout:
                     if line.strip().startswith("frame="):
                         current_frame = int(line.strip().split("=")[1]); pbar.update(max(0, current_frame - pbar.n))
@@ -358,6 +355,7 @@ def main():
     proc_group.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux (instead of transcode).")
     proc_group.add_argument("--skip-hevc", action="store_true", help="Skip files that are already HEVC.")
     proc_group.add_argument("--keep-title", action="store_true", help="Do not strip the global 'Title' metadata tag.")
+    proc_group.add_argument("--no-nice", action="store_true", help="Disable auto-priority adjustment (run at normal system priority).")
 
     audio_group = parser.add_argument_group('Audio / Subtitles')
     audio_group.add_argument("--smart-audio", action="store_true", help="Copy safe codecs (AAC/AC3), transcode others (TrueHD/DTS -> EAC3).")
@@ -432,7 +430,9 @@ def main():
     if not files_to_process: print("No video files found to process."); sys.exit(0)
 
     # --- MAIN LOOP ---
-    with tqdm(total=len(files_to_process), desc="Total", unit="file", position=0, dynamic_ncols=True) as batch_bar:
+    is_batch_mode = len(files_to_process) > 1
+    # Smart Bar: If single file, hide Total bar (disable=True). If batch, show it (disable=False).
+    with tqdm(total=len(files_to_process), desc="Total", unit="file", position=0, dynamic_ncols=True, disable=not is_batch_mode) as batch_bar:
         for i, input_file in enumerate(files_to_process, 1):
             tqdm.write(f"\n--- Processing: {os.path.basename(input_file)} ---")
 
@@ -460,7 +460,7 @@ def main():
 
             if args.skip_hevc and is_hevc(input_file):
                 tqdm.write("Already HEVC. Skipping.")
-                batch_bar.update(1) # Update bar before skip
+                if is_batch_mode: batch_bar.update(1)
                 continue
 
             is_remux_op = args.remux and not args.hvec
@@ -649,16 +649,20 @@ def main():
             ffmpeg_cmd.extend(['-c:s', 'copy', '-c:d', 'copy', '-c:t', 'copy'])
             ffmpeg_cmd.append(working_output_file)
 
+            # Determine inner bar position: 1 if batch mode (outer bar exists), 0 if single file.
+            inner_bar_pos = 1 if is_batch_mode else 0
+
             if args.dry_run:
                 print_ffmpeg_command(ffmpeg_cmd)
             else:
-                run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose)
+                run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos)
                 if args.sync_filename and os.path.exists(working_output_file):
                     try: shutil.move(working_output_file, final_output_file); tqdm.write(f"Successfully replaced '{os.path.basename(final_output_file)}'.")
                     except OSError as e: tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
 
             # Update Total bar at end of processing one file
-            batch_bar.update(1)
+            if is_batch_mode:
+                batch_bar.update(1)
 
     tqdm.write("\n--- All tasks complete. ---")
 
