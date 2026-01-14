@@ -16,11 +16,16 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.3.4"
+__version__ = "8.4.0"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.4.0 feat(ui): Update Stream Selection UI & Flags
+        - Renamed '-k' to '-E/--english' (Legacy '-k' still supported).
+        - Stream selection now displays Language Name and Code (e.g., 'English [eng]').
+        - Added lightweight ISO-639 mapping for common languages.
+
 v8.3.4 feat(ui): Smart Progress Bars & Priority Toggle
         - Added --no-nice flag to disable auto-priority adjustment.
         - UI Fix: 'Total' progress bar is now hidden for single-file jobs.
@@ -29,10 +34,6 @@ v8.3.4 feat(ui): Smart Progress Bars & Priority Toggle
 v8.3.2 feat(sys): Add auto-priority adjustment
         - Script now auto-downgrades to Nice 19 (CPU) and Class 3 (Disk IO)
           to prevent server lag during encoding.
-
-v8.3.1 feat(ui): Add Batch ETA and rename progress labels
-        - Added persistent 'Total' progress bar with ETA for batch jobs.
-        - Renamed 'FFmpeg' bar to 'Current Video'.
 """
 
 # --- PRIORITY CONTROL (Python Native) ---
@@ -83,6 +84,22 @@ TARGET_LOUDNESS = -23.0
 TARGET_TRUE_PEAK = -2.0
 TARGET_LRA = 7
 
+# Common ISO 639-2 codes to Full Name mapping
+ISO_639_MAP = {
+    'eng': 'English', 'jpn': 'Japanese', 'und': 'Undetermined',
+    'fra': 'French', 'fre': 'French', 'deu': 'German', 'ger': 'German',
+    'ita': 'Italian', 'spa': 'Spanish', 'kor': 'Korean',
+    'chi': 'Chinese', 'zho': 'Chinese', 'rus': 'Russian',
+    'por': 'Portuguese', 'vie': 'Vietnamese', 'tha': 'Thai',
+    'swe': 'Swedish', 'nor': 'Norwegian', 'dan': 'Danish',
+    'fin': 'Finnish', 'nld': 'Dutch', 'dut': 'Dutch',
+    'pol': 'Polish', 'hin': 'Hindi', 'tur': 'Turkish',
+    'ara': 'Arabic', 'heb': 'Hebrew', 'cze': 'Czech', 'ces': 'Czech',
+    'gre': 'Greek', 'ell': 'Greek', 'hun': 'Hungarian', 'ind': 'Indonesian',
+    'msa': 'Malay', 'may': 'Malay', 'rum': 'Romanian', 'ron': 'Romanian',
+    'ukr': 'Ukrainian'
+}
+
 # --- Helper Functions ---
 def get_total_frames(file_path):
     """Gets total frames quickly using mediainfo (preferred) or falls back."""
@@ -125,9 +142,36 @@ def plan_stream_selection(streams):
         else: streams_to_remove.append(s)
     return streams_to_keep, streams_to_remove
 
+def get_stream_display_string(s):
+    """Formats a stream info string with language decoding (e.g., Audio: English [eng])."""
+    stype = s.get('codec_type', 'N/A').capitalize()
+    index = s['index']
+    
+    # Only show language for Audio and Subtitle tracks
+    if stype.lower() in ['audio', 'subtitle']:
+        lang_code = s.get('tags', {}).get('language', 'und')
+        # Try to find the full name in our map, defaulting to the code if not found
+        lang_name = ISO_639_MAP.get(lang_code, lang_code)
+        
+        # If the lookup returned the code itself (unknown lang), just show code
+        if lang_name == lang_code:
+            return f"Stream #{index} ({stype}: {lang_code})"
+        else:
+            return f"Stream #{index} ({stype}: {lang_name} [{lang_code}])"
+            
+    return f"Stream #{index} ({stype})"
+
 def display_and_confirm_plan(s_keep, s_rem):
-    tqdm.write("\n--- Stream Selection Plan ---\nKEPT:"); [tqdm.write(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_keep]
-    tqdm.write("\nREMOVED:"); [tqdm.write(f"  - Stream #{s['index']} ({s.get('codec_type', 'N/A').capitalize()})") for s in s_rem]
+    tqdm.write("\n--- Stream Selection Plan ---")
+    
+    tqdm.write("KEPT:")
+    for s in s_keep:
+        tqdm.write(f"  - {get_stream_display_string(s)}")
+        
+    tqdm.write("\nREMOVED:")
+    for s in s_rem:
+        tqdm.write(f"  - {get_stream_display_string(s)}")
+
     try: return input("Proceed? [y/N]: ").lower().strip() == 'y'
     except KeyboardInterrupt: return False
 
@@ -335,7 +379,7 @@ def load_loudness_db(log_file: str, verbose=False) -> Dict[str, Dict[str, float]
 def main():
     print(f",hvec v{__version__}")
 
-    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -k\n  ,hvec -i /videos/ -D -k -R\n  ,hvec -i movie.mp4 -r -C chapters.txt\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.csv")
+    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel VAAPI.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -E\n  ,hvec -i /videos/ -D -E -R\n  ,hvec -i movie.mp4 -r -C chapters.txt\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.csv")
 
     # --- Grouped Arguments for Cleaner UI ---
     io_group = parser.add_argument_group('Input / Output')
@@ -364,7 +408,7 @@ def main():
     audio_group.add_argument("--abitrate", help="Set audio bitrate (e.g., '192k', '384k').")
     audio_group.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed (single file mode only).")
     audio_group.add_argument("-C", "--chapters", help="External chapter file (TXT/OGM or XML) to embed.")
-    audio_group.add_argument("-k", "--filter-streams", action="store_true", help="Interactively filter streams (single file mode only).")
+    audio_group.add_argument("-E", "--english", "-k", dest="filter_streams", action="store_true", help="Keep English Audio/Subs + Video (Interactively filter streams).")
 
     info_group = parser.add_argument_group('Info / Debug')
     info_group.add_argument("-m", "--mediainfo", action="store_true", help="Show mediainfo of the input file before processing.")
