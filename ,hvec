@@ -16,11 +16,16 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.5.1"
+__version__ = "8.5.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.5.2 fix(ui): Correct Prompt Order
+        - Fixed logic order so main Stream Selection Plan is displayed/confirmed
+          BEFORE prompting for subtitle cleanup.
+        - If cleanup is accepted, the updated plan is shown for final confirmation.
+
 v8.5.1 fix(ui): Prompt Order & Readable Codecs
         - Reordered prompts: Language check runs BEFORE Format check.
         - Added friendly names for common subtitle codecs (e.g., PGS, VobSub).
@@ -657,11 +662,10 @@ def main():
                 if not all_streams: continue
                 s_keep, s_rem = plan_stream_selection(all_streams)
 
-                # Show the initial plan (Language Filter)
-                # If user rejects this, we skip the file entirely (standard behavior)
+                # 1. Show the initial plan (Language Filter) and ask for confirmation
                 if not display_and_confirm_plan(s_keep, s_rem): continue
 
-                # NOW check for "SRT + Non-SRT" condition (clean up logic)
+                # 2. Check for "SRT + Non-SRT" condition (clean up logic)
                 kept_subs = [s for s in s_keep if s.get('codec_type') == 'subtitle']
                 eng_srts = [s for s in kept_subs if s.get('codec_name') == 'subrip' and s.get('tags', {}).get('language') == 'eng']
                 non_srts = [s for s in kept_subs if s.get('codec_name') != 'subrip']
@@ -676,8 +680,8 @@ def main():
                                 s_rem.append(s)
                         # Re-sort s_rem by index for cleanliness
                         s_rem.sort(key=lambda x: x['index'])
-                        # Re-display the plan if it changed
-                        display_and_confirm_plan(s_keep, s_rem)
+                        # Re-display the plan if it changed to confirm the new selection
+                        if not display_and_confirm_plan(s_keep, s_rem): continue
 
                 for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
             else:
