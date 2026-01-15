@@ -16,11 +16,16 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.4.0"
+__version__ = "8.5.0"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.5.0 feat(ui): Enhanced Stream Selection
+        - Displays subtitle codec in stream list (e.g. [subrip], [dvd_subtitle]).
+        - Auto-detects if English SRTs are present alongside other formats.
+        - Prompts user to clean up (remove) non-SRT subs if SRTs are found.
+
 v8.4.0 feat(ui): Update Stream Selection UI & Flags
         - Renamed '-k' to '-E/--english' (Legacy '-k' still supported).
         - Stream selection now displays Language Name and Code (e.g., 'English [eng]').
@@ -28,12 +33,6 @@ v8.4.0 feat(ui): Update Stream Selection UI & Flags
 
 v8.3.4 feat(ui): Smart Progress Bars & Priority Toggle
         - Added --no-nice flag to disable auto-priority adjustment.
-        - UI Fix: 'Total' progress bar is now hidden for single-file jobs.
-        - UI Fix: 'Current Video' bar dynamically adjusts position (0 or 1).
-
-v8.3.2 feat(sys): Add auto-priority adjustment
-        - Script now auto-downgrades to Nice 19 (CPU) and Class 3 (Disk IO)
-          to prevent server lag during encoding.
 """
 
 # --- PRIORITY CONTROL (Python Native) ---
@@ -153,11 +152,19 @@ def get_stream_display_string(s):
         # Try to find the full name in our map, defaulting to the code if not found
         lang_name = ISO_639_MAP.get(lang_code, lang_code)
         
+        # Add codec info for subtitles specifically
+        extra_info = ""
+        if stype.lower() == 'subtitle':
+            codec = s.get('codec_name', '?')
+            # Map subrip to SRT for friendlier display, otherwise keep codec name
+            codec_display = "SRT" if codec == 'subrip' else codec
+            extra_info = f" [{codec_display}]"
+
         # If the lookup returned the code itself (unknown lang), just show code
         if lang_name == lang_code:
-            return f"Stream #{index} ({stype}: {lang_code})"
+            return f"Stream #{index} ({stype}: {lang_code}{extra_info})"
         else:
-            return f"Stream #{index} ({stype}: {lang_name} [{lang_code}])"
+            return f"Stream #{index} ({stype}: {lang_name} [{lang_code}]{extra_info})"
             
     return f"Stream #{index} ({stype})"
 
@@ -639,6 +646,23 @@ def main():
             if args.filter_streams and len(files_to_process) == 1:
                 if not all_streams: continue
                 s_keep, s_rem = plan_stream_selection(all_streams)
+
+                # Check for "SRT + Non-SRT" condition
+                kept_subs = [s for s in s_keep if s.get('codec_type') == 'subtitle']
+                eng_srts = [s for s in kept_subs if s.get('codec_name') == 'subrip' and s.get('tags', {}).get('language') == 'eng']
+                non_srts = [s for s in kept_subs if s.get('codec_name') != 'subrip']
+                
+                if eng_srts and non_srts:
+                    tqdm.write(f"\nDetected English SRT subtitles along with {len(non_srts)} non-SRT format(s).")
+                    if input("Remove non-SRT subtitles (clean up)? [y/N]: ").lower().strip() == 'y':
+                        # Move non-srts from keep to rem
+                        for s in non_srts:
+                            if s in s_keep:
+                                s_keep.remove(s)
+                                s_rem.append(s)
+                        # Re-sort s_rem by index for cleanliness
+                        s_rem.sort(key=lambda x: x['index'])
+
                 if not display_and_confirm_plan(s_keep, s_rem): continue
                 for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
             else:
