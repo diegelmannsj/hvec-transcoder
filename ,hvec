@@ -657,14 +657,15 @@ def main():
                 if not all_streams: continue
                 s_keep, s_rem = plan_stream_selection(all_streams)
 
-                # Check for "SRT + Non-SRT" condition
+                # Show the initial plan (Language Filter)
+                # If user rejects this, we skip the file entirely (standard behavior)
+                if not display_and_confirm_plan(s_keep, s_rem): continue
+
+                # NOW check for "SRT + Non-SRT" condition (clean up logic)
                 kept_subs = [s for s in s_keep if s.get('codec_type') == 'subtitle']
                 eng_srts = [s for s in kept_subs if s.get('codec_name') == 'subrip' and s.get('tags', {}).get('language') == 'eng']
                 non_srts = [s for s in kept_subs if s.get('codec_name') != 'subrip']
                 
-                # Check for "SRT + Non-SRT" condition (clean up logic)
-                # We do this logic check *before* the final display_and_confirm_plan
-                # This ensures the final confirmation plan reflects any cleanup decisions.
                 if eng_srts and non_srts:
                     tqdm.write(f"\nDetected English SRT subtitles along with {len(non_srts)} non-SRT format(s).")
                     if input("Remove non-SRT subtitles (clean up)? [y/N]: ").lower().strip() == 'y':
@@ -675,8 +676,9 @@ def main():
                                 s_rem.append(s)
                         # Re-sort s_rem by index for cleanliness
                         s_rem.sort(key=lambda x: x['index'])
+                        # Re-display the plan if it changed
+                        display_and_confirm_plan(s_keep, s_rem)
 
-                if not display_and_confirm_plan(s_keep, s_rem): continue
                 for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
             else:
                 ffmpeg_cmd.extend(['-map', '0:v?'])
