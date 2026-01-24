@@ -16,11 +16,15 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.5.3"
+__version__ = "8.5.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.5.4 feat(ui): Colored Audio Summary
+        - File summary now displays original audio loudness and the dB adjustment.
+        - Adjustment direction (Increase/Decrease) is color-coded (Green/Red).
+
 v8.5.3 feat(ui): Explicit Loudness Adjustment
         - Normalization logic now explicitly states if audio will "Increase"
           or "Decrease" and by how many dB, rather than just showing a signed value.
@@ -212,7 +216,7 @@ def format_size(size_bytes):
         return f"{s} {size_name[i]}"
     except (ValueError, TypeError): return "N/A"
 
-def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=False):
+def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=False, measured_loudness=None):
     """Prints a formatted summary of the file size change."""
     tqdm.write("\n--- File Size Summary ---")
     original_size_str = format_size(original_size_bytes); new_size_str = format_size(new_size_bytes)
@@ -224,7 +228,15 @@ def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=Fal
     else: tqdm.write("Difference: N/A")
 
     if audio_normalized:
-        tqdm.write(f"Audio:      Normalized (EBU R128 {TARGET_LOUDNESS} LUFS)")
+        if measured_loudness is not None:
+            diff = TARGET_LOUDNESS - measured_loudness
+            # Green (92m) for increase, Red (91m) for decrease
+            color = "\033[92m" if diff >= 0 else "\033[91m"
+            reset = "\033[0m"
+            direction = "Increase" if diff >= 0 else "Decrease"
+            tqdm.write(f"Audio:      Normalized (Original: {measured_loudness:.2f} LUFS | {color}{direction}: {abs(diff):.2f} dB{reset})")
+        else:
+            tqdm.write(f"Audio:      Normalized (EBU R128 {TARGET_LOUDNESS} LUFS)")
 
     tqdm.write("-------------------------")
 
@@ -320,7 +332,7 @@ def embed_chapters_mkvpropedit(chapter_file, output_file):
     except Exception as e:
         tqdm.write(f"\nAn unexpected error occurred running mkvpropedit: {e}", file=sys.stderr); return False
 
-def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False, bar_position=0):
+def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False, bar_position=0, measured_loudness=None):
     """Executes FFmpeg, shows progress, verifies output, and optionally embeds chapters."""
     tqdm.write("\nExecuting FFmpeg command:")
     tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
@@ -371,7 +383,7 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
             if verbose: tqdm.write(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
         except OSError as e: tqdm.write(f"\nWarning: Could not set permissions. Reason: {e}", file=sys.stderr)
 
-    print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=audio_normalized)
+    print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=audio_normalized, measured_loudness=measured_loudness)
 
     if delete_source and ffmpeg_success and chapters_embedded_successfully:
         tqdm.write(f"\nInfo: --delete flag set. Deleting source file...")
@@ -750,10 +762,13 @@ def main():
             # Determine inner bar position: 1 if batch mode (outer bar exists), 0 if single file.
             inner_bar_pos = 1 if is_batch_mode else 0
 
+            # Prepare measured_loudness for the summary function
+            m_loudness = analysis_data['i'] if (is_normalize_enabled and analysis_data and 'i' in analysis_data) else None
+
             if args.dry_run:
                 print_ffmpeg_command(ffmpeg_cmd)
             else:
-                run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos)
+                run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
                 if args.sync_filename and os.path.exists(working_output_file):
                     try: shutil.move(working_output_file, final_output_file); tqdm.write(f"Successfully replaced '{os.path.basename(final_output_file)}'.")
                     except OSError as e: tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
