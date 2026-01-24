@@ -16,11 +16,15 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.5.2"
+__version__ = "8.5.3"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.5.3 feat(ui): Explicit Loudness Adjustment
+        - Normalization logic now explicitly states if audio will "Increase"
+          or "Decrease" and by how many dB, rather than just showing a signed value.
+
 v8.5.2 fix(ui): Correct Prompt Order
         - Fixed logic order so main Stream Selection Plan is displayed/confirmed
           BEFORE prompting for subtitle cleanup.
@@ -653,7 +657,14 @@ def main():
                         measured_i = analysis_data['i']; measured_tp = analysis_data['tp']; measured_lra = analysis_data['lra']; measured_thresh = analysis_data['thresh']
                         filter_string_for_simple = f"loudnorm=I={TARGET_LOUDNESS}:LRA={TARGET_LRA}:tp={TARGET_TRUE_PEAK}:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
                         filter_string_for_complex = f"[0:a:0]{filter_string_for_simple}[a_norm]"
-                        tqdm.write(f"  - Input Loudness: {measured_i:.2f} LUFS (Adjustment: {TARGET_LOUDNESS - measured_i:+.2f} dB)")
+                        
+                        # --- MODIFIED LOGIC START ---
+                        diff = TARGET_LOUDNESS - measured_i
+                        change_direction = "Increase" if diff > 0 else "Decrease"
+                        tqdm.write(f"  - Input Loudness: {measured_i:.2f} LUFS")
+                        tqdm.write(f"  - Audio Level: Will {change_direction} by {abs(diff):.2f} dB")
+                        # --- MODIFIED LOGIC END ---
+
                     except KeyError: analysis_data = None; is_normalize_enabled = False
                 if not analysis_data: is_normalize_enabled = False
                 if analysis_data and normalize_mode == 'add': ffmpeg_cmd.extend(['-filter_complex', filter_string_for_complex])
