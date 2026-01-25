@@ -16,11 +16,16 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.5.4"
+__version__ = "8.5.5"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.5.5 fix(ffmpeg): Fix AVI Hardware Upload
+        - Explicitly initialize VAAPI device for AVI files.
+        - Fixes "A hardware device reference is required to upload frames to"
+          error when transcoding AVIs (Software Decode -> HW Encode).
+
 v8.5.4 feat(ui): Colored Audio Summary
         - File summary now displays original audio loudness and the dB adjustment.
         - Adjustment direction (Increase/Decrease) is color-coded (Green/Red).
@@ -32,7 +37,6 @@ v8.5.3 feat(ui): Explicit Loudness Adjustment
 v8.5.2 fix(ui): Correct Prompt Order
         - Fixed logic order so main Stream Selection Plan is displayed/confirmed
           BEFORE prompting for subtitle cleanup.
-        - If cleanup is accepted, the updated plan is shown for final confirmation.
 
 v8.5.1 fix(ui): Prompt Order & Readable Codecs
         - Reordered prompts: Language check runs BEFORE Format check.
@@ -42,8 +46,6 @@ v8.5.0 feat(ui): Enhanced Stream Selection
         - Displays subtitle codec in stream list (e.g. [subrip], [dvd_subtitle]).
         - Auto-detects if English SRTs are present alongside other formats.
         - Prompts user to clean up (remove) non-SRT subs if SRTs are found.
-
-v8.4.0 feat(ui): Update Stream Selection UI & Flags
 """
 
 # --- PRIORITY CONTROL (Python Native) ---
@@ -606,7 +608,12 @@ def main():
             else: ffmpeg_cmd.extend(['-v', 'error', '-stats'])
 
             is_avi = input_file.lower().endswith('.avi')
-            if is_avi: ffmpeg_cmd.extend(['-fflags', '+genpts'])
+            if is_avi:
+                ffmpeg_cmd.extend(['-fflags', '+genpts'])
+                # Fix for AVI HW upload: Initialize device manually since -hwaccel is skipped
+                if is_transcode_op:
+                    ffmpeg_cmd.extend(['-init_hw_device', 'vaapi=va:/dev/dri/renderD128', '-filter_hw_device', 'va'])
+
             if is_transcode_op and not is_avi: ffmpeg_cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
 
             external_sub_files = []
