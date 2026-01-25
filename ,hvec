@@ -16,11 +16,17 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.5.5"
+__version__ = "8.5.6"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.5.6 feat(core): Batch Error Handling
+        - Script now continues to the next file if an error occurs during batch processing.
+        - Errors are logged in RED during processing.
+        - Added a final summary listing all failed files in RED.
+        - Refactored FFmpeg execution to return status instead of exiting.
+
 v8.5.5 fix(ffmpeg): Fix AVI Hardware Upload
         - Explicitly initialize VAAPI device for AVI files.
         - Fixes "A hardware device reference is required to upload frames to"
@@ -95,6 +101,11 @@ CWD_LOG_PATH = os.path.abspath(DEFAULT_LOG_BASENAME)
 TARGET_LOUDNESS = -23.0
 TARGET_TRUE_PEAK = -2.0
 TARGET_LRA = 7
+
+# --- ANSI Colors ---
+GREEN = "\033[92m"
+RED = "\033[91m"
+RESET = "\033[0m"
 
 # Common ISO 639-2 codes to Full Name mapping
 ISO_639_MAP = {
@@ -233,10 +244,9 @@ def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=Fal
         if measured_loudness is not None:
             diff = TARGET_LOUDNESS - measured_loudness
             # Green (92m) for increase, Red (91m) for decrease
-            color = "\033[92m" if diff >= 0 else "\033[91m"
-            reset = "\033[0m"
+            color = GREEN if diff >= 0 else RED
             direction = "Increase" if diff >= 0 else "Decrease"
-            tqdm.write(f"Audio:      Normalized (Original: {measured_loudness:.2f} LUFS | {color}{direction}: {abs(diff):.2f} dB{reset})")
+            tqdm.write(f"Audio:      Normalized (Original: {measured_loudness:.2f} LUFS | {color}{direction}: {abs(diff):.2f} dB{RESET})")
         else:
             tqdm.write(f"Audio:      Normalized (EBU R128 {TARGET_LOUDNESS} LUFS)")
 
@@ -357,19 +367,29 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
             if process.returncode != 0: raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_output)
         ffmpeg_success = True
     except (subprocess.CalledProcessError, FileNotFoundError, KeyboardInterrupt) as e:
-        if isinstance(e, subprocess.CalledProcessError): tqdm.write(f"\n--- FFmpeg Error --\n{e.stderr}\n--------------------", file=sys.stderr)
-        elif isinstance(e, FileNotFoundError): tqdm.write("\nError: Required command not found (ffmpeg/stdbuf).", file=sys.stderr)
-        else: tqdm.write("\nCancelled.", file=sys.stderr)
-        if 'process' in locals(): process.terminate()
-        sys.exit(1)
+        if isinstance(e, subprocess.CalledProcessError):
+             tqdm.write(f"\n{RED}--- FFmpeg Error ---{RESET}\n{e.stderr}\n{RED}--------------------{RESET}", file=sys.stderr)
+             if 'process' in locals(): process.terminate()
+             return False
+        elif isinstance(e, FileNotFoundError):
+             tqdm.write(f"\n{RED}Error: Required command not found (ffmpeg/stdbuf).{RESET}", file=sys.stderr)
+             if 'process' in locals(): process.terminate()
+             return False
+        else:
+             tqdm.write(f"\n{RED}Cancelled.{RESET}", file=sys.stderr)
+             if 'process' in locals(): process.terminate()
+             sys.exit(1)
 
     if not ffmpeg_success or not os.path.exists(output_file):
-        tqdm.write(f"\nError: FFmpeg failed or output file '{output_file}' not created.", file=sys.stderr); sys.exit(1)
+        tqdm.write(f"\n{RED}Error: FFmpeg failed or output file '{output_file}' not created.{RESET}", file=sys.stderr)
+        return False
+        
     try:
         new_size_bytes = os.path.getsize(output_file)
         subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
     except Exception:
-        tqdm.write(f"\nError: Output file '{output_file}' appears invalid after FFmpeg.", file=sys.stderr); sys.exit(1)
+        tqdm.write(f"\n{RED}Error: Output file '{output_file}' appears invalid after FFmpeg.{RESET}", file=sys.stderr)
+        return False
 
     tqdm.write(f"\nSuccessfully created and verified FFmpeg output '{output_file}'.")
 
@@ -393,6 +413,8 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
         except OSError as e: tqdm.write(f"\nError: Could not delete source '{source_file}'. Reason: {e}", file=sys.stderr)
     elif delete_source:
          tqdm.write(f"\nWarning: --delete flag ignored because chapter embedding failed.")
+    
+    return True
 
 def load_loudness_db(log_file: str, verbose=False) -> Dict[str, Dict[str, float]]:
     """Reads a CSV loudness audit log file and returns a dict."""
@@ -514,6 +536,7 @@ def main():
     if not files_to_process: print("No video files found to process."); sys.exit(0)
 
     # --- MAIN LOOP ---
+    failed_files = []
     is_batch_mode = len(files_to_process) > 1
     # Smart Bar: If single file, hide Total bar (disable=True). If batch, show it (disable=False).
     with tqdm(total=len(files_to_process), desc="Total", unit="file", position=0, dynamic_ncols=True, disable=not is_batch_mode) as batch_bar:
@@ -775,8 +798,14 @@ def main():
             if args.dry_run:
                 print_ffmpeg_command(ffmpeg_cmd)
             else:
-                run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
-                if args.sync_filename and os.path.exists(working_output_file):
+                success = run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
+                if not success:
+                    failed_files.append(input_file)
+                    # Cleanup temp file if it exists and failed
+                    if args.sync_filename and os.path.exists(working_output_file):
+                        try: os.remove(working_output_file)
+                        except OSError: pass
+                elif args.sync_filename and os.path.exists(working_output_file):
                     try: shutil.move(working_output_file, final_output_file); tqdm.write(f"Successfully replaced '{os.path.basename(final_output_file)}'.")
                     except OSError as e: tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
 
@@ -785,6 +814,11 @@ def main():
                 batch_bar.update(1)
 
     tqdm.write("\n--- All tasks complete. ---")
+    
+    if failed_files:
+        tqdm.write(f"\n{RED}--- Failed Files ({len(failed_files)}) ---{RESET}")
+        for f in failed_files:
+            tqdm.write(f"{RED}  - {os.path.basename(f)}{RESET}")
 
 if __name__ == "__main__":
     main()
