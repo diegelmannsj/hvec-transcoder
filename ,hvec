@@ -16,11 +16,17 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.5.6"
+__version__ = "8.5.7"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.5.7 fix(audio): Fix 'Unsupported Channel Layout' for AAC
+        - Added 'aformat=channel_layouts=7.1|5.1|stereo|mono' to the normalization
+          filter chain.
+        - Fixes FFmpeg error "Unsupported channel layout '6 channels'" when
+          encoding Atmos/EAC3 inputs to AAC by forcing a standard layout.
+
 v8.5.6 feat(core): Batch Error Handling
         - Script now continues to the next file if an error occurs during batch processing.
         - Errors are logged in RED during processing.
@@ -697,7 +703,8 @@ def main():
                 if analysis_data:
                     try:
                         measured_i = analysis_data['i']; measured_tp = analysis_data['tp']; measured_lra = analysis_data['lra']; measured_thresh = analysis_data['thresh']
-                        filter_string_for_simple = f"loudnorm=I={TARGET_LOUDNESS}:LRA={TARGET_LRA}:tp={TARGET_TRUE_PEAK}:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
+                        # Add aformat to ensure compatible channel layouts (fixes "Unsupported channel layout '6 channels'" for AAC)
+                        filter_string_for_simple = f"loudnorm=I={TARGET_LOUDNESS}:LRA={TARGET_LRA}:tp={TARGET_TRUE_PEAK}:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh},aformat=channel_layouts=7.1|5.1|stereo|mono"
                         filter_string_for_complex = f"[0:a:0]{filter_string_for_simple}[a_norm]"
                         
                         # --- MODIFIED LOGIC START ---
