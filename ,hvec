@@ -16,11 +16,18 @@ import csv
 import time
 
 # --- Version History ---
-__version__ = "8.5.7"
+__version__ = "8.5.8"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.5.8 feat(core): Auto-Update Loudness Log
+        - When audio normalization is successfully applied, the script now appends
+          a new entry to the 'audit_loudness.csv' log with the target values
+          (e.g., -23.0 LUFS).
+        - This ensures that subsequent runs of ',audit_loudness' recognize the
+          file as [NORMALIZED] immediately, preventing redundant prompts.
+
 v8.5.7 fix(audio): Fix 'Unsupported Channel Layout' for AAC
         - Added 'aformat=channel_layouts=7.1|5.1|stereo|mono' to the normalization
           filter chain.
@@ -806,15 +813,42 @@ def main():
                 print_ffmpeg_command(ffmpeg_cmd)
             else:
                 success = run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
+                
+                perform_log_update = False
                 if not success:
                     failed_files.append(input_file)
                     # Cleanup temp file if it exists and failed
                     if args.sync_filename and os.path.exists(working_output_file):
                         try: os.remove(working_output_file)
                         except OSError: pass
-                elif args.sync_filename and os.path.exists(working_output_file):
-                    try: shutil.move(working_output_file, final_output_file); tqdm.write(f"Successfully replaced '{os.path.basename(final_output_file)}'.")
-                    except OSError as e: tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
+                else:
+                    # Success Case
+                    if args.sync_filename and os.path.exists(working_output_file):
+                        try: 
+                            shutil.move(working_output_file, final_output_file)
+                            tqdm.write(f"Successfully replaced '{os.path.basename(final_output_file)}'.")
+                            perform_log_update = True
+                        except OSError as e: 
+                            tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
+                    else:
+                        # Direct output or non-sync mode
+                        perform_log_update = True
+
+                    # --- v8.5.8: Update Audit Log on Success ---
+                    if perform_log_update and is_normalize_enabled and audio_normalized and active_log_file and analysis_data:
+                        try:
+                            # We assume target values were met since normalization succeeded
+                            post_norm_data = {
+                                'i': TARGET_LOUDNESS,
+                                'tp': TARGET_TRUE_PEAK,
+                                'lra': analysis_data.get('lra', 0.0),
+                                'thresh': analysis_data.get('thresh', 0.0)
+                            }
+                            # Log with 0.0s time since normalization time isn't strictly analysis time
+                            append_to_loudness_log(final_output_file, post_norm_data, 0.0, active_log_file)
+                        except Exception as e:
+                            tqdm.write(f"Warning: Could not update loudness log: {e}", file=sys.stderr)
+                    # -------------------------------------------
 
             # Update Total bar at end of processing one file
             if is_batch_mode:
