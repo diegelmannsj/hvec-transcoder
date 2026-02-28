@@ -17,33 +17,27 @@ import time
 import curses
 
 # --- Version History ---
-__version__ = "8.6.0"
+__version__ = "8.6.2"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.6.2 feat(ui): TUI Recursive Scan, Columns, and File Info Overlay
+        - Added 'Scan Subdirectories (Recursive)' toggle to TUI Screen 1.
+        - Added Select All ('A') / None ('N') keybindings for format selection.
+        - Redesigned TUI Screen 2 file list into rigid, fixed-width columns.
+        - Added 'F' (File Info) keybinding to Screen 2 to display a centered 
+          overlay window detailing the selected file's A/V/S streams and codecs.
+
+v8.6.1 feat(ui): TUI Non-HEVC Filter
+        - Added a modifier toggle to Screen 1 of the TUI to strictly filter out
+          files that are already HEVC.
+        - Implemented live-updating terminal status during the ffprobe scan phase.
+
 v8.6.0 feat(ui/core): Interactive TUI and QSV Transition
         - Transitioned from VAAPI to Intel Quick Sync (QSV) for optimal Alder Lake-N performance.
         - Replaced `-hwaccel vaapi` with `-hwaccel qsv` and `hevc_vaapi` with `hevc_qsv`.
         - Added `-T` / `--tui` flag for an interactive curses-based file selection interface.
-        - TUI allows filtering by video format, granular file selection, and toggling sort orders.
-        - Selected files via TUI are automatically processed using the 'upgrade' profile logic.
-
-v8.5.8 feat(core): Auto-Update Loudness Log
-        - When audio normalization is successfully applied, the script now appends
-          a new entry to the 'audit_loudness.csv' log with the target values.
-
-v8.5.7 fix(audio): Fix 'Unsupported Channel Layout' for AAC
-        - Added 'aformat=channel_layouts=7.1|5.1|stereo|mono' to the normalization filter chain.
-
-v8.5.6 feat(core): Batch Error Handling
-        - Script now continues to the next file if an error occurs during batch processing.
-
-v8.5.5 fix(ffmpeg): Fix AVI Hardware Upload
-        - Explicitly initialize hardware device for AVI files.
-
-v8.5.4 feat(ui): Colored Audio Summary
-        - File summary now displays original audio loudness and the dB adjustment.
 """
 
 # --- PRIORITY CONTROL (Python Native) ---
@@ -104,6 +98,21 @@ SUBTITLE_CODEC_MAP = {
 }
 
 # --- Helper Functions ---
+def get_video_codec(f):
+    if not os.path.exists(f): return "---", False
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', f]
+    try:
+        out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip().lower()
+        if not out: return "---", False
+        out = out.split('\n')[0].strip()  # Grab first stream if multiple exist
+        return out, (out == 'hevc')
+    except Exception:
+        return "---", False
+
+def is_hevc(f):
+    _, is_h = get_video_codec(f)
+    return is_h
+
 def get_total_frames(file_path):
     if shutil.which('mediainfo'):
         cmd = ['mediainfo', '--Inform=Video;%FrameCount%', file_path]
@@ -208,12 +217,6 @@ def find_video_files(p, r):
     if r: [vids.extend([os.path.join(root, f) for f in files if f.lower().endswith(VIDEO_EXTENSIONS)]) for root, _, files in os.walk(p)]
     else: vids.extend([os.path.join(p, f) for f in os.listdir(p) if f.lower().endswith(VIDEO_EXTENSIONS)])
     return vids
-
-def is_hevc(f):
-    if not os.path.exists(f): return False
-    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', f]
-    try: return 'hevc' in subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.lower()
-    except Exception: return False
 
 def print_ffmpeg_command(cmd):
     tqdm.write("\nExecuting FFmpeg command (Dry Run):")
@@ -382,23 +385,84 @@ def load_loudness_db(log_file: str, verbose=False) -> Dict[str, Dict[str, float]
     return db
 
 # --- Interactive TUI ---
-def run_tui(target_dir, recursive):
+def show_file_info_popup(stdscr, filepath):
+    h, w = stdscr.getmaxyx()
+    streams = get_stream_info(filepath)
+    
+    lines = [f"File: {os.path.basename(filepath)}", "-" * 30]
+    if not streams:
+        lines.append("Error reading stream metadata.")
+    else:
+        v_streams = [s for s in streams if s.get('codec_type') == 'video']
+        if v_streams:
+            v = v_streams[0]
+            lines.append(f"Video: {v.get('codec_name', 'N/A').upper()} ({v.get('width', '?')}x{v.get('height', '?')})")
+        else:
+            lines.append("Video: None found")
+            
+        a_streams = [s for s in streams if s.get('codec_type') == 'audio']
+        if a_streams:
+            lines.append("Audio:")
+            for s in a_streams:
+                codec = s.get('codec_name', 'N/A').upper()
+                ch = s.get('channels', '?')
+                lang = s.get('tags', {}).get('language', 'und')
+                lines.append(f"  - {codec} ({ch} ch) [{lang}]")
+        
+        s_streams = [s for s in streams if s.get('codec_type') == 'subtitle']
+        if s_streams:
+            lines.append("Subtitles:")
+            for s in s_streams:
+                codec = s.get('codec_name', 'N/A').upper()
+                lang = s.get('tags', {}).get('language', 'und')
+                lines.append(f"  - {codec} [{lang}]")
+                
+    lines.append("-" * 30)
+    lines.append("Press any key to close...")
+    
+    box_w = max((len(line) for line in lines), default=40) + 4
+    box_h = len(lines) + 4
+    box_w = min(box_w, w - 2)
+    box_h = min(box_h, h - 2)
+    
+    start_y = max(1, (h - box_h) // 2)
+    start_x = max(1, (w - box_w) // 2)
+    
+    win = curses.newwin(box_h, box_w, start_y, start_x)
+    win.box()
+    
+    for i, line in enumerate(lines[:box_h-2]):
+        safe_line = line[:box_w-4]
+        win.addstr(i+1, 2, safe_line)
+        
+    win.refresh()
+    win.getch()
+
+def run_tui(target_dir, initial_recursive):
     def main_loop(stdscr):
         curses.curs_set(0)
         
         # Screen 1: Format Selection
         formats = ['.ts', '.mp4', '.mkv', '.avi', '.mov', '.m2ts', '.wmv', '.flv', '.webm']
         selected_formats = set()
+        
+        modifiers = [
+            {"label": "Scan Subdirectories (Recursive)", "active": initial_recursive},
+            {"label": "Filter: ONLY show Non-HEVC / x264 (Slower scan)", "active": False}
+        ]
+        
         current_row = 0
+        total_rows = len(formats) + len(modifiers)
 
         while True:
             stdscr.clear()
             h, w = stdscr.getmaxyx()
             stdscr.addstr(0, 0, "=== Screen 1: Select Video Formats to Scan ===")
-            stdscr.addstr(1, 0, "Space: Check/Uncheck | Enter/C: Confirm | Q/Esc: Quit")
+            stdscr.addstr(1, 0, "Space: Toggle | A: All | N: None | Enter/C: Confirm | Q/Esc: Quit")
             
+            # Print Formats
             for idx, fmt in enumerate(formats):
-                if idx + 3 >= h - 1: break
+                if idx + 3 >= h - 4: break
                 marker = "[X]" if fmt in selected_formats else "[ ]"
                 display_str = f"{marker} {fmt}"
                 if idx == current_row:
@@ -408,13 +472,41 @@ def run_tui(target_dir, recursive):
                 else:
                     stdscr.addstr(idx + 3, 0, display_str)
             
+            # Print Modifiers Section
+            mod_start_y = len(formats) + 4
+            if mod_start_y < h:
+                stdscr.addstr(mod_start_y, 0, "--- Modifiers ---")
+                for m_idx, mod in enumerate(modifiers):
+                    row_idx = len(formats) + m_idx
+                    if mod_start_y + 1 + m_idx >= h: break
+                    
+                    mod_marker = "[X]" if mod["active"] else "[ ]"
+                    mod_str = f"{mod_marker} {mod['label']}"
+                    
+                    if row_idx == current_row:
+                        stdscr.attron(curses.A_REVERSE)
+                        stdscr.addstr(mod_start_y + 1 + m_idx, 0, mod_str[:w-1])
+                        stdscr.attroff(curses.A_REVERSE)
+                    else:
+                        stdscr.addstr(mod_start_y + 1 + m_idx, 0, mod_str[:w-1])
+            
             key = stdscr.getch()
-            if key == curses.KEY_UP and current_row > 0: current_row -= 1
-            elif key == curses.KEY_DOWN and current_row < len(formats) - 1: current_row += 1
+            if key == curses.KEY_UP and current_row > 0: 
+                current_row -= 1
+            elif key == curses.KEY_DOWN and current_row < total_rows - 1: 
+                current_row += 1
             elif key == ord(' '):
-                fmt = formats[current_row]
-                if fmt in selected_formats: selected_formats.remove(fmt)
-                else: selected_formats.add(fmt)
+                if current_row < len(formats):
+                    fmt = formats[current_row]
+                    if fmt in selected_formats: selected_formats.remove(fmt)
+                    else: selected_formats.add(fmt)
+                else:
+                    m_idx = current_row - len(formats)
+                    modifiers[m_idx]["active"] = not modifiers[m_idx]["active"]
+            elif key in [ord('a'), ord('A')]:
+                selected_formats.update(formats)
+            elif key in [ord('n'), ord('N')]:
+                selected_formats.clear()
             elif key in [10, 13, ord('c'), ord('C')]:
                 break
             elif key in [27, ord('q'), ord('Q')]:
@@ -422,29 +514,51 @@ def run_tui(target_dir, recursive):
         
         if not selected_formats: return []
         
+        use_recursive = modifiers[0]["active"]
+        filter_non_hevc = modifiers[1]["active"]
+
         # Scan phase
         stdscr.clear()
         stdscr.addstr(0, 0, "Scanning files... Please wait.")
+        if filter_non_hevc:
+            stdscr.addstr(1, 0, "(Non-HEVC filter active. Probing files, this may take a moment...)")
         stdscr.refresh()
         
         found_files = []
-        if recursive:
+        
+        def process_found_file(p):
+            codec = "---"
+            if filter_non_hevc:
+                try:
+                    stdscr.move(3, 0)
+                    stdscr.clrtoeol()
+                    _, w = stdscr.getmaxyx()
+                    display_name = os.path.basename(p)
+                    safe_w = max(0, w - 15)
+                    stdscr.addstr(3, 0, f"Checking: {display_name[:safe_w]}")
+                    stdscr.refresh()
+                except Exception: pass
+                
+                c, is_h = get_video_codec(p)
+                if is_h: return
+                codec = c
+
+            try: size = os.path.getsize(p)
+            except OSError: size = 0
+            found_files.append({"path": p, "size": size, "checked": False, "codec": codec})
+
+        if use_recursive:
             for root, _, files in os.walk(target_dir):
                 for f in files:
                     if os.path.splitext(f)[1].lower() in selected_formats:
-                        p = os.path.join(root, f)
-                        try: size = os.path.getsize(p)
-                        except OSError: size = 0
-                        found_files.append({"path": p, "size": size, "checked": False})
+                        process_found_file(os.path.join(root, f))
         else:
             try:
                 for f in os.listdir(target_dir):
                     if os.path.splitext(f)[1].lower() in selected_formats:
                         p = os.path.join(target_dir, f)
                         if os.path.isfile(p):
-                            try: size = os.path.getsize(p)
-                            except OSError: size = 0
-                            found_files.append({"path": p, "size": size, "checked": False})
+                            process_found_file(p)
             except FileNotFoundError: pass
         
         if not found_files: return []
@@ -467,7 +581,7 @@ def run_tui(target_dir, recursive):
                 return None
 
             stdscr.addstr(0, 0, "=== Screen 2: Select Files to Process ===")
-            stdscr.addstr(1, 0, "Space: Check/Uncheck | A: All | N: None | S: Toggle Sort | C: Confirm | Q: Quit")
+            stdscr.addstr(1, 0, "Space: Check | A: All | N: None | S: Sort | F: File Info | C: Confirm | Q: Quit")
             sort_str = "Sort: Largest Size First" if sort_by_size else "Sort: Alphabetical (A-Z)"
             stdscr.addstr(2, 0, sort_str)
             
@@ -478,10 +592,15 @@ def run_tui(target_dir, recursive):
                 item = found_files[idx]
                 marker = "[X]" if item['checked'] else "[ ]"
                 filename = os.path.basename(item['path'])
-                size_str = format_size(item['size'])
+                size_str = format_size(item['size']).rjust(10)
+                codec_str = item['codec'].ljust(6)
                 
-                display_text = f"{marker} {filename} ({size_str})"
-                if len(display_text) > w - 1: display_text = display_text[:w-4] + "..."
+                # Calculate available width for filename (Marker:3 + Div:3 + Size:10 + Div:3 + Codec:6 + Div:3 = 28 chars)
+                avail_w = w - 28
+                if len(filename) > avail_w: 
+                    filename = filename[:max(0, avail_w-3)] + "..."
+                
+                display_text = f"{marker} | {size_str} | {codec_str} | {filename}"
                 
                 if idx == current_row:
                     stdscr.attron(curses.A_REVERSE)
@@ -505,6 +624,8 @@ def run_tui(target_dir, recursive):
                 for f in found_files: f['checked'] = True
             elif key in [ord('n'), ord('N')]:
                 for f in found_files: f['checked'] = False
+            elif key in [ord('f'), ord('F')]:
+                show_file_info_popup(stdscr, found_files[current_row]['path'])
             elif key in [ord('s'), ord('S')]:
                 sort_by_size = not sort_by_size
                 if sort_by_size: found_files.sort(key=lambda x: x['size'], reverse=True)
