@@ -17,11 +17,17 @@ import time
 import curses
 
 # --- Version History ---
-__version__ = "8.6.2"
+__version__ = "8.6.3"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.6.3 feat(core/ui): Persistent Probe Cache & A/V/S Columns
+        - Introduced a persistent CSV database (~/.hvec/probe.csv) to cache ffprobe results.
+        - The cache records Filepath, Size, MTime, Video Codec, Audio Codecs, and Subtitles.
+        - Bypasses ffprobe entirely if a file's size and modification time match the cache.
+        - Expanded TUI Screen 2 into a 6-column layout displaying Video, Audio, and Sub streams.
+
 v8.6.2 feat(ui): TUI Recursive Scan, Columns, and File Info Overlay
         - Added 'Scan Subdirectories (Recursive)' toggle to TUI Screen 1.
         - Added Select All ('A') / None ('N') keybindings for format selection.
@@ -63,10 +69,14 @@ enforce_background_priority()
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm', '.iso')
 SUBTITLE_EXTENSIONS = ('.srt', '.ass', '.sub')
 
-DEFAULT_LOG_BASENAME = 'audit_loudness.csv'
 DEFAULT_LOG_DIR = os.path.expanduser('~/.hvec')
+DEFAULT_LOG_BASENAME = 'audit_loudness.csv'
 DEFAULT_LOG_PATH = os.path.join(DEFAULT_LOG_DIR, DEFAULT_LOG_BASENAME)
 CWD_LOG_PATH = os.path.abspath(DEFAULT_LOG_BASENAME)
+
+PROBE_CACHE_PATH = os.path.join(DEFAULT_LOG_DIR, 'probe.csv')
+PROBE_CACHE = {}
+
 TARGET_LOUDNESS = -23.0
 TARGET_TRUE_PEAK = -2.0
 TARGET_LRA = 7
@@ -97,22 +107,78 @@ SUBTITLE_CODEC_MAP = {
     'eia_608': 'EIA-608', 'dvb_subtitle': 'DVB'
 }
 
-# --- Helper Functions ---
-def get_video_codec(f):
-    if not os.path.exists(f): return "---", False
-    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', f]
+# --- Caching Functions ---
+def load_probe_cache():
+    if os.path.exists(PROBE_CACHE_PATH):
+        try:
+            with open(PROBE_CACHE_PATH, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    PROBE_CACHE[row['Filepath']] = {
+                        'size': row['Size'],
+                        'mtime': row['MTime'],
+                        'v': row['V'],
+                        'a': row['A'],
+                        's': row['S']
+                    }
+        except Exception: pass
+
+def append_to_probe_cache(filepath, size, mtime, v, a, s):
+    os.makedirs(os.path.dirname(PROBE_CACHE_PATH), exist_ok=True)
+    is_new = not os.path.exists(PROBE_CACHE_PATH) or os.path.getsize(PROBE_CACHE_PATH) == 0
     try:
-        out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip().lower()
-        if not out: return "---", False
-        out = out.split('\n')[0].strip()  # Grab first stream if multiple exist
-        return out, (out == 'hevc')
+        with open(PROBE_CACHE_PATH, 'a', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            if is_new:
+                writer.writerow(['Filepath', 'Size', 'MTime', 'V', 'A', 'S'])
+            writer.writerow([filepath, str(size), str(mtime), v, a, s])
+    except Exception: pass
+
+def probe_and_cache(p, size, mtime):
+    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name', '-of', 'json', p]
+    try:
+        out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+        data = json.loads(out)
+        v_codecs, a_codecs, s_codecs = [], [], []
+        
+        for stream in data.get('streams', []):
+            ctype = stream.get('codec_type')
+            cname = stream.get('codec_name', '?').lower()
+            if ctype == 'video':
+                v_codecs.append(cname)
+            elif ctype == 'audio':
+                a_codecs.append(cname)
+            elif ctype == 'subtitle':
+                if cname == 'subrip': cname = 'srt'
+                elif cname == 'hdmv_pgs_subtitle': cname = 'pgs'
+                elif cname == 'dvd_subtitle': cname = 'vobsub'
+                s_codecs.append(cname)
+        
+        v = v_codecs[0] if v_codecs else "---"
+        a = ",".join(list(dict.fromkeys(a_codecs))) if a_codecs else "---"
+        s = ",".join(list(dict.fromkeys(s_codecs))) if s_codecs else "---"
+        
+        append_to_probe_cache(p, size, mtime, v, a, s)
+        PROBE_CACHE[p] = {'size': str(size), 'mtime': str(mtime), 'v': v, 'a': a, 's': s}
+        return v, a, s
     except Exception:
-        return "---", False
+        return "---", "---", "---"
 
 def is_hevc(f):
-    _, is_h = get_video_codec(f)
-    return is_h
+    try:
+        stat = os.stat(f)
+        size = stat.st_size
+        mtime = str(stat.st_mtime)
+    except OSError:
+        return False
 
+    if f in PROBE_CACHE and PROBE_CACHE[f]['size'] == str(size) and PROBE_CACHE[f]['mtime'] == mtime:
+        return PROBE_CACHE[f]['v'].lower() == 'hevc'
+
+    v, _, _ = probe_and_cache(f, size, mtime)
+    return v.lower() == 'hevc'
+
+# --- Helper Functions ---
 def get_total_frames(file_path):
     if shutil.which('mediainfo'):
         cmd = ['mediainfo', '--Inform=Video;%FrameCount%', file_path]
@@ -521,31 +587,45 @@ def run_tui(target_dir, initial_recursive):
         stdscr.clear()
         stdscr.addstr(0, 0, "Scanning files... Please wait.")
         if filter_non_hevc:
-            stdscr.addstr(1, 0, "(Non-HEVC filter active. Probing files, this may take a moment...)")
+            stdscr.addstr(1, 0, "(Non-HEVC filter active. Probing new/uncached files...)")
         stdscr.refresh()
         
         found_files = []
         
         def process_found_file(p):
-            codec = "---"
-            if filter_non_hevc:
-                try:
-                    stdscr.move(3, 0)
-                    stdscr.clrtoeol()
-                    _, w = stdscr.getmaxyx()
-                    display_name = os.path.basename(p)
-                    safe_w = max(0, w - 15)
-                    stdscr.addstr(3, 0, f"Checking: {display_name[:safe_w]}")
-                    stdscr.refresh()
-                except Exception: pass
-                
-                c, is_h = get_video_codec(p)
-                if is_h: return
-                codec = c
+            try:
+                stat = os.stat(p)
+                size = stat.st_size
+                mtime = str(stat.st_mtime)
+            except OSError:
+                return
 
-            try: size = os.path.getsize(p)
-            except OSError: size = 0
-            found_files.append({"path": p, "size": size, "checked": False, "codec": codec})
+            v, a, s = "---", "---", "---"
+
+            # Check if file is perfectly cached
+            if p in PROBE_CACHE and PROBE_CACHE[p]['size'] == str(size) and PROBE_CACHE[p]['mtime'] == mtime:
+                v = PROBE_CACHE[p]['v']
+                a = PROBE_CACHE[p]['a']
+                s = PROBE_CACHE[p]['s']
+                if filter_non_hevc and v.lower() == 'hevc':
+                    return
+            else:
+                if filter_non_hevc:
+                    try:
+                        stdscr.move(3, 0)
+                        stdscr.clrtoeol()
+                        _, w = stdscr.getmaxyx()
+                        display_name = os.path.basename(p)
+                        safe_w = max(0, w - 15)
+                        stdscr.addstr(3, 0, f"Checking: {display_name[:safe_w]}")
+                        stdscr.refresh()
+                    except Exception: pass
+                    
+                    v, a, s = probe_and_cache(p, size, mtime)
+                    if v.lower() == 'hevc':
+                        return
+
+            found_files.append({"path": p, "size": size, "checked": False, "v": v, "a": a, "s": s})
 
         if use_recursive:
             for root, _, files in os.walk(target_dir):
@@ -592,15 +672,18 @@ def run_tui(target_dir, initial_recursive):
                 item = found_files[idx]
                 marker = "[X]" if item['checked'] else "[ ]"
                 filename = os.path.basename(item['path'])
-                size_str = format_size(item['size']).rjust(10)
-                codec_str = item['codec'].ljust(6)
                 
-                # Calculate available width for filename (Marker:3 + Div:3 + Size:10 + Div:3 + Codec:6 + Div:3 = 28 chars)
-                avail_w = w - 28
+                size_str = format_size(item['size']).rjust(10)
+                v_str = item['v'][:6].ljust(6)
+                a_str = item['a'][:12].ljust(12)
+                s_str = item['s'][:8].ljust(8)
+                
+                # Marker(4) + |(3) + Size(10) + |(3) + V(6) + |(3) + A(12) + |(3) + S(8) + |(3) = 55
+                avail_w = w - 55
                 if len(filename) > avail_w: 
                     filename = filename[:max(0, avail_w-3)] + "..."
                 
-                display_text = f"{marker} | {size_str} | {codec_str} | {filename}"
+                display_text = f"{marker} | {size_str} | {v_str} | {a_str} | {s_str} | {filename}"
                 
                 if idx == current_row:
                     stdscr.attron(curses.A_REVERSE)
@@ -645,6 +728,9 @@ def run_tui(target_dir, initial_recursive):
 # --- Main Logic ---
 def main():
     print(f",hvec v{__version__}")
+    
+    # Load the global persistent cache so it's ready for TUI and batch skips
+    load_probe_cache()
 
     parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel QSV.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -E\n  ,hvec -i /videos/ -D -E -R\n  ,hvec -T -i /recordings/\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.csv")
 
