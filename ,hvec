@@ -17,11 +17,17 @@ import time
 import curses
 
 # --- Version History ---
-__version__ = "8.6.3"
+__version__ = "8.6.4"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.6.4 feat(audio): Batch Normalization Profile & Prompts
+        - Added `--profile normalize` preset to quickly normalize audio while remuxing
+          video and seamlessly replacing the original files (-N -r -S -D).
+        - Added batch-memory for multi-channel audio handling, allowing users to
+          apply their [A]dd/[R]eplace/[S]kip choice to the entire remaining queue.
+
 v8.6.3 feat(core/ui): Persistent Probe Cache & A/V/S Columns
         - Introduced a persistent CSV database (~/.hvec/probe.csv) to cache ffprobe results.
         - The cache records Filepath, Size, MTime, Video Codec, Audio Codecs, and Subtitles.
@@ -744,7 +750,7 @@ def main():
     io_group.add_argument("-R", "--recursive", action="store_true", help="Process subdirectories.")
 
     proc_group = parser.add_argument_group('Processing / Quality')
-    proc_group.add_argument("--profile", choices=['upgrade'], help="Presets: 'upgrade' (Recursive, Sync, Delete, Skip HEVC, Rename x264).")
+    proc_group.add_argument("--profile", choices=['upgrade', 'normalize'], help="Presets: 'upgrade', 'normalize'.")
     proc_group.add_argument("-Q", "--quality", type=int, default=24, help="Set QSV quality (1-51).")
     proc_group.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.")
     proc_group.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
@@ -785,10 +791,18 @@ def main():
         args.smart_audio = True
         do_x264_rename = True
         if args.verbose: print("Info: Applied 'upgrade' profile.")
+    elif args.profile == 'normalize':
+        if not args.input: args.input = "."
+        if args.normalize is None:
+            args.normalize = True
+        args.remux = True
+        args.sync_filename = True
+        args.delete = True
+        if args.verbose: print("Info: Applied 'normalize' profile.")
 
-    if not args.input and not args.tui and args.profile != 'upgrade':
+    if not args.input and not args.tui and args.profile not in ['upgrade', 'normalize']:
         parser.print_help()
-        print("\nError: -i/--input is required (unless using --profile upgrade or -T/--tui).")
+        print("\nError: -i/--input is required (unless using a --profile or -T/--tui).")
         sys.exit(1)
 
     if args.verbose: print("Info: Verbose mode enabled.")
@@ -866,6 +880,8 @@ def main():
     # --- MAIN LOOP ---
     failed_files = []
     is_batch_mode = len(files_to_process) > 1
+    batch_normalize_mode = None
+    
     with tqdm(total=len(files_to_process), desc="Total", unit="file", position=0, dynamic_ncols=True, disable=not is_batch_mode) as batch_bar:
         for i, input_file in enumerate(files_to_process, 1):
             tqdm.write(f"\n--- Processing: {os.path.basename(input_file)} ---")
@@ -1000,11 +1016,22 @@ def main():
             if is_normalize_enabled and not args.filter_streams:
                 if any(s.get('channels', 0) > 2 for s in audio_streams):
                     tqdm.write("\nInput has multi-channel audio.")
-                    try:
-                        response = input("  [A]dd as new default, [R]eplace, [S]kip: ").lower().strip()
-                        if response == 'a': normalize_mode = 'add'
-                        elif response == 's': is_normalize_enabled = False
-                    except KeyboardInterrupt: sys.exit(1)
+                    if batch_normalize_mode is not None:
+                        tqdm.write(f"  [A]dd as new default, [R]eplace, [S]kip: {batch_normalize_mode.upper()} (Auto-applied)")
+                        if batch_normalize_mode == 'a': normalize_mode = 'add'
+                        elif batch_normalize_mode == 's': is_normalize_enabled = False
+                    else:
+                        try:
+                            response = input("  [A]dd as new default, [R]eplace, [S]kip: ").lower().strip()
+                            if response == 'a': normalize_mode = 'add'
+                            elif response == 's': is_normalize_enabled = False
+                            else: response = 'r'
+                            
+                            if is_batch_mode and i < len(files_to_process):
+                                save_resp = input("  Apply this choice to the remaining files in the queue? [y/N]: ").lower().strip()
+                                if save_resp == 'y':
+                                    batch_normalize_mode = response
+                        except KeyboardInterrupt: sys.exit(1)
 
             filter_string_for_complex = None
             filter_string_for_simple = None
