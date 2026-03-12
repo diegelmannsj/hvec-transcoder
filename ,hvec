@@ -17,11 +17,17 @@ import time
 import curses
 
 # --- Version History ---
-__version__ = "8.6.4"
+__version__ = "8.6.5"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.6.5 feat(subs): Automatic EIA-608 Subtitle Extraction
+        - Added automatic detection and extraction of hidden ATSC EIA-608 closed
+          captions from raw Live TV `.ts` streams using `lavfi`.
+        - Safely handles complex file paths by generating temporary symlinks.
+        - Automatically embeds extracted captions into the final `.mkv` as an SRT track.
+
 v8.6.4 feat(audio): Batch Normalization Profile & Prompts
         - Added `--profile normalize` preset to quickly normalize audio while remuxing
           video and seamlessly replacing the original files (-N -r -S -D).
@@ -979,10 +985,45 @@ def main():
 
             if is_transcode_op and not is_avi: ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv'])
 
+            # --- Extract Embedded EIA-608 Captions from .ts Files ---
+            temp_files_to_cleanup = []
+            extracted_ts_subs = False
+            
+            if input_file.lower().endswith('.ts'):
+                tqdm.write("Info: Checking for embedded EIA-608 closed captions...")
+                ts_srt_temp = f"/tmp/cc_extract_{os.getpid()}_{i}.srt"
+                ts_symlink_temp = f"/tmp/cc_link_{os.getpid()}_{i}.ts"
+                try:
+                    # Create a safe symlink in /tmp to bypass lavfi's issue with spaces/apostrophes
+                    if os.path.exists(ts_symlink_temp): os.remove(ts_symlink_temp)
+                    os.symlink(os.path.abspath(input_file), ts_symlink_temp)
+
+                    extract_cmd = ['ffmpeg', '-hide_banner', '-y', '-f', 'lavfi', '-i', f'movie={ts_symlink_temp}[out+subcc]', '-map', '0:1', ts_srt_temp]
+                    subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    # Verify extraction succeeded and file isn't just an empty header (usually > 50 bytes if valid)
+                    if os.path.exists(ts_srt_temp) and os.path.getsize(ts_srt_temp) > 50:
+                        tqdm.write("  -> Successfully extracted hidden captions to SRT!")
+                        extracted_ts_subs = True
+                        temp_files_to_cleanup.append(ts_srt_temp)
+                    else:
+                        tqdm.write("  -> No embedded captions found.")
+                        if os.path.exists(ts_srt_temp): os.remove(ts_srt_temp)
+                except Exception as e:
+                    tqdm.write(f"Warning: Closed caption extraction failed: {e}", file=sys.stderr)
+                finally:
+                    if os.path.exists(ts_symlink_temp): os.remove(ts_symlink_temp)
+
+            # --- Gather External Subtitles ---
             external_sub_files = []
             if args.subs:
                 for sub_file in args.subs:
                     if os.path.exists(sub_file): external_sub_files.append(os.path.abspath(sub_file))
+            
+            # Append newly extracted .ts captions if they exist
+            if extracted_ts_subs:
+                external_sub_files.append(ts_srt_temp)
+
             if len(files_to_process) == 1:
                 abs_input_file = os.path.abspath(input_file); input_dir = os.path.dirname(abs_input_file); input_base = os.path.splitext(os.path.basename(input_file))[0]
                 if args.verbose: tqdm.write("Info: Scanning for sidecar subtitles...")
@@ -1167,6 +1208,12 @@ def main():
                             append_to_loudness_log(final_output_file, post_norm_data, 0.0, active_log_file)
                         except Exception as e:
                             tqdm.write(f"Warning: Could not update loudness log: {e}", file=sys.stderr)
+
+            # Cleanup any temporary subtitle extraction files
+            for tf in temp_files_to_cleanup:
+                if os.path.exists(tf):
+                    try: os.remove(tf)
+                    except OSError: pass
 
             if is_batch_mode:
                 batch_bar.update(1)
