@@ -17,11 +17,16 @@ import time
 import curses
 
 # --- Version History ---
-__version__ = "8.6.5"
+__version__ = "8.6.6"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.6.6 fix(qsv): Hardware Pipeline Scaling Fix
+        - Removed `-hwaccel_output_format qsv` to prevent filtergraph crashes
+          (`auto_scale_0`) when processing Live TV `.ts` streams that contain
+          dynamic resolution changes or corrupted frames.
+
 v8.6.5 feat(subs): Automatic EIA-608 Subtitle Extraction
         - Added automatic detection and extraction of hidden ATSC EIA-608 closed
           captions from raw Live TV `.ts` streams using `lavfi`.
@@ -983,7 +988,7 @@ def main():
                 if is_transcode_op:
                     ffmpeg_cmd.extend(['-init_hw_device', 'qsv=hw', '-filter_hw_device', 'hw'])
 
-            if is_transcode_op and not is_avi: ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv'])
+            if is_transcode_op and not is_avi: ffmpeg_cmd.extend(['-hwaccel', 'qsv'])
 
             # --- Extract Embedded EIA-608 Captions from .ts Files ---
             temp_files_to_cleanup = []
