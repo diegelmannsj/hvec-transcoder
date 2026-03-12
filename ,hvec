@@ -17,11 +17,15 @@ import time
 import curses
 
 # --- Version History ---
-__version__ = "8.6.6"
+__version__ = "8.6.7"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.6.7 fix(qsv): Force nv12 Output Format
+        - Explicitly set `-hwaccel_output_format nv12` to allow FFmpeg to handle
+          dynamic resolution changes and glitches in Live TV `.ts` streams.
+
 v8.6.6 fix(qsv): Hardware Pipeline Scaling Fix
         - Removed `-hwaccel_output_format qsv` to prevent filtergraph crashes
           (`auto_scale_0`) when processing Live TV `.ts` streams that contain
@@ -38,29 +42,6 @@ v8.6.4 feat(audio): Batch Normalization Profile & Prompts
           video and seamlessly replacing the original files (-N -r -S -D).
         - Added batch-memory for multi-channel audio handling, allowing users to
           apply their [A]dd/[R]eplace/[S]kip choice to the entire remaining queue.
-
-v8.6.3 feat(core/ui): Persistent Probe Cache & A/V/S Columns
-        - Introduced a persistent CSV database (~/.hvec/probe.csv) to cache ffprobe results.
-        - The cache records Filepath, Size, MTime, Video Codec, Audio Codecs, and Subtitles.
-        - Bypasses ffprobe entirely if a file's size and modification time match the cache.
-        - Expanded TUI Screen 2 into a 6-column layout displaying Video, Audio, and Sub streams.
-
-v8.6.2 feat(ui): TUI Recursive Scan, Columns, and File Info Overlay
-        - Added 'Scan Subdirectories (Recursive)' toggle to TUI Screen 1.
-        - Added Select All ('A') / None ('N') keybindings for format selection.
-        - Redesigned TUI Screen 2 file list into rigid, fixed-width columns.
-        - Added 'F' (File Info) keybinding to Screen 2 to display a centered 
-          overlay window detailing the selected file's A/V/S streams and codecs.
-
-v8.6.1 feat(ui): TUI Non-HEVC Filter
-        - Added a modifier toggle to Screen 1 of the TUI to strictly filter out
-          files that are already HEVC.
-        - Implemented live-updating terminal status during the ffprobe scan phase.
-
-v8.6.0 feat(ui/core): Interactive TUI and QSV Transition
-        - Transitioned from VAAPI to Intel Quick Sync (QSV) for optimal Alder Lake-N performance.
-        - Replaced `-hwaccel vaapi` with `-hwaccel qsv` and `hevc_vaapi` with `hevc_qsv`.
-        - Added `-T` / `--tui` flag for an interactive curses-based file selection interface.
 """
 
 # --- PRIORITY CONTROL (Python Native) ---
@@ -988,7 +969,9 @@ def main():
                 if is_transcode_op:
                     ffmpeg_cmd.extend(['-init_hw_device', 'qsv=hw', '-filter_hw_device', 'hw'])
 
-            if is_transcode_op and not is_avi: ffmpeg_cmd.extend(['-hwaccel', 'qsv'])
+            if is_transcode_op and not is_avi:
+                # Explicitly force nv12 output format to handle Dynamic Resolution changes in Live TV streams.
+                ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', 'nv12'])
 
             # --- Extract Embedded EIA-608 Captions from .ts Files ---
             temp_files_to_cleanup = []
