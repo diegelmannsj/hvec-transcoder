@@ -15,6 +15,7 @@ from typing import Dict, Any, List, Tuple
 import csv
 import time
 import curses
+import builtins
 
 # --- Version History ---
 __version__ = "8.6.8"
@@ -22,8 +23,9 @@ __version__ = "8.6.8"
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
-v8.6.8 feat(cli): Assume Yes Flag
-        - Added `-Y` / `--assume-yes` flag to bypass the confirmation prompt for non-interactive and background scheduling.
+v8.6.8 feat(cli): Assume Yes Option
+        - Added `--assume-yes` / `-Y` flag to automatically answer 'yes' to all interactive prompts.
+        - The current version is now always printed first, regardless of the flags/options.
 
 v8.6.7 fix(qsv): Force nv12 Output Format
         - Explicitly set `-hwaccel_output_format nv12` to allow FFmpeg to handle
@@ -43,509 +45,1174 @@ v8.6.5 feat(subs): Automatic EIA-608 Subtitle Extraction
 v8.6.4 feat(audio): Batch Normalization Profile & Prompts
         - Added `--profile normalize` preset to quickly normalize audio while remuxing
           video and seamlessly replacing the original files (-N -r -S -D).
-        - Added batch-memory for multi-channel audio normalization to prevent
-          repeatedly prompting the user on every file in a directory.
-
-v8.6.3 fix(mkvmerge): Subtitle Track Naming
-        - Adjusted mkvmerge metadata arguments to properly label extracted SRT
-          subtitle tracks as "English" rather than leaving them undefined.
-
-v8.6.2 feat(audio): Loudness Logging
-        - Introduced CSV-based loudness logging for audio normalization passes.
-        - Tracks pre- and post-normalization LUFS/True Peak values.
-
-v8.6.1 fix(core): Metadata Passthrough
-        - Refined metadata and chapter passthrough parameters for cleaner outputs
-          when remuxing from `.ts` and `.mkv` sources.
-
-v8.6.0 feat(core): QSV Hardware Acceleration
-        - Fully integrated Intel Quick Sync Video (QSV) for all h264/hevc decoding
-          and encoding operations, optimizing performance for N150 processors.
+        - Added batch-memory for multi-channel audio handling, allowing users to
+          apply their [A]dd/[R]eplace/[S]kip choice to the entire remaining queue.
 """
 
-# --- Configuration & Constants ---
-LOG_DIR = "/storage/megawd/tv/.logs"
+# --- PRIORITY CONTROL (Python Native) ---
+def enforce_background_priority():
+    if '--no-nice' in sys.argv:
+        return
+    if not sys.platform.startswith('linux'):
+        return
+    try:
+        current_nice = os.nice(0)
+        if current_nice < 19:
+            print("Auto-adjusting priority: Switching to Background Mode (Nice 19, IO Idle)...")
+            sys.stdout.flush()
+            new_args = ['nice', '-n', '19', 'ionice', '-c', '3'] + sys.argv
+            os.execvp('nice', new_args)
+    except Exception as e:
+        print(f"Warning: Could not auto-adjust priority: {e}", file=sys.stderr)
+
+enforce_background_priority()
+
+
+# --- Constants ---
+VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm', '.iso')
+SUBTITLE_EXTENSIONS = ('.srt', '.ass', '.sub')
+
+DEFAULT_LOG_DIR = os.path.expanduser('~/.hvec')
+DEFAULT_LOG_BASENAME = 'audit_loudness.csv'
+DEFAULT_LOG_PATH = os.path.join(DEFAULT_LOG_DIR, DEFAULT_LOG_BASENAME)
+CWD_LOG_PATH = os.path.abspath(DEFAULT_LOG_BASENAME)
+
+PROBE_CACHE_PATH = os.path.join(DEFAULT_LOG_DIR, 'probe.csv')
+PROBE_CACHE = {}
+
 TARGET_LOUDNESS = -23.0
 TARGET_TRUE_PEAK = -2.0
+TARGET_LRA = 7
 
-# Colors for terminal output
-RED = "\033[91m"
+# --- ANSI Colors ---
 GREEN = "\033[92m"
-YELLOW = "\033[93m"
-CYAN = "\033[96m"
+RED = "\033[91m"
 RESET = "\033[0m"
 
-def check_dependencies():
-    """Ensure required external tools are installed."""
-    deps = ['ffmpeg', 'ffprobe', 'mkvmerge']
-    missing = []
-    for dep in deps:
-        if shutil.which(dep) is None:
-            missing.append(dep)
-    if missing:
-        tqdm.write(f"{RED}Error: Missing required dependencies: {', '.join(missing)}{RESET}", file=sys.stderr)
-        sys.exit(1)
+ISO_639_MAP = {
+    'eng': 'English', 'jpn': 'Japanese', 'und': 'Undetermined',
+    'fra': 'French', 'fre': 'French', 'deu': 'German', 'ger': 'German',
+    'ita': 'Italian', 'spa': 'Spanish', 'kor': 'Korean',
+    'chi': 'Chinese', 'zho': 'Chinese', 'rus': 'Russian',
+    'por': 'Portuguese', 'vie': 'Vietnamese', 'tha': 'Thai',
+    'swe': 'Swedish', 'nor': 'Norwegian', 'dan': 'Danish',
+    'fin': 'Finnish', 'nld': 'Dutch', 'dut': 'Dutch',
+    'pol': 'Polish', 'hin': 'Hindi', 'tur': 'Turkish',
+    'ara': 'Arabic', 'heb': 'Hebrew', 'cze': 'Czech', 'ces': 'Czech',
+    'gre': 'Greek', 'ell': 'Greek', 'hun': 'Hungarian', 'ind': 'Indonesian',
+    'msa': 'Malay', 'may': 'Malay', 'rum': 'Romanian', 'ron': 'Romanian',
+    'ukr': 'Ukrainian'
+}
 
-def run_command(cmd: List[str], desc: str = "Processing", show_output: bool = False, is_batch: bool = False) -> bool:
-    """Run a shell command with a tqdm progress bar or live output."""
-    try:
-        if show_output:
-            tqdm.write(f"{CYAN}--- {desc} ---{RESET}")
-            subprocess.run(cmd, check=True)
-            return True
-        else:
-            # For ffmpeg/mkvmerge, we could parse progress, but for simplicity we show a spinner or indeterminate bar
-            # unless it's a fast operation
-            with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
-                with tqdm(total=100, desc=desc, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}", leave=not is_batch) as pbar:
-                    # Very basic simulated progress for indeterminate tasks
-                    for line in proc.stdout:
-                        # If we wanted to parse FFmpeg time, we'd do it here. For now, just step the bar slightly to show activity.
-                        pbar.update(0.1)
-                        if pbar.n >= 99:
-                            pbar.n = 0 
-                            pbar.refresh()
-                proc.wait()
-                if proc.returncode != 0:
-                    tqdm.write(f"{RED}Command failed with exit code {proc.returncode}{RESET}", file=sys.stderr)
-                    return False
-            return True
-    except subprocess.CalledProcessError as e:
-        tqdm.write(f"{RED}Error executing {cmd[0]}: {e}{RESET}", file=sys.stderr)
-        return False
-    except FileNotFoundError:
-        tqdm.write(f"{RED}Command not found: {cmd[0]}{RESET}", file=sys.stderr)
-        return False
-    except KeyboardInterrupt:
-        tqdm.write(f"\n{RED}Process interrupted by user.{RESET}", file=sys.stderr)
-        sys.exit(1)
+SUBTITLE_CODEC_MAP = {
+    'subrip': 'SRT', 'hdmv_pgs_subtitle': 'PGS', 'dvd_subtitle': 'VobSub',
+    'ass': 'ASS', 'ssa': 'SSA', 'mov_text': 'MovText', 'webvtt': 'WebVTT',
+    'eia_608': 'EIA-608', 'dvb_subtitle': 'DVB'
+}
 
-def get_media_info(file_path: str) -> Dict[str, Any]:
-    """Use ffprobe to get media streams information."""
-    cmd = [
-        'ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', file_path
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        tqdm.write(f"{RED}Error running ffprobe on {file_path}: {e}{RESET}", file=sys.stderr)
-        return {}
-
-def analyze_audio_loudness(file_path: str, stream_index: int) -> Dict[str, float]:
-    """Analyze audio stream for LUFS and True Peak."""
-    tqdm.write(f"{CYAN}Analyzing audio stream #{stream_index} for loudness...{RESET}")
-    cmd = [
-        'ffmpeg', '-hide_banner', '-i', file_path, '-map', f'0:{stream_index}',
-        '-af', 'ebur128=framelog=verbose:peak=true', '-f', 'null', '-'
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        output = result.stderr
-        
-        # Parse the output
-        i_match = re.search(r'I:\s+(-?\d+\.\d+)\s+LUFS', output)
-        tp_match = re.search(r'True peak:\s+(-?\d+\.\d+)\s+dBTP', output)
-        lra_match = re.search(r'LRA:\s+(\d+\.\d+)\s+LU', output)
-        thresh_match = re.search(r'Threshold:\s+(-?\d+\.\d+)\s+LUFS', output)
-
-        if i_match and tp_match:
-            return {
-                'i': float(i_match.group(1)),
-                'tp': float(tp_match.group(1)),
-                'lra': float(lra_match.group(1)) if lra_match else 0.0,
-                'thresh': float(thresh_match.group(1)) if thresh_match else 0.0
-            }
-        else:
-            tqdm.write(f"{YELLOW}Could not parse loudness data.{RESET}")
-            return {}
-    except subprocess.CalledProcessError as e:
-         tqdm.write(f"{RED}Error analyzing audio: {e}{RESET}", file=sys.stderr)
-         return {}
-
-def append_to_loudness_log(file_name: str, pre_data: Dict[str, float], post_data: Dict[str, float], log_file: str):
-    """Append loudness data to CSV log."""
-    file_exists = os.path.isfile(log_file)
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    
-    with open(log_file, mode='a', newline='') as f:
-        fieldnames = ['Timestamp', 'Filename', 'Pre_I(LUFS)', 'Pre_TP(dBTP)', 'Pre_LRA', 'Post_I(LUFS)', 'Post_TP(dBTP)', 'Post_LRA']
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        
-        if not file_exists:
-            writer.writeheader()
-            
-        writer.writerow({
-            'Timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-            'Filename': os.path.basename(file_name),
-            'Pre_I(LUFS)': pre_data.get('i', ''),
-            'Pre_TP(dBTP)': pre_data.get('tp', ''),
-            'Pre_LRA': pre_data.get('lra', ''),
-            'Post_I(LUFS)': post_data.get('i', ''),
-            'Post_TP(dBTP)': post_data.get('tp', ''),
-            'Post_LRA': post_data.get('lra', '')
-        })
-
-def extract_eia608_subtitles(input_file: str, temp_srt: str) -> bool:
-    """Extract EIA-608 closed captions to an SRT file using lavfi."""
-    tqdm.write(f"{CYAN}Checking for embedded EIA-608 captions...{RESET}")
-    # Create symlink to handle bad paths
-    sym_path = f"/tmp/hvec_temp_{os.getpid()}.ts"
-    try:
-        os.symlink(os.path.abspath(input_file), sym_path)
-    except OSError as e:
-         tqdm.write(f"{YELLOW}Failed to create symlink for CC extraction: {e}{RESET}")
-         sym_path = input_file
-
-    cmd = [
-        'ffmpeg', '-y', '-hide_banner', '-f', 'lavfi',
-        '-i', f'movie={sym_path}[out0+subcc]',
-        '-map', '0:1', temp_srt
-    ]
-    
-    success = False
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0 and os.path.exists(temp_srt) and os.path.getsize(temp_srt) > 100:
-            tqdm.write(f"{GREEN}Successfully extracted EIA-608 captions.{RESET}")
-            success = True
-        else:
-            tqdm.write(f"{YELLOW}No EIA-608 captions found or extraction failed.{RESET}")
-    except Exception as e:
-        tqdm.write(f"{YELLOW}Exception during CC extraction: {e}{RESET}")
-    finally:
-        if sym_path != input_file and os.path.exists(sym_path):
-            os.remove(sym_path)
-            
-    return success
-
-def setup_permissions(path: str):
-    """Set correct ownership and permissions for the output file."""
-    try:
-        # Set 664 permissions
-        os.chmod(path, 0o664)
-        # Attempt to set group to 'media' (if it exists)
+# --- Caching Functions ---
+def load_probe_cache():
+    if os.path.exists(PROBE_CACHE_PATH):
         try:
-            media_gid = grp.getgrnam('media').gr_gid
-            os.chown(path, -1, media_gid)
-        except KeyError:
-            pass # Group 'media' doesn't exist, ignore
-    except OSError as e:
-        tqdm.write(f"{YELLOW}Warning: Could not set permissions on {path}: {e}{RESET}")
+            with open(PROBE_CACHE_PATH, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    PROBE_CACHE[row['Filepath']] = {
+                        'size': row['Size'],
+                        'mtime': row['MTime'],
+                        'v': row['V'],
+                        'a': row['A'],
+                        's': row['S']
+                    }
+        except Exception: pass
 
+def append_to_probe_cache(filepath, size, mtime, v, a, s):
+    os.makedirs(os.path.dirname(PROBE_CACHE_PATH), exist_ok=True)
+    is_new = not os.path.exists(PROBE_CACHE_PATH) or os.path.getsize(PROBE_CACHE_PATH) == 0
+    try:
+        with open(PROBE_CACHE_PATH, 'a', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            if is_new:
+                writer.writerow(['Filepath', 'Size', 'MTime', 'V', 'A', 'S'])
+            writer.writerow([filepath, str(size), str(mtime), v, a, s])
+    except Exception: pass
+
+def probe_and_cache(p, size, mtime):
+    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name', '-of', 'json', p]
+    try:
+        out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+        data = json.loads(out)
+        v_codecs, a_codecs, s_codecs = [], [], []
+        
+        for stream in data.get('streams', []):
+            ctype = stream.get('codec_type')
+            cname = stream.get('codec_name', '?').lower()
+            if ctype == 'video':
+                v_codecs.append(cname)
+            elif ctype == 'audio':
+                a_codecs.append(cname)
+            elif ctype == 'subtitle':
+                if cname == 'subrip': cname = 'srt'
+                elif cname == 'hdmv_pgs_subtitle': cname = 'pgs'
+                elif cname == 'dvd_subtitle': cname = 'vobsub'
+                s_codecs.append(cname)
+        
+        v = v_codecs[0] if v_codecs else "---"
+        a = ",".join(list(dict.fromkeys(a_codecs))) if a_codecs else "---"
+        s = ",".join(list(dict.fromkeys(s_codecs))) if s_codecs else "---"
+        
+        append_to_probe_cache(p, size, mtime, v, a, s)
+        PROBE_CACHE[p] = {'size': str(size), 'mtime': str(mtime), 'v': v, 'a': a, 's': s}
+        return v, a, s
+    except Exception:
+        return "---", "---", "---"
+
+def is_hevc(f):
+    try:
+        stat = os.stat(f)
+        size = stat.st_size
+        mtime = str(stat.st_mtime)
+    except OSError:
+        return False
+
+    if f in PROBE_CACHE and PROBE_CACHE[f]['size'] == str(size) and PROBE_CACHE[f]['mtime'] == mtime:
+        return PROBE_CACHE[f]['v'].lower() == 'hevc'
+
+    v, _, _ = probe_and_cache(f, size, mtime)
+    return v.lower() == 'hevc'
+
+# --- Helper Functions ---
+def get_total_frames(file_path):
+    if shutil.which('mediainfo'):
+        cmd = ['mediainfo', '--Inform=Video;%FrameCount%', file_path]
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return int(result.stdout.strip())
+        except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+            pass
+
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=duration,avg_frame_rate', '-of', 'json', file_path]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        data = json.loads(result.stdout)['streams'][0]
+        if 'duration' not in data or 'avg_frame_rate' not in data: return None
+        duration, fr_str = float(data['duration']), data['avg_frame_rate']
+        if '/' in fr_str:
+            n, d = map(int, fr_str.split('/')); frame_rate = n / d if d != 0 else 0
+        else: frame_rate = float(fr_str)
+        if duration <= 0 or frame_rate <= 0: return None
+        return int(duration * frame_rate)
+    except Exception: return None
+
+def get_stream_info(file_path):
+    ffprobe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', file_path]
+    try:
+        result = subprocess.run(ffprobe_cmd, check=True, capture_output=True, text=True)
+        return json.loads(result.stdout).get('streams', [])
+    except Exception:
+        tqdm.write(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr); return None
+
+def plan_stream_selection(streams):
+    streams_to_keep, streams_to_remove = [], []
+    for s in streams:
+        keep = False; stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); title = s.get('title', '').lower()
+        if stype == 'video' or (stype == 'audio' and (lang == 'eng' or 'commentary' in title or 'director' in title)) or (stype == 'subtitle' and lang == 'eng'): keep = True
+        if keep: streams_to_keep.append(s)
+        else: streams_to_remove.append(s)
+    return streams_to_keep, streams_to_remove
+
+def get_stream_display_string(s):
+    stype = s.get('codec_type', 'N/A').capitalize()
+    index = s['index']
+    
+    if stype.lower() in ['audio', 'subtitle']:
+        lang_code = s.get('tags', {}).get('language', 'und')
+        lang_name = ISO_639_MAP.get(lang_code, lang_code)
+        
+        extra_info = ""
+        if stype.lower() == 'subtitle':
+            codec = s.get('codec_name', '?')
+            codec_display = SUBTITLE_CODEC_MAP.get(codec, codec)
+            extra_info = f" [{codec_display}]"
+
+        if lang_name == lang_code:
+            return f"Stream #{index} ({stype}: {lang_code}{extra_info})"
+        else:
+            return f"Stream #{index} ({stype}: {lang_name} [{lang_code}]{extra_info})"
+            
+    return f"Stream #{index} ({stype})"
+
+def display_and_confirm_plan(s_keep, s_rem):
+    tqdm.write("\n--- Stream Selection Plan ---")
+    tqdm.write("KEPT:")
+    for s in s_keep: tqdm.write(f"  - {get_stream_display_string(s)}")
+    tqdm.write("\nREMOVED:")
+    for s in s_rem: tqdm.write(f"  - {get_stream_display_string(s)}")
+    try: return input("Proceed? [y/N]: ").lower().strip() == 'y'
+    except KeyboardInterrupt: return False
+
+def format_size(size_bytes):
+    if size_bytes is None or not isinstance(size_bytes, (int, float)) or size_bytes < 0: return "N/A"
+    if size_bytes == 0: return "0 B"
+    size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
+    try:
+        i = int(math.floor(math.log(size_bytes, 1024))); i = min(i, len(size_name) - 1)
+        p = math.pow(1024, i); s = round(size_bytes / p, 2)
+        return f"{s} {size_name[i]}"
+    except (ValueError, TypeError): return "N/A"
+
+def print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=False, measured_loudness=None):
+    tqdm.write("\n--- File Size Summary ---")
+    original_size_str = format_size(original_size_bytes); new_size_str = format_size(new_size_bytes)
+    tqdm.write(f"Original:   {original_size_str}"); tqdm.write(f"New:         {new_size_str}")
+    if original_size_bytes is not None and new_size_bytes is not None and original_size_bytes > 0:
+        difference_bytes = new_size_bytes - original_size_bytes; percentage_change = (difference_bytes / original_size_bytes) * 100
+        change_type = "increase" if difference_bytes >= 0 else "decrease"; difference_str = format_size(abs(difference_bytes))
+        tqdm.write(f"Difference: {difference_str} ({abs(percentage_change):.2f}% {change_type})")
+    else: tqdm.write("Difference: N/A")
+
+    if audio_normalized:
+        if measured_loudness is not None:
+            diff = TARGET_LOUDNESS - measured_loudness
+            color = GREEN if diff >= 0 else RED
+            direction = "Increase" if diff >= 0 else "Decrease"
+            tqdm.write(f"Audio:      Normalized (Original: {measured_loudness:.2f} LUFS | {color}{direction}: {abs(diff):.2f} dB{RESET})")
+        else:
+            tqdm.write(f"Audio:      Normalized (EBU R128 {TARGET_LOUDNESS} LUFS)")
+    tqdm.write("-------------------------")
+
+def find_video_files(p, r):
+    vids = [];
+    if r: [vids.extend([os.path.join(root, f) for f in files if f.lower().endswith(VIDEO_EXTENSIONS)]) for root, _, files in os.walk(p)]
+    else: vids.extend([os.path.join(p, f) for f in os.listdir(p) if f.lower().endswith(VIDEO_EXTENSIONS)])
+    return vids
+
+def print_ffmpeg_command(cmd):
+    tqdm.write("\nExecuting FFmpeg command (Dry Run):")
+    tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
+
+def run_loudnorm_analysis(input_file: str) -> Tuple[Dict[str, float] or None, float]:
+    start_time = time.time()
+    cmd = [
+        'ffmpeg', '-nostdin', '-i', input_file,
+        '-threads', '0', '-map', '0:a:0',
+        '-af', 'ebur128=peak=true', '-f', 'null', '-'
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', timeout=1200)
+        scan_time = time.time() - start_time
+        stderr_output = result.stderr
+
+        if not stderr_output:
+            tqdm.write("Error: No output from ffmpeg analysis.", file=sys.stderr)
+            return None, scan_time
+
+        patterns = {
+            'i':      re.compile(r"Integrated loudness:\s+I:\s*(-?[\d\.]+)\s+LUFS"),
+            'thresh': re.compile(r"Integrated loudness:\s+I:.*?\s+Threshold:\s*(-?[\d\.]+)\s+LUFS"),
+            'lra':    re.compile(r"Loudness range:\s+LRA:\s*(-?[\d\.]+)\s+LU"),
+            'tp':     re.compile(r"True peak:\s+Peak:\s*(-?[\d\.]+)\s+dBFS")
+        }
+        loudness_data = {}
+        missing_keys = []
+        for key, pattern in patterns.items():
+            match = pattern.search(stderr_output)
+            if match: loudness_data[key] = float(match.group(1))
+            else: missing_keys.append(key)
+
+        if missing_keys:
+            if "Stream map '0:a:0' matches no streams" in stderr_output: return None, scan_time
+            else: tqdm.write(f"Error: Could not parse ebur128 output. Missing: {', '.join(missing_keys)}", file=sys.stderr); return None, scan_time
+        return loudness_data, scan_time
+    except Exception as e:
+        tqdm.write(f"\nAn unexpected error occurred during audio analysis: {e}", file=sys.stderr)
+        return None, time.time() - start_time
+
+def append_to_loudness_log(file_path: str, data: Dict[str, float], scan_time: float, log_file: str):
+    LOG_HEADER = ["Timestamp", "Status", "File", "Size", "ScanTime", "CurrentLoudness", "Adjustment_dB", "MeasuredTP", "MeasuredLRA", "MeasuredThresh", "Error"]
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    try: size_str = format_size(os.path.getsize(file_path))
+    except Exception: size_str = "N/A"
+
+    input_i = data.get('i', 0.0); adjustment = TARGET_LOUDNESS - input_i
+    row = [timestamp, 'SUCCESS', os.path.abspath(file_path), size_str, f"{scan_time:.2f}s", f"{input_i:.2f}", f"{adjustment:+.2f}", f"{data.get('tp', 0.0):.2f}", f"{data.get('lra', 0.0):.2f}", f"{data.get('thresh', 0.0):.2f}", ""]
+
+    try:
+        log_dir = os.path.dirname(log_file)
+        if log_dir and not os.path.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
+        is_new = not os.path.exists(log_file) or os.path.getsize(log_file) == 0
+        with open(log_file, 'a', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            if is_new: writer.writerow(LOG_HEADER)
+            writer.writerow(row)
+        tqdm.write(f"Info: Appended analysis results to '{log_file}'.")
+    except Exception as e: tqdm.write(f"Warning: Could not append to loudness log: {e}", file=sys.stderr)
+
+def embed_chapters_mkvpropedit(chapter_file, output_file):
+    if not shutil.which('mkvpropedit'):
+        tqdm.write("\nError: 'mkvpropedit' command not found. Please install MKVToolNix.", file=sys.stderr); return False
+    mkvpropedit_cmd = ['mkvpropedit', output_file, '--chapters', chapter_file]
+    tqdm.write("\nExecuting mkvpropedit command:")
+    tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in mkvpropedit_cmd))
+    try:
+        subprocess.run(mkvpropedit_cmd, check=True, capture_output=True, text=True)
+        tqdm.write(f"Successfully embedded chapters into '{os.path.basename(output_file)}'.")
+        return True
+    except subprocess.CalledProcessError as e:
+        tqdm.write(f"\n--- mkvpropedit Error ---\n{e.stderr}\n-------------------------", file=sys.stderr); return False
+    except Exception as e:
+        tqdm.write(f"\nAn unexpected error occurred running mkvpropedit: {e}", file=sys.stderr); return False
+
+def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False, bar_position=0, measured_loudness=None):
+    tqdm.write("\nExecuting FFmpeg command:")
+    tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
+    output_file = cmd[-1]
+    original_size_bytes = os.path.getsize(source_file) if os.path.exists(source_file) else None
+
+    ffmpeg_success = False
+    try:
+        if "-progress" not in cmd:
+            subprocess.run(cmd, check=True)
+        else:
+            if total_frames is None: tqdm.write("\nWarning: Could not get total frames. Progress bar indeterminate.")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8')
+            with tqdm(total=total_frames, unit='frame', dynamic_ncols=True, desc="Current Video", position=bar_position, leave=True) as pbar:
+                for line in process.stdout:
+                    if line.strip().startswith("frame="):
+                        current_frame = int(line.strip().split("=")[1]); pbar.update(max(0, current_frame - pbar.n))
+            stderr_output = process.stderr.read(); process.wait()
+            if process.returncode != 0: raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_output)
+        ffmpeg_success = True
+    except (subprocess.CalledProcessError, FileNotFoundError, KeyboardInterrupt) as e:
+        if isinstance(e, subprocess.CalledProcessError):
+             tqdm.write(f"\n{RED}--- FFmpeg Error ---{RESET}\n{e.stderr}\n{RED}--------------------{RESET}", file=sys.stderr)
+             if 'process' in locals(): process.terminate()
+             return False
+        elif isinstance(e, FileNotFoundError):
+             tqdm.write(f"\n{RED}Error: Required command not found (ffmpeg/stdbuf).{RESET}", file=sys.stderr)
+             if 'process' in locals(): process.terminate()
+             return False
+        else:
+             tqdm.write(f"\n{RED}Cancelled.{RESET}", file=sys.stderr)
+             if 'process' in locals(): process.terminate()
+             sys.exit(1)
+
+    if not ffmpeg_success or not os.path.exists(output_file):
+        tqdm.write(f"\n{RED}Error: FFmpeg failed or output file '{output_file}' not created.{RESET}", file=sys.stderr)
+        return False
+        
+    try:
+        new_size_bytes = os.path.getsize(output_file)
+        subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
+    except Exception:
+        tqdm.write(f"\n{RED}Error: Output file '{output_file}' appears invalid after FFmpeg.{RESET}", file=sys.stderr)
+        return False
+
+    tqdm.write(f"\nSuccessfully created and verified FFmpeg output '{output_file}'.")
+
+    chapters_embedded_successfully = True
+    if chapter_file_to_embed:
+        chapters_embedded_successfully = embed_chapters_mkvpropedit(chapter_file_to_embed, output_file)
+        if not chapters_embedded_successfully:
+             tqdm.write(f"\nError: Failed to embed chapters. Output file may be incomplete.", file=sys.stderr)
+
+    if permissions:
+        try:
+            os.chown(output_file, permissions['uid'], permissions['gid']); os.chmod(output_file, permissions['mode'])
+            if verbose: tqdm.write(f"Info: Applied permissions to '{os.path.basename(output_file)}'.")
+        except OSError as e: tqdm.write(f"\nWarning: Could not set permissions. Reason: {e}", file=sys.stderr)
+
+    print_size_summary(original_size_bytes, new_size_bytes, audio_normalized=audio_normalized, measured_loudness=measured_loudness)
+
+    if delete_source and ffmpeg_success and chapters_embedded_successfully:
+        tqdm.write(f"\nInfo: --delete flag set. Deleting source file...")
+        try: os.remove(source_file); tqdm.write(f"Successfully deleted: {source_file}")
+        except OSError as e: tqdm.write(f"\nError: Could not delete source '{source_file}'. Reason: {e}", file=sys.stderr)
+    elif delete_source:
+         tqdm.write(f"\nWarning: --delete flag ignored because chapter embedding failed.")
+    
+    return True
+
+def load_loudness_db(log_file: str, verbose=False) -> Dict[str, Dict[str, float]]:
+    db = {}
+    if not os.path.exists(log_file):
+        tqdm.write(f"Warning: Loudness log not found at '{log_file}'. Will run analysis.", file=sys.stderr); return db
+    if verbose: tqdm.write(f"Info: Loading loudness database from '{os.path.basename(log_file)}'...")
+    try:
+        with open(log_file, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    if row.get('Status') == 'SUCCESS':
+                        file_path = row.get('File', '').strip()
+                        if not file_path: continue
+                        data = {'i': float(row['CurrentLoudness']), 'tp': float(row['MeasuredTP']), 'lra': float(row['MeasuredLRA']), 'thresh': float(row['MeasuredThresh'])}
+                        db[file_path] = data
+                except (ValueError, KeyError, TypeError, AttributeError): pass
+    except Exception as e: tqdm.write(f"Error: Could not read loudness log '{log_file}': {e}", file=sys.stderr)
+    if verbose: tqdm.write(f"Info: Loaded {len(db)} pre-analyzed entries.")
+    return db
+
+# --- Interactive TUI ---
+def show_file_info_popup(stdscr, filepath):
+    h, w = stdscr.getmaxyx()
+    streams = get_stream_info(filepath)
+    
+    lines = [f"File: {os.path.basename(filepath)}", "-" * 30]
+    if not streams:
+        lines.append("Error reading stream metadata.")
+    else:
+        v_streams = [s for s in streams if s.get('codec_type') == 'video']
+        if v_streams:
+            v = v_streams[0]
+            lines.append(f"Video: {v.get('codec_name', 'N/A').upper()} ({v.get('width', '?')}x{v.get('height', '?')})")
+        else:
+            lines.append("Video: None found")
+            
+        a_streams = [s for s in streams if s.get('codec_type') == 'audio']
+        if a_streams:
+            lines.append("Audio:")
+            for s in a_streams:
+                codec = s.get('codec_name', 'N/A').upper()
+                ch = s.get('channels', '?')
+                lang = s.get('tags', {}).get('language', 'und')
+                lines.append(f"  - {codec} ({ch} ch) [{lang}]")
+        
+        s_streams = [s for s in streams if s.get('codec_type') == 'subtitle']
+        if s_streams:
+            lines.append("Subtitles:")
+            for s in s_streams:
+                codec = s.get('codec_name', 'N/A').upper()
+                lang = s.get('tags', {}).get('language', 'und')
+                lines.append(f"  - {codec} [{lang}]")
+                
+    lines.append("-" * 30)
+    lines.append("Press any key to close...")
+    
+    box_w = max((len(line) for line in lines), default=40) + 4
+    box_h = len(lines) + 4
+    box_w = min(box_w, w - 2)
+    box_h = min(box_h, h - 2)
+    
+    start_y = max(1, (h - box_h) // 2)
+    start_x = max(1, (w - box_w) // 2)
+    
+    win = curses.newwin(box_h, box_w, start_y, start_x)
+    win.box()
+    
+    for i, line in enumerate(lines[:box_h-2]):
+        safe_line = line[:box_w-4]
+        win.addstr(i+1, 2, safe_line)
+        
+    win.refresh()
+    win.getch()
+
+def run_tui(target_dir, initial_recursive):
+    def main_loop(stdscr):
+        curses.curs_set(0)
+        
+        # Screen 1: Format Selection
+        formats = ['.ts', '.mp4', '.mkv', '.avi', '.mov', '.m2ts', '.wmv', '.flv', '.webm']
+        selected_formats = set()
+        
+        modifiers = [
+            {"label": "Scan Subdirectories (Recursive)", "active": initial_recursive},
+            {"label": "Filter: ONLY show Non-HEVC / x264 (Slower scan)", "active": False}
+        ]
+        
+        current_row = 0
+        total_rows = len(formats) + len(modifiers)
+
+        while True:
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+            stdscr.addstr(0, 0, "=== Screen 1: Select Video Formats to Scan ===")
+            stdscr.addstr(1, 0, "Space: Toggle | A: All | N: None | Enter/C: Confirm | Q/Esc: Quit")
+            
+            # Print Formats
+            for idx, fmt in enumerate(formats):
+                if idx + 3 >= h - 4: break
+                marker = "[X]" if fmt in selected_formats else "[ ]"
+                display_str = f"{marker} {fmt}"
+                if idx == current_row:
+                    stdscr.attron(curses.A_REVERSE)
+                    stdscr.addstr(idx + 3, 0, display_str)
+                    stdscr.attroff(curses.A_REVERSE)
+                else:
+                    stdscr.addstr(idx + 3, 0, display_str)
+            
+            # Print Modifiers Section
+            mod_start_y = len(formats) + 4
+            if mod_start_y < h:
+                stdscr.addstr(mod_start_y, 0, "--- Modifiers ---")
+                for m_idx, mod in enumerate(modifiers):
+                    row_idx = len(formats) + m_idx
+                    if mod_start_y + 1 + m_idx >= h: break
+                    
+                    mod_marker = "[X]" if mod["active"] else "[ ]"
+                    mod_str = f"{mod_marker} {mod['label']}"
+                    
+                    if row_idx == current_row:
+                        stdscr.attron(curses.A_REVERSE)
+                        stdscr.addstr(mod_start_y + 1 + m_idx, 0, mod_str[:w-1])
+                        stdscr.attroff(curses.A_REVERSE)
+                    else:
+                        stdscr.addstr(mod_start_y + 1 + m_idx, 0, mod_str[:w-1])
+            
+            key = stdscr.getch()
+            if key == curses.KEY_UP and current_row > 0: 
+                current_row -= 1
+            elif key == curses.KEY_DOWN and current_row < total_rows - 1: 
+                current_row += 1
+            elif key == ord(' '):
+                if current_row < len(formats):
+                    fmt = formats[current_row]
+                    if fmt in selected_formats: selected_formats.remove(fmt)
+                    else: selected_formats.add(fmt)
+                else:
+                    m_idx = current_row - len(formats)
+                    modifiers[m_idx]["active"] = not modifiers[m_idx]["active"]
+            elif key in [ord('a'), ord('A')]:
+                selected_formats.update(formats)
+            elif key in [ord('n'), ord('N')]:
+                selected_formats.clear()
+            elif key in [10, 13, ord('c'), ord('C')]:
+                break
+            elif key in [27, ord('q'), ord('Q')]:
+                return None
+        
+        if not selected_formats: return []
+        
+        use_recursive = modifiers[0]["active"]
+        filter_non_hevc = modifiers[1]["active"]
+
+        # Scan phase
+        stdscr.clear()
+        stdscr.addstr(0, 0, "Scanning files... Please wait.")
+        if filter_non_hevc:
+            stdscr.addstr(1, 0, "(Non-HEVC filter active. Probing new/uncached files...)")
+        stdscr.refresh()
+        
+        found_files = []
+        
+        def process_found_file(p):
+            try:
+                stat = os.stat(p)
+                size = stat.st_size
+                mtime = str(stat.st_mtime)
+            except OSError:
+                return
+
+            v, a, s = "---", "---", "---"
+
+            # Check if file is perfectly cached
+            if p in PROBE_CACHE and PROBE_CACHE[p]['size'] == str(size) and PROBE_CACHE[p]['mtime'] == mtime:
+                v = PROBE_CACHE[p]['v']
+                a = PROBE_CACHE[p]['a']
+                s = PROBE_CACHE[p]['s']
+                if filter_non_hevc and v.lower() == 'hevc':
+                    return
+            else:
+                if filter_non_hevc:
+                    try:
+                        stdscr.move(3, 0)
+                        stdscr.clrtoeol()
+                        _, w = stdscr.getmaxyx()
+                        display_name = os.path.basename(p)
+                        safe_w = max(0, w - 15)
+                        stdscr.addstr(3, 0, f"Checking: {display_name[:safe_w]}")
+                        stdscr.refresh()
+                    except Exception: pass
+                    
+                    v, a, s = probe_and_cache(p, size, mtime)
+                    if v.lower() == 'hevc':
+                        return
+
+            found_files.append({"path": p, "size": size, "checked": False, "v": v, "a": a, "s": s})
+
+        if use_recursive:
+            for root, _, files in os.walk(target_dir):
+                for f in files:
+                    if os.path.splitext(f)[1].lower() in selected_formats:
+                        process_found_file(os.path.join(root, f))
+        else:
+            try:
+                for f in os.listdir(target_dir):
+                    if os.path.splitext(f)[1].lower() in selected_formats:
+                        p = os.path.join(target_dir, f)
+                        if os.path.isfile(p):
+                            process_found_file(p)
+            except FileNotFoundError: pass
+        
+        if not found_files: return []
+
+        # Screen 2: File Selection
+        sort_by_size = True
+        found_files.sort(key=lambda x: x['size'], reverse=True)
+        
+        current_row = 0
+        offset = 0
+        
+        while True:
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+            
+            visible_lines = h - 4
+            if visible_lines <= 0:
+                stdscr.addstr(0, 0, "Terminal window too small!")
+                stdscr.getch()
+                return None
+
+            stdscr.addstr(0, 0, "=== Screen 2: Select Files to Process ===")
+            stdscr.addstr(1, 0, "Space: Check | A: All | N: None | S: Sort | F: File Info | C: Confirm | Q: Quit")
+            sort_str = "Sort: Largest Size First" if sort_by_size else "Sort: Alphabetical (A-Z)"
+            stdscr.addstr(2, 0, sort_str)
+            
+            for i in range(visible_lines):
+                idx = offset + i
+                if idx >= len(found_files): break
+                
+                item = found_files[idx]
+                marker = "[X]" if item['checked'] else "[ ]"
+                filename = os.path.basename(item['path'])
+                
+                size_str = format_size(item['size']).rjust(10)
+                v_str = item['v'][:6].ljust(6)
+                a_str = item['a'][:12].ljust(12)
+                s_str = item['s'][:8].ljust(8)
+                
+                # Marker(4) + |(3) + Size(10) + |(3) + V(6) + |(3) + A(12) + |(3) + S(8) + |(3) = 55
+                avail_w = w - 55
+                if len(filename) > avail_w: 
+                    filename = filename[:max(0, avail_w-3)] + "..."
+                
+                display_text = f"{marker} | {size_str} | {v_str} | {a_str} | {s_str} | {filename}"
+                
+                if idx == current_row:
+                    stdscr.attron(curses.A_REVERSE)
+                    stdscr.addstr(i + 4, 0, display_text)
+                    stdscr.attroff(curses.A_REVERSE)
+                else:
+                    stdscr.addstr(i + 4, 0, display_text)
+                    
+            key = stdscr.getch()
+            if key == curses.KEY_UP:
+                if current_row > 0:
+                    current_row -= 1
+                    if current_row < offset: offset = current_row
+            elif key == curses.KEY_DOWN:
+                if current_row < len(found_files) - 1:
+                    current_row += 1
+                    if current_row >= offset + visible_lines: offset += 1
+            elif key == ord(' '):
+                found_files[current_row]['checked'] = not found_files[current_row]['checked']
+            elif key in [ord('a'), ord('A')]:
+                for f in found_files: f['checked'] = True
+            elif key in [ord('n'), ord('N')]:
+                for f in found_files: f['checked'] = False
+            elif key in [ord('f'), ord('F')]:
+                show_file_info_popup(stdscr, found_files[current_row]['path'])
+            elif key in [ord('s'), ord('S')]:
+                sort_by_size = not sort_by_size
+                if sort_by_size: found_files.sort(key=lambda x: x['size'], reverse=True)
+                else: found_files.sort(key=lambda x: os.path.basename(x['path']).lower())
+                current_row = 0; offset = 0
+            elif key in [10, 13, ord('c'), ord('C')]:
+                return [f['path'] for f in found_files if f['checked']]
+            elif key in [27, ord('q'), ord('Q')]:
+                return None
+
+    try:
+        return curses.wrapper(main_loop)
+    except Exception as e:
+        print(f"TUI Error: {e}")
+        return None
+
+# --- Main Logic ---
 def main():
-    print(f"[,hvec v{__version__}]")
+    # ALWAYS print version first, regardless of flags
+    print(f",hvec Transcoder v{__version__}\n")
+    print(f",hvec v{__version__}")
     
-    parser = argparse.ArgumentParser(description="Advanced Video Transcoder & Remuxer (QSV Accelerated)", formatter_class=argparse.RawTextHelpFormatter)
-    
-    # Input/Output
-    parser.add_argument('-i', '--input', nargs='+', required=True, help="Input file(s) to process. Accepts wildcards.")
-    parser.add_argument('-o', '--output', help="Output file (only valid for single file processing)")
-    
-    # Modes
-    parser.add_argument('--remux', action='store_true', help="Remux video instead of transcoding (copy video stream)")
-    parser.add_argument('--encode', action='store_true', help="Transcode video to HEVC using Intel QSV")
-    parser.add_argument('--profile', choices=['normalize'], help="Apply predefined processing profile (e.g., 'normalize' implies -N -r -S -D)")
-    
-    # Audio
-    parser.add_argument('--english', action='store_true', help="Keep only English audio streams")
-    parser.add_argument('-N', '--normalize', action='store_true', help="Normalize primary audio stream to ATSC A/85 standards (-23 LUFS)")
-    
-    # File Operations
-    parser.add_argument('-S', '--suffix-remove', action='store_true', help="Remove scene release suffixes from output filename")
-    parser.add_argument('-D', '--delete', action='store_true', help="Delete original file after successful processing")
-    parser.add_argument('-Y', '--assume-yes', action='store_true', help='Assume "yes" to all prompts and run non-interactively')
-    
-    # Utilities
-    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}', help="Show version and exit")
-    parser.add_argument('--history', action='store_true', help="Show detailed version history and exit")
+    # Load the global persistent cache so it's ready for TUI and batch skips
+    load_probe_cache()
+
+    parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel QSV.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -E\n  ,hvec -i /videos/ -D -E -R\n  ,hvec -T -i /recordings/\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.csv")
+
+    io_group = parser.add_argument_group('Input / Output')
+    io_group.add_argument("-i", "--input", required=False, help="Input video file or directory (Default '.' if --profile upgrade or -T used).")
+    io_group.add_argument("-o", "--output", help="Output MKV file (single file mode only).")
+    io_group.add_argument("--out-dir", help="Output directory for batch processing.")
+    io_group.add_argument("-S", "--sync-filename", action="store_true", help="Output filename will match input filename (extension changed to .mkv).")
+    io_group.add_argument("--temp-dir", default="/storage/temp/", help="Temporary directory for operations using -S. (default: %(default)s)")
+    io_group.add_argument("-D", "--delete", action="store_true", help="Delete original file after success.")
+    io_group.add_argument("-R", "--recursive", action="store_true", help="Process subdirectories.")
+
+    proc_group = parser.add_argument_group('Processing / Quality')
+    proc_group.add_argument("--profile", choices=['upgrade', 'normalize'], help="Presets: 'upgrade', 'normalize'.")
+    proc_group.add_argument("-Q", "--quality", type=int, default=24, help="Set QSV quality (1-51).")
+    proc_group.add_argument("-p", "--preset", type=str, default='medium', choices=['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], help="Set encoding preset.")
+    proc_group.add_argument("-H", "--hvec", action="store_true", help="Force HEVC output (overrides --remux).")
+    proc_group.add_argument("-r", "--remux", action="store_true", help="Perform a lossless remux (instead of transcode).")
+    proc_group.add_argument("--skip-hevc", action="store_true", help="Skip files that are already HEVC.")
+    proc_group.add_argument("--keep-title", action="store_true", help="Do not strip the global 'Title' metadata tag.")
+    proc_group.add_argument("--no-nice", action="store_true", help="Disable auto-priority adjustment (run at normal system priority).")
+
+    audio_group = parser.add_argument_group('Audio / Subtitles')
+    audio_group.add_argument("--smart-audio", action="store_true", help="Copy safe codecs (AAC/AC3), transcode others (TrueHD/DTS -> EAC3).")
+    audio_group.add_argument("-N", "--normalize", nargs='?', const=True, default=None, help=f"Normalize audio to EBU R128 ({TARGET_LOUDNESS} LUFS).")
+    audio_group.add_argument("--acodec", help="Re-encode audio codec (e.g., 'aac', 'ac3'). Default: 'copy'.")
+    audio_group.add_argument("--abitrate", help="Set audio bitrate (e.g., '192k', '384k').")
+    audio_group.add_argument("-s", "--subs", nargs='+', help="External subtitle files to embed (single file mode only).")
+    audio_group.add_argument("-C", "--chapters", help="External chapter file (TXT/OGM or XML) to embed.")
+    audio_group.add_argument("-E", "--english", "-k", dest="filter_streams", action="store_true", help="Keep English Audio/Subs + Video (Interactively filter streams).")
+
+    ui_group = parser.add_argument_group('User Interface')
+    ui_group.add_argument("-T", "--tui", action="store_true", help="Launch interactive TUI for batch file selection.")
+
+    info_group = parser.add_argument_group('Info / Debug')
+    info_group.add_argument("-m", "--mediainfo", action="store_true", help="Show mediainfo of the input file before processing.")
+    info_group.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
+    info_group.add_argument("-q", "--quiet", action="store_true", help="Suppress FFmpeg output.")
+    info_group.add_argument("-V", "--verbose", action="store_true", help="Print detailed information during processing.")
+    info_group.add_argument('-Y', '--assume-yes', action='store_true', 
+                        help='Automatically answer "yes" to all interactive prompts')
+    info_group.add_argument("-v", "--version", action="store_true", help="Show version history and exit.")
 
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
 
-    if args.history:
-        print(VERSION_HISTORY)
-        sys.exit(0)
+    # Apply assume-yes logic by overriding the builtin input function
+    if getattr(args, "assume_yes", False):
+        def assume_yes_input(prompt_text=""):
+            # Print the prompt so the user sees what was "answered"
+            print(f"{prompt_text}y (auto)")
+            return "y"
+        builtins.input = assume_yes_input
 
-    if not args.remux and not args.encode and not args.profile:
-        tqdm.write(f"{RED}Error: You must specify a mode: --remux, --encode, or --profile{RESET}", file=sys.stderr)
+    do_x264_rename = False
+    if args.profile == 'upgrade':
+        if not args.input: args.input = "."
+        args.recursive = True
+        args.sync_filename = True
+        args.delete = True
+        args.skip_hevc = True
+        args.smart_audio = True
+        do_x264_rename = True
+        if args.verbose: print("Info: Applied 'upgrade' profile.")
+    elif args.profile == 'normalize':
+        if not args.input: args.input = "."
+        if args.normalize is None:
+            args.normalize = True
+        args.remux = True
+        args.sync_filename = True
+        args.delete = True
+        if args.verbose: print("Info: Applied 'normalize' profile.")
+
+    if not args.input and not args.tui and args.profile not in ['upgrade', 'normalize']:
+        parser.print_help()
+        print("\nError: -i/--input is required (unless using a --profile or -T/--tui).")
         sys.exit(1)
 
-    is_batch_mode = len(args.input) > 1
-    if is_batch_mode and args.output:
-        tqdm.write(f"{RED}Error: Cannot specify --output when processing multiple files.{RESET}", file=sys.stderr)
-        sys.exit(1)
+    if args.verbose: print("Info: Verbose mode enabled.")
+    if args.version: print(VERSION_HISTORY); sys.exit(0)
+    
+    # Handle Input defaulting for TUI
+    if args.tui and not args.input:
+        args.input = "."
 
-    check_dependencies()
+    if not os.path.exists(args.input): print(f"Error: Input path not found: {args.input}", file=sys.stderr); sys.exit(1)
 
-    # Profile handling
-    is_normalize_enabled = args.normalize
-    is_remux_enabled = args.remux
-    is_encode_enabled = args.encode
-    is_delete_enabled = args.delete
-    is_suffix_remove = args.suffix_remove
+    is_mediainfo_prompt_mode = False
+    if args.mediainfo:
+        is_default = (args.output is None and not args.filter_streams and not args.delete and args.out_dir is None and not args.recursive and args.chapters is None and args.subs is None and not args.hvec and args.normalize is None and args.quality == 24 and args.preset == 'medium' and args.acodec is None and args.abitrate is None and not args.skip_hevc and not args.dry_run and not args.remux and not args.quiet and not args.verbose and not args.sync_filename and not args.keep_title and not args.profile and not args.tui)
+        if is_default: is_mediainfo_prompt_mode = True
 
-    if args.profile == 'normalize':
-        is_normalize_enabled = True
-        is_remux_enabled = True
-        is_suffix_remove = True
-        is_delete_enabled = True
-        tqdm.write(f"{CYAN}Loaded Profile: 'normalize' (Remux, Normalize Audio, Remove Suffix, Delete Original){RESET}")
+    if args.mediainfo:
+        if not shutil.which('mediainfo'): print("Warning: 'mediainfo' command not found.", file=sys.stderr)
+        elif not os.path.isfile(args.input): print("Info: --mediainfo flag is ignored in directory/batch mode.")
+        else:
+            print("\n--- MediaInfo Output ---")
+            try: subprocess.run(['mediainfo', args.input], text=True)
+            except Exception as e: print(f"Error: Could not run mediainfo: {e}", file=sys.stderr)
+            print("------------------------")
+        if is_mediainfo_prompt_mode:
+            try:
+                if input("\nContinue with default transcode? [y/N]: ").lower().strip() != 'y': print("Aborting."); sys.exit(0)
+            except (KeyboardInterrupt, EOFError): print("\nCancelled."); sys.exit(1)
 
-    # Initialize batch memory for multi-channel normalization choices
-    global_normalize_multichannel = None
-
-    files_to_process = args.input
-    failed_files = []
-
-    # Prepare Loudness Log
+    loudness_db = {}
+    is_normalize_enabled = args.normalize is not None
     active_log_file = None
-    if is_normalize_enabled:
-        date_str = time.strftime("%Y-%m")
-        active_log_file = os.path.join(LOG_DIR, f"loudness_log_{date_str}.csv")
+    if isinstance(args.normalize, str):
+        active_log_file = args.normalize; loudness_db = load_loudness_db(active_log_file, args.verbose)
+    elif is_normalize_enabled:
+        if os.path.exists(CWD_LOG_PATH): active_log_file = CWD_LOG_PATH; loudness_db = load_loudness_db(CWD_LOG_PATH, args.verbose)
+        elif os.path.exists(DEFAULT_LOG_PATH): active_log_file = DEFAULT_LOG_PATH; loudness_db = load_loudness_db(DEFAULT_LOG_PATH, args.verbose)
+        else: active_log_file = DEFAULT_LOG_PATH
 
-    with tqdm(total=len(files_to_process), desc="Total Progress", disable=not is_batch_mode) as batch_bar:
-        for input_file in files_to_process:
-            if not os.path.isfile(input_file):
-                tqdm.write(f"{YELLOW}Warning: File not found: {input_file}. Skipping.{RESET}")
-                failed_files.append(input_file)
-                if is_batch_mode: batch_bar.update(1)
-                continue
+    # --- TUI Execution Path ---
+    if args.tui:
+        selected_files = run_tui(args.input, args.recursive)
+        if selected_files is None:
+            print("\nCancelled by user.")
+            sys.exit(0)
+        if not selected_files:
+            print("\nNo files selected.")
+            sys.exit(0)
+            
+        args.recursive = True
+        args.sync_filename = True
+        args.delete = True
+        args.skip_hevc = True
+        args.smart_audio = True
+        do_x264_rename = True
+        
+        print("\n--- TUI Selection Summary ---")
+        for f in selected_files:
+            print(f"  - {os.path.basename(f)} ({format_size(os.path.getsize(f))})")
+        print("-----------------------------")
+        try:
+            if input("Proceed with '--profile upgrade' on these files? [y/N]: ").lower().strip() != 'y':
+                print("Aborting.")
+                sys.exit(0)
+        except KeyboardInterrupt:
+            print("\nAborted.")
+            sys.exit(1)
+            
+        files_to_process = selected_files
+    else:
+        files_to_process = find_video_files(args.input, args.recursive) if os.path.isdir(args.input) else [args.input]
 
+    if not files_to_process: print("No video files found to process."); sys.exit(0)
+
+    # --- MAIN LOOP ---
+    failed_files = []
+    is_batch_mode = len(files_to_process) > 1
+    batch_normalize_mode = None
+    
+    with tqdm(total=len(files_to_process), desc="Total", unit="file", position=0, dynamic_ncols=True, disable=not is_batch_mode) as batch_bar:
+        for i, input_file in enumerate(files_to_process, 1):
             tqdm.write(f"\n--- Processing: {os.path.basename(input_file)} ---")
-            
-            media_info = get_media_info(input_file)
-            if not media_info or 'streams' not in media_info:
-                tqdm.write(f"{RED}Error: Could not read media info. Skipping.{RESET}")
-                failed_files.append(input_file)
-                if is_batch_mode: batch_bar.update(1)
-                continue
 
-            video_streams = []
-            audio_streams = []
-            subtitle_streams = []
+            chapter_file_for_this_run = args.chapters
+            if chapter_file_for_this_run and len(files_to_process) > 1:
+                if args.verbose: tqdm.write("Info: --chapters flag is ignored in batch/directory mode for now.")
+                chapter_file_for_this_run = None
+            if chapter_file_for_this_run and not os.path.exists(chapter_file_for_this_run):
+                 tqdm.write(f"Warning: Chapter file '{chapter_file_for_this_run}' not found. Skipping.")
+                 chapter_file_for_this_run = None
 
-            for i, stream in enumerate(media_info['streams']):
-                codec_type = stream.get('codec_type')
-                if codec_type == 'video':
-                    video_streams.append(stream)
-                elif codec_type == 'audio':
-                    audio_streams.append(stream)
-                elif codec_type == 'subtitle':
-                    subtitle_streams.append(stream)
-
-            # Build Stream Selection Plan
-            kept_streams = []
-            removed_streams = []
-            
-            # Video
-            if video_streams:
-                kept_streams.append((video_streams[0]['index'], 'Video', video_streams[0].get('codec_name', 'unknown')))
-            else:
-                tqdm.write(f"{RED}Error: No video stream found. Skipping.{RESET}")
-                failed_files.append(input_file)
-                if is_batch_mode: batch_bar.update(1)
-                continue
-
-            # Audio
-            target_audio_index = -1
-            audio_channels = 2
-            for stream in audio_streams:
-                tags = stream.get('tags', {})
-                lang = tags.get('language', 'unknown')
-                
-                keep_audio = True
-                if args.english and lang not in ['eng', 'unknown']:
-                    keep_audio = False
-                    
-                if keep_audio:
-                    if target_audio_index == -1:
-                        target_audio_index = stream['index']
-                        audio_channels = stream.get('channels', 2)
-                    kept_streams.append((stream['index'], f"Audio: {tags.get('title', 'Unknown')} [{lang}]", stream.get('codec_name', 'unknown')))
-                else:
-                    removed_streams.append((stream['index'], f"Audio: {tags.get('title', 'Unknown')} [{lang}]", stream.get('codec_name', 'unknown')))
-
-            # Display Plan
-            tqdm.write(f"\n{CYAN}--- Stream Selection Plan ---{RESET}")
-            tqdm.write(f"{GREEN}KEPT:{RESET}")
-            for idx, desc, codec in kept_streams:
-                tqdm.write(f"  - Stream #{idx} ({desc}) [{codec}]")
-                
-            if removed_streams:
-                tqdm.write(f"\n{RED}REMOVED:{RESET}")
-                for idx, desc, codec in removed_streams:
-                    tqdm.write(f"  - Stream #{idx} ({desc}) [{codec}]")
-
-            # Check Assume Yes Flag
-            if getattr(args, 'assume_yes', False):
-                tqdm.write("Proceed? [y/N]: y (auto-assumed via -Y)")
-                proceed_choice = 'y'
-            else:
-                proceed_choice = input("Proceed? [y/N]: ")
-                
-            if proceed_choice.lower() != 'y':
-                tqdm.write(f"{YELLOW}Skipping {input_file}{RESET}")
-                if is_batch_mode: batch_bar.update(1)
-                continue
-
-            mode_str = "Lossless Video Remux" if is_remux_enabled else "HEVC QSV Encode"
-            tqdm.write(f"Mode: {mode_str}")
-
-            # Subtitle Extraction
-            temp_files_to_cleanup = []
-            extracted_srt = None
-            if input_file.lower().endswith('.ts'):
-                extracted_srt = f"/tmp/hvec_subs_{os.getpid()}.srt"
-                if extract_eia608_subtitles(input_file, extracted_srt):
-                    temp_files_to_cleanup.append(extracted_srt)
-                else:
-                    extracted_srt = None
-
-            # Audio Normalization Prep
-            audio_filter_str = None
-            analysis_data = None
-            audio_normalized = False
-            
-            if is_normalize_enabled and target_audio_index != -1:
-                # Handle multi-channel downmix or retention
-                proceed_norm = True
-                if audio_channels > 2:
-                    if getattr(args, 'assume_yes', False):
-                        choice = 'd'
-                        tqdm.write(f"{YELLOW}Multi-channel audio detected. Auto-assumed Downmix to Stereo (d) via -Y.{RESET}")
-                    elif global_normalize_multichannel is not None:
-                        choice = global_normalize_multichannel
-                        tqdm.write(f"Applying batch multichannel choice: '{choice}'")
-                    else:
-                        tqdm.write(f"{YELLOW}Warning: Audio has {audio_channels} channels. Normalization works best on stereo.{RESET}")
-                        choice = input("Downmix to Stereo (d), Keep Multichannel (k), or Skip Normalization (s)? [d/k/s/D(All)/K(All)]: ").lower()
-                        if choice == 'd(all)' or choice == 'd':
-                             if choice == 'd(all)': global_normalize_multichannel = 'd'
-                             choice = 'd'
-                        elif choice == 'k(all)' or choice == 'k':
-                             if choice == 'k(all)': global_normalize_multichannel = 'k'
-                             choice = 'k'
-                        
-                    if choice == 's':
-                        proceed_norm = False
-                    elif choice == 'd':
-                        audio_filter_str = f"pan=stereo|FL=0.5*FC+0.707*FL+0.707*BL+0.5*LFE|FR=0.5*FC+0.707*FR+0.707*BR+0.5*LFE,loudnorm=I={TARGET_LOUDNESS}:TP={TARGET_TRUE_PEAK}"
-                    else: # 'k'
-                        audio_filter_str = f"loudnorm=I={TARGET_LOUDNESS}:TP={TARGET_TRUE_PEAK}"
-                else:
-                    audio_filter_str = f"loudnorm=I={TARGET_LOUDNESS}:TP={TARGET_TRUE_PEAK}"
-
-                if proceed_norm:
-                    analysis_data = analyze_audio_loudness(input_file, target_audio_index)
-                    if analysis_data:
-                        tqdm.write(f"Pre-Norm LUFS: {analysis_data.get('i')} | TP: {analysis_data.get('tp')}")
-                        # Linear integration if needed, but loudnorm handles dynamic range automatically
-                        audio_normalized = True
-
-            # Determine Output Filename
-            base_name = os.path.basename(input_file)
-            name_no_ext, _ = os.path.splitext(base_name)
-            
-            if is_suffix_remove:
-                # Simple regex to strip typical release group suffixes (e.g., -GROUP)
-                name_no_ext = re.sub(r'-[a-zA-Z0-9]+$', '', name_no_ext)
-                
-            if args.output:
-                final_output_file = args.output
-            else:
-                final_output_file = os.path.join(os.path.dirname(input_file), f"{name_no_ext}.mkv")
-                
-            # Prevent overwriting input directly
-            temp_output_file = final_output_file
-            if os.path.abspath(input_file) == os.path.abspath(final_output_file):
-                temp_output_file = final_output_file + ".tmp.mkv"
-                temp_files_to_cleanup.append(temp_output_file)
-
-            # Build FFmpeg Command
-            ffmpeg_cmd = ['ffmpeg', '-y', '-hide_banner']
-            
-            # QSV Decoding
-            if is_encode_enabled or (is_remux_enabled and input_file.lower().endswith('.ts')):
-                # Use QSV for decoding if possible, enforce nv12 for robustness against resolution changes
-                ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', 'nv12'])
-                
-            ffmpeg_cmd.extend(['-i', input_file])
-            
-            if extracted_srt:
-                ffmpeg_cmd.extend(['-i', extracted_srt])
-
-            # Map kept streams
-            for idx, _, _ in kept_streams:
-                ffmpeg_cmd.extend(['-map', f'0:{idx}'])
-                
-            if extracted_srt:
-                # Map the new subtitle stream
-                ffmpeg_cmd.extend(['-map', '1:0'])
-
-            # Video Encoding Settings
-            if is_remux_enabled:
-                ffmpeg_cmd.extend(['-c:v', 'copy'])
-            else:
-                ffmpeg_cmd.extend(['-c:v', 'hevc_qsv', '-preset', 'slow', '-global_quality', '23'])
-                
-            # Audio Encoding Settings
-            if audio_normalized:
-                ffmpeg_cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-af', audio_filter_str])
-            else:
-                ffmpeg_cmd.extend(['-c:a', 'copy'])
-
-            # Subtitle Settings
-            ffmpeg_cmd.extend(['-c:s', 'copy'])
-            
-            # Metadata passthrough
-            ffmpeg_cmd.extend(['-map_metadata', '0', '-map_chapters', '0'])
-            
-            if extracted_srt:
-                # Set metadata for the newly added SRT track (assuming it's the last stream mapped)
-                srt_stream_idx = len(kept_streams) # 0-indexed offset based on mapped streams
-                ffmpeg_cmd.extend([f'-metadata:s:s:{srt_stream_idx - 1}', 'language=eng', f'-metadata:s:s:{srt_stream_idx - 1}', 'title=English (CC)'])
-
-            ffmpeg_cmd.append(temp_output_file)
-
-            # Execute
-            success = run_command(ffmpeg_cmd, desc=f"Processing {base_name}", is_batch=is_batch_mode)
-            
-            if not success:
-                failed_files.append(input_file)
-            else:
-                # File replacements and cleanup
-                setup_permissions(temp_output_file)
-                
-                if temp_output_file != final_output_file:
+            permissions_to_apply = None
+            try:
+                stat_info = os.stat(input_file); input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
+                target_gid = input_gid
+                if input_group_name != 'jellyfin':
                     try:
-                        shutil.move(temp_output_file, final_output_file)
-                        setup_permissions(final_output_file)
-                    except OSError as e:
-                        tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
-                        success = False
-                
-                if success:
-                    tqdm.write(f"{GREEN}Successfully processed: {final_output_file}{RESET}")
-                    if is_delete_enabled and os.path.abspath(input_file) != os.path.abspath(final_output_file):
+                        jellyfin_gid = grp.getgrnam('jellyfin').gr_gid
+                        response = input(f"Warning: Source group is '{input_group_name}'. Change output to 'jellyfin'? [Y/n]: ").lower().strip()
+                        if response in ('y', 'yes', ''): target_gid = jellyfin_gid
+                    except Exception: pass
+                permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
+            except Exception: pass
+
+            if args.skip_hevc and is_hevc(input_file):
+                tqdm.write("Already HEVC. Skipping.")
+                if is_batch_mode: batch_bar.update(1)
+                continue
+
+            is_remux_op = args.remux and not args.hvec
+            is_transcode_op = not is_remux_op
+
+            def generate_output_filename(base, is_remux, has_chapters, is_normalized, rename_x264=False):
+                if rename_x264:
+                    new_base = re.sub(r'(?i)x264|h264|avc|mpeg4', 'x265', base)
+                    if new_base != base and args.verbose: tqdm.write(f"Info: Renamed tag in filename: '{base}' -> '{new_base}'")
+                    base = new_base
+
+                sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.')
+                suffix = ".REMUX" if is_remux else ".CONV"
+                chapter_suffix = ".CHAPTERS" if has_chapters else ""
+                norm_suffix = ".NORM" if is_normalized else ""
+                base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
+                return f"{base_no_suffix}{suffix}{norm_suffix}{chapter_suffix}.mkv"
+
+            if args.output and len(files_to_process) == 1: final_output_file = args.output
+            elif args.sync_filename:
+                base, _ = os.path.splitext(os.path.basename(input_file))
+                if do_x264_rename:
+                    new_base = re.sub(r'(?i)x264|h264|avc|mpeg4', 'x265', base)
+                    if new_base != base and args.verbose: tqdm.write(f"Info: Renaming final output: '{base}' -> '{new_base}'")
+                    base = new_base
+                final_output_file = os.path.join(os.path.dirname(input_file), f"{base}.mkv")
+            else:
+                base, _ = os.path.splitext(os.path.basename(input_file))
+                new_filename = generate_output_filename(base, is_remux_op, chapter_file_for_this_run is not None, is_normalize_enabled, rename_x264=do_x264_rename)
+                if args.out_dir:
+                    relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(input_file))
+                    output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
+                    final_output_file = os.path.join(output_dir, new_filename)
+                else: final_output_file = os.path.join(os.path.dirname(input_file), new_filename)
+
+            if args.sync_filename:
+                try: os.makedirs(args.temp_dir, exist_ok=True)
+                except OSError as e: tqdm.write(f"Error: Could not create temp dir: {e}", file=sys.stderr); sys.exit(1)
+                working_output_file = os.path.join(args.temp_dir, os.path.basename(final_output_file))
+                if args.verbose: tqdm.write(f"Info: Using temp file '{working_output_file}'")
+            else:
+                working_output_file = final_output_file
+                if os.path.abspath(working_output_file) == os.path.abspath(input_file):
+                    base, ext = os.path.splitext(working_output_file); working_output_file = f"{base}.COPY{ext}"
+
+            if not args.sync_filename and os.path.exists(working_output_file) and not args.dry_run:
+                try:
+                    if input(f"Output '{os.path.basename(working_output_file)}' exists. Overwrite? [y/N]: ").lower().strip() != 'y': tqdm.write("Skipping."); continue
+                except KeyboardInterrupt: sys.exit(1)
+
+            total_frames = get_total_frames(input_file) if not (is_remux_op or args.quiet or args.dry_run) else None
+            ffmpeg_cmd = ['ffmpeg', '-y', '-nostdin']
+
+            use_progress_bar = total_frames is not None and not (is_remux_op or args.quiet or args.dry_run)
+            if use_progress_bar:
+                if sys.platform != "win32": ffmpeg_cmd = ['stdbuf', '-o0'] + ffmpeg_cmd
+                ffmpeg_cmd.extend(['-progress', '-', '-nostats'])
+            elif args.quiet: ffmpeg_cmd.extend(['-loglevel', 'error', '-hide_banner'])
+            else: ffmpeg_cmd.extend(['-v', 'error', '-stats'])
+
+            # --- QSV Pipeline Update ---
+            is_avi = input_file.lower().endswith('.avi')
+            if is_avi:
+                ffmpeg_cmd.extend(['-fflags', '+genpts'])
+                if is_transcode_op:
+                    ffmpeg_cmd.extend(['-init_hw_device', 'qsv=hw', '-filter_hw_device', 'hw'])
+
+            if is_transcode_op and not is_avi:
+                # Explicitly force nv12 output format to handle Dynamic Resolution changes in Live TV streams.
+                ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', 'nv12'])
+
+            # --- Extract Embedded EIA-608 Captions from .ts Files ---
+            temp_files_to_cleanup = []
+            extracted_ts_subs = False
+            
+            if input_file.lower().endswith('.ts'):
+                tqdm.write("Info: Checking for embedded EIA-608 closed captions...")
+                ts_srt_temp = f"/tmp/cc_extract_{os.getpid()}_{i}.srt"
+                ts_symlink_temp = f"/tmp/cc_link_{os.getpid()}_{i}.ts"
+                try:
+                    # Create a safe symlink in /tmp to bypass lavfi's issue with spaces/apostrophes
+                    if os.path.exists(ts_symlink_temp): os.remove(ts_symlink_temp)
+                    os.symlink(os.path.abspath(input_file), ts_symlink_temp)
+
+                    extract_cmd = ['ffmpeg', '-hide_banner', '-y', '-f', 'lavfi', '-i', f'movie={ts_symlink_temp}[out+subcc]', '-map', '0:1', ts_srt_temp]
+                    subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    # Verify extraction succeeded and file isn't just an empty header (usually > 50 bytes if valid)
+                    if os.path.exists(ts_srt_temp) and os.path.getsize(ts_srt_temp) > 50:
+                        tqdm.write("  -> Successfully extracted hidden captions to SRT!")
+                        extracted_ts_subs = True
+                        temp_files_to_cleanup.append(ts_srt_temp)
+                    else:
+                        tqdm.write("  -> No embedded captions found.")
+                        if os.path.exists(ts_srt_temp): os.remove(ts_srt_temp)
+                except Exception as e:
+                    tqdm.write(f"Warning: Closed caption extraction failed: {e}", file=sys.stderr)
+                finally:
+                    if os.path.exists(ts_symlink_temp): os.remove(ts_symlink_temp)
+
+            # --- Gather External Subtitles ---
+            external_sub_files = []
+            if args.subs:
+                for sub_file in args.subs:
+                    if os.path.exists(sub_file): external_sub_files.append(os.path.abspath(sub_file))
+            
+            # Append newly extracted .ts captions if they exist
+            if extracted_ts_subs:
+                external_sub_files.append(ts_srt_temp)
+
+            if len(files_to_process) == 1:
+                abs_input_file = os.path.abspath(input_file); input_dir = os.path.dirname(abs_input_file); input_base = os.path.splitext(os.path.basename(input_file))[0]
+                if args.verbose: tqdm.write("Info: Scanning for sidecar subtitles...")
+                try:
+                    for item in os.listdir(input_dir):
+                        item_path = os.path.join(input_dir, item); item_base, item_ext = os.path.splitext(item)
+                        if item_ext.lower() in SUBTITLE_EXTENSIONS and item_base.startswith(input_base):
+                            abs_item_path = os.path.abspath(item_path)
+                            if abs_item_path not in external_sub_files: external_sub_files.append(abs_item_path)
+                except OSError: pass
+
+            ffmpeg_cmd.extend(['-i', input_file])
+            for sub_file in external_sub_files: ffmpeg_cmd.extend(['-i', sub_file])
+
+            if not args.keep_title:
+                if args.verbose: tqdm.write("Info: Stripping global 'Title' metadata.")
+                ffmpeg_cmd.extend(['-metadata', 'title='])
+
+            all_streams = get_stream_info(input_file) or []
+            audio_streams = [s for s in all_streams if s.get('codec_type') == 'audio']
+            map_original_subs = True
+            if external_sub_files and not args.filter_streams:
+                existing_subs = [s for s in all_streams if s.get('codec_type') == 'subtitle']
+                if existing_subs:
+                    tqdm.write("\n--- Subtitle Conflict ---")
+                    try:
+                        if input("Remove existing subtitles and only use external ones? [y/N]: ").lower().strip() == 'y': map_original_subs = False
+                    except (KeyboardInterrupt, EOFError): sys.exit(1)
+
+            normalize_mode = 'replace'
+            if is_normalize_enabled and not args.filter_streams:
+                if any(s.get('channels', 0) > 2 for s in audio_streams):
+                    tqdm.write("\nInput has multi-channel audio.")
+                    if batch_normalize_mode is not None:
+                        tqdm.write(f"  [A]dd as new default, [R]eplace, [S]kip: {batch_normalize_mode.upper()} (Auto-applied)")
+                        if batch_normalize_mode == 'a': normalize_mode = 'add'
+                        elif batch_normalize_mode == 's': is_normalize_enabled = False
+                    else:
                         try:
-                            os.remove(input_file)
-                            tqdm.write(f"Deleted original file: {input_file}")
-                        except OSError as e:
-                             tqdm.write(f"{YELLOW}Warning: Could not delete original file: {e}{RESET}")
-                             
-                    # Update Loudness Log if applicable
-                    if is_normalize_enabled and audio_normalized and active_log_file and analysis_data:
+                            response = input("  [A]dd as new default, [R]eplace, [S]kip: ").lower().strip()
+                            if response == 'a': normalize_mode = 'add'
+                            elif response == 's': is_normalize_enabled = False
+                            else: response = 'r'
+                            
+                            if is_batch_mode and i < len(files_to_process):
+                                save_resp = input("  Apply this choice to the remaining files in the queue? [y/N]: ").lower().strip()
+                                if save_resp == 'y':
+                                    batch_normalize_mode = response
+                        except KeyboardInterrupt: sys.exit(1)
+
+            filter_string_for_complex = None
+            filter_string_for_simple = None
+            analysis_data = None
+            if is_normalize_enabled:
+                abs_input_file = os.path.abspath(input_file)
+                if abs_input_file in loudness_db: analysis_data = loudness_db[abs_input_file]; tqdm.write("Info: Found pre-analyzed data.")
+                else:
+                    tqdm.write("Running audio normalization analysis...")
+                    analysis_data, scan_time = run_loudnorm_analysis(input_file)
+                    if analysis_data and active_log_file: append_to_loudness_log(input_file, analysis_data, scan_time, active_log_file)
+                if analysis_data:
+                    try:
+                        measured_i = analysis_data['i']; measured_tp = analysis_data['tp']; measured_lra = analysis_data['lra']; measured_thresh = analysis_data['thresh']
+                        filter_string_for_simple = f"loudnorm=I={TARGET_LOUDNESS}:LRA={TARGET_LRA}:tp={TARGET_TRUE_PEAK}:measured_I={measured_i}:measured_tp={measured_tp}:measured_LRA={measured_lra}:measured_thresh={measured_thresh},aformat=channel_layouts=7.1|5.1|stereo|mono"
+                        filter_string_for_complex = f"[0:a:0]{filter_string_for_simple}[a_norm]"
+                        
+                        diff = TARGET_LOUDNESS - measured_i
+                        change_direction = "Increase" if diff > 0 else "Decrease"
+                        tqdm.write(f"  - Input Loudness: {measured_i:.2f} LUFS")
+                        tqdm.write(f"  - Audio Level: Will {change_direction} by {abs(diff):.2f} dB")
+
+                    except KeyError: analysis_data = None; is_normalize_enabled = False
+                if not analysis_data: is_normalize_enabled = False
+                if analysis_data and normalize_mode == 'add': ffmpeg_cmd.extend(['-filter_complex', filter_string_for_complex])
+
+            if args.filter_streams and len(files_to_process) == 1:
+                if not all_streams: continue
+                s_keep, s_rem = plan_stream_selection(all_streams)
+
+                if not display_and_confirm_plan(s_keep, s_rem): continue
+
+                kept_subs = [s for s in s_keep if s.get('codec_type') == 'subtitle']
+                eng_srts = [s for s in kept_subs if s.get('codec_name') == 'subrip' and s.get('tags', {}).get('language') == 'eng']
+                non_srts = [s for s in kept_subs if s.get('codec_name') != 'subrip']
+                
+                if eng_srts and non_srts:
+                    tqdm.write(f"\nDetected English SRT subtitles along with {len(non_srts)} non-SRT format(s).")
+                    if input("Remove non-SRT subtitles (clean up)? [y/N]: ").lower().strip() == 'y':
+                        for s in non_srts:
+                            if s in s_keep:
+                                s_keep.remove(s)
+                                s_rem.append(s)
+                        s_rem.sort(key=lambda x: x['index'])
+                        if not display_and_confirm_plan(s_keep, s_rem): continue
+
+                for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
+            else:
+                ffmpeg_cmd.extend(['-map', '0:v?'])
+                if is_normalize_enabled and normalize_mode == 'add' and filter_string_for_complex: ffmpeg_cmd.extend(['-map', '[a_norm]'])
+                ffmpeg_cmd.extend(['-map', '0:a?'])
+                if map_original_subs: ffmpeg_cmd.extend(['-map', '0:s?'])
+                ffmpeg_cmd.extend(['-map', '0:d?', '-map', '0:t?'])
+                if external_sub_files:
+                    internal_sub_count = len([s for s in all_streams if s.get('codec_type') == 'subtitle'])
+                    for i, sub_file in enumerate(external_sub_files):
+                        ffmpeg_cmd.extend([f'-map', f'{i + 1}'])
+                        output_sub_index = internal_sub_count + i
+                        ffmpeg_cmd.extend([f'-metadata:s:s:{output_sub_index}', f'language=eng'])
+
+            audio_normalized = False
+            if is_transcode_op:
+                tqdm.write("\nMode: Intel QSV Video Transcode");
+                if is_avi: ffmpeg_cmd.extend(['-vf', 'hwupload=extra_hw_frames=64,format=qsv'])
+                ffmpeg_cmd.extend(['-c:v', 'hevc_qsv', '-preset', args.preset, '-global_quality', str(args.quality)])
+            else: tqdm.write("Mode: Lossless Video Remux"); ffmpeg_cmd.extend(['-c:v', 'copy'])
+
+            if is_normalize_enabled and analysis_data:
+                if normalize_mode == 'add':
+                    tqdm.write("Info: Adding normalized audio, copying others.")
+                    ffmpeg_cmd.extend(['-c:a:0', 'aac', '-q:a:0', '4', '-disposition:a:0', 'default'])
+                    for i in range(len(audio_streams)): ffmpeg_cmd.extend([f'-c:a:{i + 1}', 'copy'])
+                    audio_normalized = True
+                else:
+                    tqdm.write("Info: Replacing audio stream 0 with normalized version.")
+                    ffmpeg_cmd.extend([f'-c:a:0', 'aac', '-q:a:0', '4', f'-af:a:0', filter_string_for_simple])
+                    for i in range(1, len(audio_streams)): ffmpeg_cmd.extend([f'-c:a:{i}', 'aac', '-q:a:1', '5', f'-af:a:{i}', 'anull'])
+                    audio_normalized = True
+
+            if not audio_normalized:
+                if args.smart_audio and audio_streams:
+                    if args.verbose: tqdm.write("Info: Smart Audio enabled.")
+                    safe_codecs = ['aac', 'ac3', 'eac3', 'mp3']
+                    for i, stream in enumerate(audio_streams):
+                        codec = stream.get('codec_name', '').lower()
+                        if codec in safe_codecs:
+                            ffmpeg_cmd.extend([f'-c:a:{i}', 'copy'])
+                            if args.verbose: tqdm.write(f"  - Stream a:{i} ({codec}) -> Copy")
+                        else:
+                            ffmpeg_cmd.extend([f'-c:a:{i}', 'eac3', f'-b:a:{i}', '640k'])
+                            if args.verbose: tqdm.write(f"  - Stream a:{i} ({codec}) -> Transcode (EAC3 640k)")
+                elif args.acodec:
+                    ffmpeg_cmd.extend(['-c:a', args.acodec])
+                    if args.abitrate: ffmpeg_cmd.extend(['-b:a', args.abitrate])
+                else: ffmpeg_cmd.extend(['-c:a', 'copy'])
+
+            ffmpeg_cmd.extend(['-c:s', 'copy', '-c:d', 'copy', '-c:t', 'copy'])
+            ffmpeg_cmd.append(working_output_file)
+
+            inner_bar_pos = 1 if is_batch_mode else 0
+            m_loudness = analysis_data['i'] if (is_normalize_enabled and analysis_data and 'i' in analysis_data) else None
+
+            if args.dry_run:
+                print_ffmpeg_command(ffmpeg_cmd)
+            else:
+                success = run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
+                
+                perform_log_update = False
+                if not success:
+                    failed_files.append(input_file)
+                    if args.sync_filename and os.path.exists(working_output_file):
+                        try: os.remove(working_output_file)
+                        except OSError: pass
+                else:
+                    if args.sync_filename and os.path.exists(working_output_file):
+                        try: 
+                            shutil.move(working_output_file, final_output_file)
+                            tqdm.write(f"Successfully replaced '{os.path.basename(final_output_file)}'.")
+                            perform_log_update = True
+                        except OSError as e: 
+                            tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
+                    else:
+                        perform_log_update = True
+
+                    if perform_log_update and is_normalize_enabled and audio_normalized and active_log_file and analysis_data:
                         try:
                             post_norm_data = {
                                 'i': TARGET_LOUDNESS,
                                 'tp': TARGET_TRUE_PEAK,
-                                'lra': analysis_data.get('lra', 0.0), # Assuming LRA stays roughly similar or is handled by loudnorm
+                                'lra': analysis_data.get('lra', 0.0),
                                 'thresh': analysis_data.get('thresh', 0.0)
                             }
-                            append_to_loudness_log(final_output_file, analysis_data, post_norm_data, active_log_file)
+                            append_to_loudness_log(final_output_file, post_norm_data, 0.0, active_log_file)
                         except Exception as e:
-                            tqdm.write(f"{YELLOW}Warning: Could not update loudness log: {e}{RESET}", file=sys.stderr)
+                            tqdm.write(f"Warning: Could not update loudness log: {e}", file=sys.stderr)
 
             # Cleanup any temporary subtitle extraction files
             for tf in temp_files_to_cleanup:
