@@ -18,11 +18,15 @@ import curses
 import builtins
 
 # --- Version History ---
-__version__ = "8.6.8"
+__version__ = "8.6.9"
 
 VERSION_HISTORY = f"""
 ,hvec Transcoder v{__version__}
 ---------------------------------
+v8.6.9 fix(transcode): Dynamic QSV Format
+        - Replaced hardcoded `-hwaccel_output_format nv12` to fix fatal decoding errors in FFmpeg 7+ for 10-bit sources on QSV.
+        - Added ffprobe bit-depth detection (pix_fmt) to automatically determine the correct hardware surface (p010le vs nv12).
+
 v8.6.8 feat(cli): Assume Yes Option
         - Added `--assume-yes` / `-Y` flag to automatically answer 'yes' to all interactive prompts.
         - The current version is now always printed first, regardless of the flags/options.
@@ -987,8 +991,23 @@ def main():
                     ffmpeg_cmd.extend(['-init_hw_device', 'qsv=hw', '-filter_hw_device', 'hw'])
 
             if is_transcode_op and not is_avi:
-                # Explicitly force nv12 output format to handle Dynamic Resolution changes in Live TV streams.
-                ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', 'nv12'])
+                # Probe video stream to determine if it is 10-bit or 8-bit
+                qsv_fmt = "nv12"  # 8-bit fallback/default (Safe for Live TV .ts)
+                try:
+                    probe_cmd = [
+                        "ffprobe", "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "stream=pix_fmt", "-of",
+                        "default=noprint_wrappers=1:nokey=1", input_file
+                    ]
+                    pix_fmt = subprocess.check_output(probe_cmd, stderr=subprocess.DEVNULL).decode('utf-8').strip()
+                    
+                    if "p10le" in pix_fmt or "10bit" in pix_fmt:
+                        qsv_fmt = "p010le"  # 10-bit QSV hardware surface
+                except Exception:
+                    pass
+                
+                # Apply the dynamic hardware surface format
+                ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', qsv_fmt])
 
             # --- Extract Embedded EIA-608 Captions from .ts Files ---
             temp_files_to_cleanup = []
