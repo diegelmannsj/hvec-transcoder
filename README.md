@@ -28,12 +28,18 @@ Required:
 - FFmpeg and FFprobe
 - FFmpeg built with Intel QSV support
 - Compatible Intel Quick Sync Video hardware and drivers
-- Python packages `argcomplete` and `tqdm`
+- Python package `tqdm`
 
 Install the Python dependencies with:
 
 ```bash
-python3 -m pip install argcomplete tqdm
+python3 -m pip install tqdm
+```
+
+The optional `argcomplete` package enables shell-completion integration when installed:
+
+```bash
+python3 -m pip install argcomplete
 ```
 
 Some features use additional commands:
@@ -69,6 +75,8 @@ sudo ln -s /path/to/hvec-project/,hvec /usr/local/bin/,hvec
 ```
 
 Without `--remux`, the default operation transcodes video to HEVC using `hevc_qsv`. Audio is copied unless an audio-processing option is selected. Generated output names normally end in `.CONV.mkv`; remuxed files normally end in `.REMUX.mkv`.
+
+After FFmpeg completes, the script uses FFprobe to confirm that the output is readable, contains video when the source does, uses HEVC when transcoding, and has a duration reasonably close to the source. Source deletion is allowed only after this verification succeeds.
 
 ## Options
 
@@ -177,6 +185,8 @@ Launch the interactive selector for a directory tree:
 
 Synchronization mode verifies its temporary output and places it at the final destination before deleting a separately named source. If the final placement fails, the source is retained. When the synchronized output path is identical to the source path, `--delete` is required as explicit confirmation that the source may be replaced.
 
+Temporary output names include the process ID and a hash of the full input path. This prevents simultaneous jobs or identically named files from sharing a working file.
+
 ### Dry-run limitations
 
 `--dry-run` prints the planned transcode/remux command without running FFmpeg, creating output directories, updating caches or logs, extracting captions, or deleting sources. It may run read-only FFprobe inspections to build the command. If normalization is requested without cached loudness data, the preview uses target values in place of a full loudness analysis.
@@ -193,3 +203,23 @@ The script stores persistent data under `~/.hvec`:
 - `~/.hvec/audit_loudness.csv` stores loudness-analysis results when normalization is used without another CSV path.
 
 If `audit_loudness.csv` exists in the current directory, normalization prefers that file over the default file in `~/.hvec`.
+
+## Option validation
+
+The script rejects ambiguous or conflicting combinations before processing:
+
+- `--abitrate` requires `--acodec`.
+- `--smart-audio` cannot be combined with `--acodec`.
+- `--normalize` cannot be combined with `--smart-audio` or `--acodec`.
+- `--output` is limited to one input and cannot be combined with `--out-dir` or `--sync-filename`.
+- External subtitles and chapters are limited to single-file mode.
+
+## Tests
+
+Run the automated test suite with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+The suite uses temporary directories and synthetic FFmpeg media. It does not modify media-library files.

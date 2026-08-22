@@ -1,1 +1,3 @@
 ,hvec.pre-fixes-*.bak
+__pycache__/
+*.pyc

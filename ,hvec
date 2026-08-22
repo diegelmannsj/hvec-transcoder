@@ -6,23 +6,33 @@ import sys
 import os
 import json
 import math
-import argcomplete
 import re
 import shutil
-from tqdm import tqdm
-import grp
 from typing import Dict, Any, List, Tuple
 import csv
 import time
-import curses
 import builtins
 import errno
 import tempfile
+import hashlib
+import shlex
+import signal
+
+argcomplete = None
+tqdm = None
+grp = None
+curses = None
 
 # --- Version History ---
-__version__ = "8.7.0"
+__version__ = "8.8.0"
 
 VERSION_HISTORY = """Version History:
+v8.8.0 fix(reliability): Verification, Process Safety, and Tests
+        - Added FFprobe codec, video-stream, and duration verification before source deletion.
+        - Added collision-resistant temporary filenames and safer interrupted-process cleanup.
+        - Prevented FFmpeg progress deadlocks by draining stderr through a temporary file.
+        - Added early option-conflict validation, optional argcomplete loading, and automated tests.
+
 v8.7.0 fix(safety): Safer Processing and CLI Behavior
         - Deferred source deletion in sync mode until final output placement succeeds.
         - Made dry-run avoid cache, log, directory, caption extraction, and loudness-analysis writes.
@@ -95,6 +105,24 @@ GREEN = "\033[92m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
+def load_runtime_dependencies():
+    """Load dependencies needed for processing after early CLI exits are handled."""
+    global tqdm, grp
+    try:
+        from tqdm import tqdm as tqdm_impl
+        tqdm = tqdm_impl
+    except ImportError:
+        print("Error: Missing Python package 'tqdm'. Install it with: python3 -m pip install tqdm", file=sys.stderr)
+        return False
+
+    if os.name == 'posix':
+        try:
+            import grp as grp_impl
+            grp = grp_impl
+        except ImportError:
+            grp = None
+    return True
+
 ISO_639_MAP = {
     'eng': 'English', 'jpn': 'Japanese', 'und': 'Undetermined',
     'fra': 'French', 'fre': 'French', 'deu': 'German', 'ger': 'German',
@@ -117,7 +145,7 @@ SUBTITLE_CODEC_MAP = {
 }
 
 # --- Caching Functions ---
-def load_probe_cache():
+def load_probe_cache(verbose=False):
     if os.path.exists(PROBE_CACHE_PATH):
         try:
             with open(PROBE_CACHE_PATH, 'r', encoding='utf-8') as f:
@@ -130,9 +158,11 @@ def load_probe_cache():
                         'a': row['A'],
                         's': row['S']
                     }
-        except Exception: pass
+        except Exception as e:
+            if verbose:
+                print(f"Warning: Could not load probe cache: {e}", file=sys.stderr)
 
-def append_to_probe_cache(filepath, size, mtime, v, a, s):
+def append_to_probe_cache(filepath, size, mtime, v, a, s, verbose=False):
     os.makedirs(os.path.dirname(PROBE_CACHE_PATH), exist_ok=True)
     is_new = not os.path.exists(PROBE_CACHE_PATH) or os.path.getsize(PROBE_CACHE_PATH) == 0
     try:
@@ -141,9 +171,11 @@ def append_to_probe_cache(filepath, size, mtime, v, a, s):
             if is_new:
                 writer.writerow(['Filepath', 'Size', 'MTime', 'V', 'A', 'S'])
             writer.writerow([filepath, str(size), str(mtime), v, a, s])
-    except Exception: pass
+    except Exception as e:
+        if verbose:
+            print(f"Warning: Could not update probe cache: {e}", file=sys.stderr)
 
-def probe_and_cache(p, size, mtime, write_cache=True):
+def probe_and_cache(p, size, mtime, write_cache=True, verbose=False):
     cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name', '-of', 'json', p]
     try:
         out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
@@ -168,13 +200,15 @@ def probe_and_cache(p, size, mtime, write_cache=True):
         s = ",".join(list(dict.fromkeys(s_codecs))) if s_codecs else "---"
         
         if write_cache:
-            append_to_probe_cache(p, size, mtime, v, a, s)
+            append_to_probe_cache(p, size, mtime, v, a, s, verbose=verbose)
             PROBE_CACHE[p] = {'size': str(size), 'mtime': str(mtime), 'v': v, 'a': a, 's': s}
         return v, a, s
-    except Exception:
+    except Exception as e:
+        if verbose:
+            print(f"Warning: Could not probe '{p}': {e}", file=sys.stderr)
         return "---", "---", "---"
 
-def is_hevc(f, write_cache=True):
+def is_hevc(f, write_cache=True, verbose=False):
     try:
         stat = os.stat(f)
         size = stat.st_size
@@ -185,7 +219,7 @@ def is_hevc(f, write_cache=True):
     if f in PROBE_CACHE and PROBE_CACHE[f]['size'] == str(size) and PROBE_CACHE[f]['mtime'] == mtime:
         return PROBE_CACHE[f]['v'].lower() == 'hevc'
 
-    v, _, _ = probe_and_cache(f, size, mtime, write_cache=write_cache)
+    v, _, _ = probe_and_cache(f, size, mtime, write_cache=write_cache, verbose=verbose)
     return v.lower() == 'hevc'
 
 # --- Helper Functions ---
@@ -218,6 +252,117 @@ def get_stream_info(file_path):
         return json.loads(result.stdout).get('streams', [])
     except Exception:
         tqdm.write(f"Error: Could not get stream information from '{file_path}'.", file=sys.stderr); return None
+
+def probe_media(file_path):
+    """Return format and stream metadata used to validate completed output."""
+    cmd = ['ffprobe', '-v', 'error', '-show_format', '-show_streams', '-of', 'json', file_path]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return json.loads(result.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as e:
+        return None
+
+def get_media_duration(probe_data):
+    if not probe_data:
+        return None
+    candidates = [probe_data.get('format', {}).get('duration')]
+    candidates.extend(s.get('duration') for s in probe_data.get('streams', []))
+    for value in candidates:
+        try:
+            duration = float(value)
+            if duration > 0:
+                return duration
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def verify_output_file(source_file, output_file, expect_hevc):
+    """Verify readability, expected video codec, and reasonable duration parity."""
+    source_data = probe_media(source_file)
+    output_data = probe_media(output_file)
+    if not output_data:
+        return False, "FFprobe could not read the output"
+
+    def content_video_streams(probe_data):
+        return [
+            stream for stream in (probe_data or {}).get('streams', [])
+            if stream.get('codec_type') == 'video'
+            and stream.get('disposition', {}).get('attached_pic', 0) != 1
+        ]
+
+    source_video = content_video_streams(source_data)
+    output_video = content_video_streams(output_data)
+    if source_video and not output_video:
+        return False, "the output is missing its video stream"
+    if expect_hevc and output_video and not any(
+        stream.get('codec_name', '').lower() in ('hevc', 'h265') for stream in output_video
+    ):
+        codecs = ", ".join(stream.get('codec_name', 'unknown') for stream in output_video)
+        return False, f"expected HEVC video but FFprobe reported {codecs}"
+
+    source_duration = get_media_duration(source_data)
+    output_duration = get_media_duration(output_data)
+    if source_duration is not None and output_duration is not None:
+        tolerance = max(5.0, source_duration * 0.02)
+        if abs(source_duration - output_duration) > tolerance:
+            return False, f"duration differs by {abs(source_duration - output_duration):.2f}s (allowed {tolerance:.2f}s)"
+    return True, None
+
+def generate_output_filename(base, is_remux, has_chapters, is_normalized, rename_x264=False):
+    if rename_x264:
+        base = re.sub(r'(?i)x264|h264|avc|mpeg4', 'x265', base)
+    sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.')
+    suffix = ".REMUX" if is_remux else ".CONV"
+    chapter_suffix = ".CHAPTERS" if has_chapters else ""
+    norm_suffix = ".NORM" if is_normalized else ""
+    base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
+    return f"{base_no_suffix}{suffix}{norm_suffix}{chapter_suffix}.mkv"
+
+def get_unique_working_output(temp_dir, final_output_file, input_file):
+    digest = hashlib.sha256(os.path.abspath(input_file).encode('utf-8')).hexdigest()[:10]
+    base, ext = os.path.splitext(os.path.basename(final_output_file))
+    return os.path.join(temp_dir, f".{base}.hvec-{os.getpid()}-{digest}{ext}")
+
+def terminate_process(process, timeout=5):
+    """Terminate an FFmpeg process and its process group, escalating if necessary."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        if os.name == 'posix':
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        process.wait(timeout=timeout)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            try:
+                if os.name == 'posix':
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+                process.wait(timeout=timeout)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+
+class TemporaryArtifacts:
+    def __init__(self):
+        self.paths = []
+
+    def add(self, path):
+        self.paths.append(path)
+        return path
+
+    def cleanup(self):
+        for path in reversed(self.paths):
+            try:
+                if os.path.lexists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        self.paths.clear()
+
+    def __del__(self):
+        self.cleanup()
 
 def plan_stream_selection(streams):
     streams_to_keep, streams_to_remove = [], []
@@ -296,7 +441,7 @@ def find_video_files(p, r):
 
 def print_ffmpeg_command(cmd):
     tqdm.write("\nExecuting FFmpeg command (Dry Run):")
-    tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
+    tqdm.write(shlex.join(cmd))
 
 def run_loudnorm_analysis(input_file: str) -> Tuple[Dict[str, float] or None, float]:
     start_time = time.time()
@@ -360,7 +505,7 @@ def embed_chapters_mkvpropedit(chapter_file, output_file):
         tqdm.write("\nError: 'mkvpropedit' command not found. Please install MKVToolNix.", file=sys.stderr); return False
     mkvpropedit_cmd = ['mkvpropedit', output_file, '--chapters', chapter_file]
     tqdm.write("\nExecuting mkvpropedit command:")
-    tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in mkvpropedit_cmd))
+    tqdm.write(shlex.join(mkvpropedit_cmd))
     try:
         subprocess.run(mkvpropedit_cmd, check=True, capture_output=True, text=True)
         tqdm.write(f"Successfully embedded chapters into '{os.path.basename(output_file)}'.")
@@ -394,11 +539,28 @@ def finalize_sync_output(working_output_file, final_output_file):
             pass
         raise
 
-def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False, bar_position=0, measured_loudness=None):
+def run_ffmpeg_command(cmd, source_file, delete_source, expect_hevc, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False, bar_position=0, measured_loudness=None):
     tqdm.write("\nExecuting FFmpeg command:")
-    tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
+    tqdm.write(shlex.join(cmd))
     output_file = cmd[-1]
     original_size_bytes = os.path.getsize(source_file) if os.path.exists(source_file) else None
+    process = None
+
+    def remove_failed_output():
+        try:
+            if os.path.exists(output_file):
+                os.remove(output_file)
+                if verbose:
+                    tqdm.write(f"Info: Removed incomplete output '{output_file}'.")
+        except OSError as cleanup_error:
+            tqdm.write(f"Warning: Could not remove incomplete output '{output_file}': {cleanup_error}", file=sys.stderr)
+
+    def close_process_stdout():
+        if process is not None and process.stdout is not None:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
 
     ffmpeg_success = False
     try:
@@ -406,37 +568,60 @@ def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, 
             subprocess.run(cmd, check=True)
         else:
             if total_frames is None: tqdm.write("\nWarning: Could not get total frames. Progress bar indeterminate.")
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8')
-            with tqdm(total=total_frames, unit='frame', dynamic_ncols=True, desc="Current Video", position=bar_position, leave=True) as pbar:
-                for line in process.stdout:
-                    if line.strip().startswith("frame="):
-                        current_frame = int(line.strip().split("=")[1]); pbar.update(max(0, current_frame - pbar.n))
-            stderr_output = process.stderr.read(); process.wait()
-            if process.returncode != 0: raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_output)
+            with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as stderr_file:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    universal_newlines=True,
+                    encoding='utf-8',
+                    start_new_session=(os.name == 'posix')
+                )
+                with tqdm(total=total_frames, unit='frame', dynamic_ncols=True, desc="Current Video", position=bar_position, leave=True) as pbar:
+                    for line in process.stdout:
+                        if line.strip().startswith("frame="):
+                            try:
+                                current_frame = int(line.strip().split("=", 1)[1])
+                                pbar.update(max(0, current_frame - pbar.n))
+                            except (IndexError, ValueError):
+                                continue
+                process.stdout.close()
+                process.wait()
+                stderr_file.seek(0)
+                stderr_output = stderr_file.read()
+                if process.returncode != 0: raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_output)
         ffmpeg_success = True
-    except (subprocess.CalledProcessError, FileNotFoundError, KeyboardInterrupt) as e:
+    except (subprocess.CalledProcessError, OSError, KeyboardInterrupt) as e:
         if isinstance(e, subprocess.CalledProcessError):
-             tqdm.write(f"\n{RED}--- FFmpeg Error ---{RESET}\n{e.stderr}\n{RED}--------------------{RESET}", file=sys.stderr)
-             if 'process' in locals(): process.terminate()
+             error_details = e.stderr.strip() if e.stderr else f"FFmpeg exited with status {e.returncode}; see diagnostics above."
+             tqdm.write(f"\n{RED}--- FFmpeg Error ---{RESET}\n{error_details}\n{RED}--------------------{RESET}", file=sys.stderr)
+             terminate_process(process)
+             close_process_stdout()
+             remove_failed_output()
              return False
-        elif isinstance(e, FileNotFoundError):
-             tqdm.write(f"\n{RED}Error: Required command not found (ffmpeg/stdbuf).{RESET}", file=sys.stderr)
-             if 'process' in locals(): process.terminate()
+        elif isinstance(e, OSError):
+             tqdm.write(f"\n{RED}Error: Could not start FFmpeg: {e}.{RESET}", file=sys.stderr)
+             terminate_process(process)
+             close_process_stdout()
+             remove_failed_output()
              return False
         else:
              tqdm.write(f"\n{RED}Cancelled.{RESET}", file=sys.stderr)
-             if 'process' in locals(): process.terminate()
+             terminate_process(process)
+             close_process_stdout()
+             remove_failed_output()
              sys.exit(1)
 
     if not ffmpeg_success or not os.path.exists(output_file):
         tqdm.write(f"\n{RED}Error: FFmpeg failed or output file '{output_file}' not created.{RESET}", file=sys.stderr)
+        remove_failed_output()
         return False
         
-    try:
-        new_size_bytes = os.path.getsize(output_file)
-        subprocess.run(['ffprobe', '-v', 'error', output_file], check=True, capture_output=True)
-    except Exception:
-        tqdm.write(f"\n{RED}Error: Output file '{output_file}' appears invalid after FFmpeg.{RESET}", file=sys.stderr)
+    new_size_bytes = os.path.getsize(output_file)
+    output_valid, verification_error = verify_output_file(source_file, output_file, expect_hevc)
+    if not output_valid:
+        tqdm.write(f"\n{RED}Error: Output verification failed: {verification_error}.{RESET}", file=sys.stderr)
+        remove_failed_output()
         return False
 
     tqdm.write(f"\nSuccessfully created and verified FFmpeg output '{output_file}'.")
@@ -538,7 +723,16 @@ def show_file_info_popup(stdscr, filepath):
     win.refresh()
     win.getch()
 
-def run_tui(target_dir, initial_recursive, write_cache=True):
+def run_tui(target_dir, initial_recursive, write_cache=True, verbose=False):
+    global curses
+    if curses is None:
+        try:
+            import curses as curses_impl
+            curses = curses_impl
+        except ImportError:
+            print("Error: The Python curses module is required for --tui.", file=sys.stderr)
+            return None
+
     def main_loop(stdscr):
         curses.curs_set(0)
         
@@ -655,7 +849,7 @@ def run_tui(target_dir, initial_recursive, write_cache=True):
                         stdscr.refresh()
                     except Exception: pass
                     
-                    v, a, s = probe_and_cache(p, size, mtime, write_cache=write_cache)
+                    v, a, s = probe_and_cache(p, size, mtime, write_cache=write_cache, verbose=verbose)
                     if v.lower() == 'hevc':
                         return
 
@@ -808,7 +1002,11 @@ def main():
                         help='Automatically answer "yes" to all interactive prompts')
     info_group.add_argument("-v", "--version", action="store_true", help="Show version history and exit.")
 
-    argcomplete.autocomplete(parser)
+    try:
+        import argcomplete as argcomplete_impl
+        argcomplete_impl.autocomplete(parser)
+    except ImportError:
+        pass
     args = parser.parse_args()
 
     if args.version:
@@ -850,8 +1048,11 @@ def main():
         print("\nError: -i/--input is required (unless using a --profile or -T/--tui).")
         sys.exit(1)
 
+    if not load_runtime_dependencies():
+        sys.exit(1)
+
     # Load the global persistent cache so it's ready for TUI and batch skips
-    load_probe_cache()
+    load_probe_cache(verbose=args.verbose)
 
     if args.verbose: print("Info: Verbose mode enabled.")
     
@@ -860,6 +1061,19 @@ def main():
         args.input = "."
 
     if not os.path.exists(args.input): print(f"Error: Input path not found: {args.input}", file=sys.stderr); sys.exit(1)
+
+    if args.abitrate and not args.acodec:
+        parser.error("--abitrate requires --acodec")
+    if args.smart_audio and args.acodec:
+        parser.error("--smart-audio and --acodec cannot be used together")
+    if args.normalize is not None and (args.smart_audio or args.acodec):
+        parser.error("--normalize cannot be combined with --smart-audio or --acodec")
+    if args.output and (os.path.isdir(args.input) or args.out_dir or args.sync_filename):
+        parser.error("--output is only valid for one input and cannot be combined with --out-dir or --sync-filename")
+    if os.path.isdir(args.input) and args.subs:
+        parser.error("--subs is only supported for a single input file")
+    if os.path.isdir(args.input) and args.chapters:
+        parser.error("--chapters is only supported for a single input file")
 
     is_mediainfo_prompt_mode = False
     if args.mediainfo:
@@ -891,7 +1105,7 @@ def main():
 
     # --- TUI Execution Path ---
     if args.tui:
-        selected_files = run_tui(args.input, args.recursive, write_cache=not args.dry_run)
+        selected_files = run_tui(args.input, args.recursive, write_cache=not args.dry_run, verbose=args.verbose)
         if selected_files is None:
             print("\nCancelled by user.")
             sys.exit(0)
@@ -943,7 +1157,7 @@ def main():
                  chapter_file_for_this_run = None
 
             permissions_to_apply = None
-            if not args.dry_run:
+            if not args.dry_run and grp is not None:
                 try:
                     stat_info = os.stat(input_file); input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
                     target_gid = input_gid
@@ -952,30 +1166,19 @@ def main():
                             jellyfin_gid = grp.getgrnam('jellyfin').gr_gid
                             response = input(f"Warning: Source group is '{input_group_name}'. Change output to 'jellyfin'? [Y/n]: ").lower().strip()
                             if response in ('y', 'yes', ''): target_gid = jellyfin_gid
-                        except Exception: pass
+                        except Exception as e:
+                            if args.verbose: tqdm.write(f"Info: Keeping source group '{input_group_name}': {e}")
                     permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
-                except Exception: pass
+                except Exception as e:
+                    if args.verbose: tqdm.write(f"Warning: Could not inspect source permissions: {e}", file=sys.stderr)
 
-            if args.skip_hevc and is_hevc(input_file, write_cache=not args.dry_run):
+            if args.skip_hevc and is_hevc(input_file, write_cache=not args.dry_run, verbose=args.verbose):
                 tqdm.write("Already HEVC. Skipping.")
                 if is_batch_mode: batch_bar.update(1)
                 continue
 
             is_remux_op = args.remux and not args.hvec
             is_transcode_op = not is_remux_op
-
-            def generate_output_filename(base, is_remux, has_chapters, is_normalized, rename_x264=False):
-                if rename_x264:
-                    new_base = re.sub(r'(?i)x264|h264|avc|mpeg4', 'x265', base)
-                    if new_base != base and args.verbose: tqdm.write(f"Info: Renamed tag in filename: '{base}' -> '{new_base}'")
-                    base = new_base
-
-                sanitized = re.sub(r'[\(\)\[\]]', '', base).replace(' ', '.').replace('_', '.')
-                suffix = ".REMUX" if is_remux else ".CONV"
-                chapter_suffix = ".CHAPTERS" if has_chapters else ""
-                norm_suffix = ".NORM" if is_normalized else ""
-                base_no_suffix = sanitized.replace(suffix, '') if sanitized.endswith(suffix) else sanitized
-                return f"{base_no_suffix}{suffix}{norm_suffix}{chapter_suffix}.mkv"
 
             if args.output and len(files_to_process) == 1: final_output_file = args.output
             elif args.sync_filename:
@@ -987,6 +1190,9 @@ def main():
                 final_output_file = os.path.join(os.path.dirname(input_file), f"{base}.mkv")
             else:
                 base, _ = os.path.splitext(os.path.basename(input_file))
+                if do_x264_rename and args.verbose:
+                    renamed_base = re.sub(r'(?i)x264|h264|avc|mpeg4', 'x265', base)
+                    if renamed_base != base: tqdm.write(f"Info: Renamed tag in filename: '{base}' -> '{renamed_base}'")
                 new_filename = generate_output_filename(base, is_remux_op, chapter_file_for_this_run is not None, is_normalize_enabled, rename_x264=do_x264_rename)
                 if args.out_dir:
                     relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(input_file))
@@ -1000,7 +1206,7 @@ def main():
                 if not args.dry_run:
                     try: os.makedirs(args.temp_dir, exist_ok=True)
                     except OSError as e: tqdm.write(f"Error: Could not create temp dir: {e}", file=sys.stderr); sys.exit(1)
-                working_output_file = os.path.join(args.temp_dir, os.path.basename(final_output_file))
+                working_output_file = get_unique_working_output(args.temp_dir, final_output_file, input_file)
                 if args.verbose: tqdm.write(f"Info: Using temp file '{working_output_file}'")
                 if not args.dry_run and os.path.abspath(final_output_file) == os.path.abspath(input_file) and not args.delete:
                     tqdm.write("Error: --sync-filename would replace the source. Use --delete to confirm replacement.", file=sys.stderr)
@@ -1054,13 +1260,13 @@ def main():
                 ffmpeg_cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', qsv_fmt])
 
             # --- Extract Embedded EIA-608 Captions from .ts Files ---
-            temp_files_to_cleanup = []
+            temp_artifacts = TemporaryArtifacts()
             extracted_ts_subs = False
             
             if input_file.lower().endswith('.ts') and not args.dry_run:
                 tqdm.write("Info: Checking for embedded EIA-608 closed captions...")
-                ts_srt_temp = f"/tmp/cc_extract_{os.getpid()}_{i}.srt"
-                ts_symlink_temp = f"/tmp/cc_link_{os.getpid()}_{i}.ts"
+                ts_srt_temp = temp_artifacts.add(f"/tmp/cc_extract_{os.getpid()}_{i}.srt")
+                ts_symlink_temp = temp_artifacts.add(f"/tmp/cc_link_{os.getpid()}_{i}.ts")
                 try:
                     # Create a safe symlink in /tmp to bypass lavfi's issue with spaces/apostrophes
                     if os.path.exists(ts_symlink_temp): os.remove(ts_symlink_temp)
@@ -1073,7 +1279,6 @@ def main():
                     if os.path.exists(ts_srt_temp) and os.path.getsize(ts_srt_temp) > 50:
                         tqdm.write("  -> Successfully extracted hidden captions to SRT!")
                         extracted_ts_subs = True
-                        temp_files_to_cleanup.append(ts_srt_temp)
                     else:
                         tqdm.write("  -> No embedded captions found.")
                         if os.path.exists(ts_srt_temp): os.remove(ts_srt_temp)
@@ -1101,7 +1306,8 @@ def main():
                         if item_ext.lower() in SUBTITLE_EXTENSIONS and (item_base == input_base or item_base.startswith(f"{input_base}.")):
                             abs_item_path = os.path.abspath(item_path)
                             if abs_item_path not in external_sub_files: external_sub_files.append(abs_item_path)
-                except OSError: pass
+                except OSError as e:
+                    if args.verbose: tqdm.write(f"Warning: Could not scan for sidecar subtitles: {e}", file=sys.stderr)
 
             ffmpeg_cmd.extend(['-i', input_file])
             for sub_file in external_sub_files: ffmpeg_cmd.extend(['-i', sub_file])
@@ -1171,10 +1377,14 @@ def main():
                 if analysis_data and normalize_mode == 'add': ffmpeg_cmd.extend(['-filter_complex', filter_string_for_complex])
 
             if args.filter_streams and len(files_to_process) == 1:
-                if not all_streams: continue
+                if not all_streams:
+                    temp_artifacts.cleanup()
+                    continue
                 s_keep, s_rem = plan_stream_selection(all_streams)
 
-                if not display_and_confirm_plan(s_keep, s_rem): continue
+                if not display_and_confirm_plan(s_keep, s_rem):
+                    temp_artifacts.cleanup()
+                    continue
 
                 kept_subs = [s for s in s_keep if s.get('codec_type') == 'subtitle']
                 eng_srts = [s for s in kept_subs if s.get('codec_name') == 'subrip' and s.get('tags', {}).get('language') == 'eng']
@@ -1188,7 +1398,9 @@ def main():
                                 s_keep.remove(s)
                                 s_rem.append(s)
                         s_rem.sort(key=lambda x: x['index'])
-                        if not display_and_confirm_plan(s_keep, s_rem): continue
+                        if not display_and_confirm_plan(s_keep, s_rem):
+                            temp_artifacts.cleanup()
+                            continue
 
                 for stream in s_keep: ffmpeg_cmd.extend(['-map', f"0:{stream['index']}"])
             else:
@@ -1250,14 +1462,15 @@ def main():
                 print_ffmpeg_command(ffmpeg_cmd)
             else:
                 delete_during_processing = args.delete and not args.sync_filename
-                success = run_ffmpeg_command(ffmpeg_cmd, input_file, delete_during_processing, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
+                success = run_ffmpeg_command(ffmpeg_cmd, input_file, delete_during_processing, expect_hevc=is_transcode_op, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
                 
                 perform_log_update = False
                 if not success:
                     failed_files.append(input_file)
                     if args.sync_filename and os.path.exists(working_output_file):
                         try: os.remove(working_output_file)
-                        except OSError: pass
+                        except OSError as e:
+                            tqdm.write(f"Warning: Could not remove failed temporary output: {e}", file=sys.stderr)
                 else:
                     if args.sync_filename:
                         if os.path.exists(working_output_file):
@@ -1293,11 +1506,7 @@ def main():
                         except Exception as e:
                             tqdm.write(f"Warning: Could not update loudness log: {e}", file=sys.stderr)
 
-            # Cleanup any temporary subtitle extraction files
-            for tf in temp_files_to_cleanup:
-                if os.path.exists(tf):
-                    try: os.remove(tf)
-                    except OSError: pass
+            temp_artifacts.cleanup()
 
             if is_batch_mode:
                 batch_bar.update(1)
