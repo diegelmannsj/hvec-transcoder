@@ -16,13 +16,18 @@ import csv
 import time
 import curses
 import builtins
+import errno
+import tempfile
 
 # --- Version History ---
-__version__ = "8.6.9"
+__version__ = "8.7.0"
 
-VERSION_HISTORY = f"""
-,hvec Transcoder v{__version__}
----------------------------------
+VERSION_HISTORY = """Version History:
+v8.7.0 fix(safety): Safer Processing and CLI Behavior
+        - Deferred source deletion in sync mode until final output placement succeeds.
+        - Made dry-run avoid cache, log, directory, caption extraction, and loudness-analysis writes.
+        - Fixed version handling, batch normalization state, validation, and failure exit status.
+
 v8.6.9 fix(transcode): Dynamic QSV Format
         - Replaced hardcoded `-hwaccel_output_format nv12` to fix fatal decoding errors in FFmpeg 7+ for 10-bit sources on QSV.
         - Added ffprobe bit-depth detection (pix_fmt) to automatically determine the correct hardware surface (p010le vs nv12).
@@ -56,21 +61,18 @@ v8.6.4 feat(audio): Batch Normalization Profile & Prompts
 # --- PRIORITY CONTROL (Python Native) ---
 def enforce_background_priority():
     if '--no-nice' in sys.argv:
-        return
+        return None
     if not sys.platform.startswith('linux'):
-        return
+        return None
     try:
         current_nice = os.nice(0)
         if current_nice < 19:
-            print("Auto-adjusting priority: Switching to Background Mode (Nice 19, IO Idle)...")
-            sys.stdout.flush()
-            new_args = ['nice', '-n', '19', 'ionice', '-c', '3'] + sys.argv
-            os.execvp('nice', new_args)
+            os.nice(19 - current_nice)
+        if shutil.which('ionice'):
+            subprocess.run(['ionice', '-c', '3', '-p', str(os.getpid())], check=True, capture_output=True, text=True)
     except Exception as e:
-        print(f"Warning: Could not auto-adjust priority: {e}", file=sys.stderr)
-
-enforce_background_priority()
-
+        return f"Warning: Could not auto-adjust priority: {e}"
+    return None
 
 # --- Constants ---
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.m2ts', '.wmv', '.flv', '.webm', '.iso')
@@ -141,7 +143,7 @@ def append_to_probe_cache(filepath, size, mtime, v, a, s):
             writer.writerow([filepath, str(size), str(mtime), v, a, s])
     except Exception: pass
 
-def probe_and_cache(p, size, mtime):
+def probe_and_cache(p, size, mtime, write_cache=True):
     cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name', '-of', 'json', p]
     try:
         out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
@@ -165,13 +167,14 @@ def probe_and_cache(p, size, mtime):
         a = ",".join(list(dict.fromkeys(a_codecs))) if a_codecs else "---"
         s = ",".join(list(dict.fromkeys(s_codecs))) if s_codecs else "---"
         
-        append_to_probe_cache(p, size, mtime, v, a, s)
-        PROBE_CACHE[p] = {'size': str(size), 'mtime': str(mtime), 'v': v, 'a': a, 's': s}
+        if write_cache:
+            append_to_probe_cache(p, size, mtime, v, a, s)
+            PROBE_CACHE[p] = {'size': str(size), 'mtime': str(mtime), 'v': v, 'a': a, 's': s}
         return v, a, s
     except Exception:
         return "---", "---", "---"
 
-def is_hevc(f):
+def is_hevc(f, write_cache=True):
     try:
         stat = os.stat(f)
         size = stat.st_size
@@ -182,7 +185,7 @@ def is_hevc(f):
     if f in PROBE_CACHE and PROBE_CACHE[f]['size'] == str(size) and PROBE_CACHE[f]['mtime'] == mtime:
         return PROBE_CACHE[f]['v'].lower() == 'hevc'
 
-    v, _, _ = probe_and_cache(f, size, mtime)
+    v, _, _ = probe_and_cache(f, size, mtime, write_cache=write_cache)
     return v.lower() == 'hevc'
 
 # --- Helper Functions ---
@@ -219,7 +222,7 @@ def get_stream_info(file_path):
 def plan_stream_selection(streams):
     streams_to_keep, streams_to_remove = [], []
     for s in streams:
-        keep = False; stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); title = s.get('title', '').lower()
+        keep = False; stype = s.get('codec_type'); tags = s.get('tags', {}); lang = tags.get('language', 'und').lower(); title = tags.get('title', '').lower()
         if stype == 'video' or (stype == 'audio' and (lang == 'eng' or 'commentary' in title or 'director' in title)) or (stype == 'subtitle' and lang == 'eng'): keep = True
         if keep: streams_to_keep.append(s)
         else: streams_to_remove.append(s)
@@ -367,6 +370,30 @@ def embed_chapters_mkvpropedit(chapter_file, output_file):
     except Exception as e:
         tqdm.write(f"\nAn unexpected error occurred running mkvpropedit: {e}", file=sys.stderr); return False
 
+def finalize_sync_output(working_output_file, final_output_file):
+    """Place a verified temporary output at its destination without exposing a partial file."""
+    try:
+        os.replace(working_output_file, final_output_file)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+
+    final_dir = os.path.dirname(os.path.abspath(final_output_file))
+    prefix = f".{os.path.basename(final_output_file)}.hvec-"
+    fd, staging_file = tempfile.mkstemp(prefix=prefix, dir=final_dir)
+    os.close(fd)
+    try:
+        shutil.copy2(working_output_file, staging_file)
+        os.replace(staging_file, final_output_file)
+        os.remove(working_output_file)
+    except Exception:
+        try:
+            os.remove(staging_file)
+        except OSError:
+            pass
+        raise
+
 def run_ffmpeg_command(cmd, source_file, delete_source, audio_normalized=False, total_frames=None, permissions=None, chapter_file_to_embed=None, verbose=False, bar_position=0, measured_loudness=None):
     tqdm.write("\nExecuting FFmpeg command:")
     tqdm.write(' '.join(f'"{a}"' if ' ' in a else a for a in cmd))
@@ -511,7 +538,7 @@ def show_file_info_popup(stdscr, filepath):
     win.refresh()
     win.getch()
 
-def run_tui(target_dir, initial_recursive):
+def run_tui(target_dir, initial_recursive, write_cache=True):
     def main_loop(stdscr):
         curses.curs_set(0)
         
@@ -628,7 +655,7 @@ def run_tui(target_dir, initial_recursive):
                         stdscr.refresh()
                     except Exception: pass
                     
-                    v, a, s = probe_and_cache(p, size, mtime)
+                    v, a, s = probe_and_cache(p, size, mtime, write_cache=write_cache)
                     if v.lower() == 'hevc':
                         return
 
@@ -734,12 +761,10 @@ def run_tui(target_dir, initial_recursive):
 
 # --- Main Logic ---
 def main():
-    # ALWAYS print version first, regardless of flags
-    print(f",hvec Transcoder v{__version__}\n")
-    print(f",hvec v{__version__}")
-    
-    # Load the global persistent cache so it's ready for TUI and batch skips
-    load_probe_cache()
+    print(f",hvec Transcoder v{__version__}\n", flush=True)
+    priority_warning = enforce_background_priority()
+    if priority_warning:
+        print(priority_warning, file=sys.stderr)
 
     parser = argparse.ArgumentParser(description="A tool to transcode or remux files using Intel QSV.", formatter_class=argparse.RawTextHelpFormatter, epilog="Examples:\n  ,hvec -i \"My Movie.mkv\" -E\n  ,hvec -i /videos/ -D -E -R\n  ,hvec -T -i /recordings/\n  ,hvec -i movie.mkv -N /path/to/loudness_audit.csv")
 
@@ -786,6 +811,13 @@ def main():
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
 
+    if args.version:
+        print(VERSION_HISTORY)
+        sys.exit(0)
+
+    if not 1 <= args.quality <= 51:
+        parser.error("--quality must be between 1 and 51")
+
     # Apply assume-yes logic by overriding the builtin input function
     if getattr(args, "assume_yes", False):
         def assume_yes_input(prompt_text=""):
@@ -818,8 +850,10 @@ def main():
         print("\nError: -i/--input is required (unless using a --profile or -T/--tui).")
         sys.exit(1)
 
+    # Load the global persistent cache so it's ready for TUI and batch skips
+    load_probe_cache()
+
     if args.verbose: print("Info: Verbose mode enabled.")
-    if args.version: print(VERSION_HISTORY); sys.exit(0)
     
     # Handle Input defaulting for TUI
     if args.tui and not args.input:
@@ -846,18 +880,18 @@ def main():
             except (KeyboardInterrupt, EOFError): print("\nCancelled."); sys.exit(1)
 
     loudness_db = {}
-    is_normalize_enabled = args.normalize is not None
+    normalize_requested = args.normalize is not None
     active_log_file = None
     if isinstance(args.normalize, str):
         active_log_file = args.normalize; loudness_db = load_loudness_db(active_log_file, args.verbose)
-    elif is_normalize_enabled:
+    elif normalize_requested:
         if os.path.exists(CWD_LOG_PATH): active_log_file = CWD_LOG_PATH; loudness_db = load_loudness_db(CWD_LOG_PATH, args.verbose)
         elif os.path.exists(DEFAULT_LOG_PATH): active_log_file = DEFAULT_LOG_PATH; loudness_db = load_loudness_db(DEFAULT_LOG_PATH, args.verbose)
         else: active_log_file = DEFAULT_LOG_PATH
 
     # --- TUI Execution Path ---
     if args.tui:
-        selected_files = run_tui(args.input, args.recursive)
+        selected_files = run_tui(args.input, args.recursive, write_cache=not args.dry_run)
         if selected_files is None:
             print("\nCancelled by user.")
             sys.exit(0)
@@ -898,6 +932,7 @@ def main():
     with tqdm(total=len(files_to_process), desc="Total", unit="file", position=0, dynamic_ncols=True, disable=not is_batch_mode) as batch_bar:
         for i, input_file in enumerate(files_to_process, 1):
             tqdm.write(f"\n--- Processing: {os.path.basename(input_file)} ---")
+            is_normalize_enabled = normalize_requested
 
             chapter_file_for_this_run = args.chapters
             if chapter_file_for_this_run and len(files_to_process) > 1:
@@ -908,19 +943,20 @@ def main():
                  chapter_file_for_this_run = None
 
             permissions_to_apply = None
-            try:
-                stat_info = os.stat(input_file); input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
-                target_gid = input_gid
-                if input_group_name != 'jellyfin':
-                    try:
-                        jellyfin_gid = grp.getgrnam('jellyfin').gr_gid
-                        response = input(f"Warning: Source group is '{input_group_name}'. Change output to 'jellyfin'? [Y/n]: ").lower().strip()
-                        if response in ('y', 'yes', ''): target_gid = jellyfin_gid
-                    except Exception: pass
-                permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
-            except Exception: pass
+            if not args.dry_run:
+                try:
+                    stat_info = os.stat(input_file); input_gid = stat_info.st_gid; input_group_name = grp.getgrgid(input_gid).gr_name
+                    target_gid = input_gid
+                    if input_group_name != 'jellyfin':
+                        try:
+                            jellyfin_gid = grp.getgrnam('jellyfin').gr_gid
+                            response = input(f"Warning: Source group is '{input_group_name}'. Change output to 'jellyfin'? [Y/n]: ").lower().strip()
+                            if response in ('y', 'yes', ''): target_gid = jellyfin_gid
+                        except Exception: pass
+                    permissions_to_apply = {'uid': stat_info.st_uid, 'gid': target_gid, 'mode': stat_info.st_mode}
+                except Exception: pass
 
-            if args.skip_hevc and is_hevc(input_file):
+            if args.skip_hevc and is_hevc(input_file, write_cache=not args.dry_run):
                 tqdm.write("Already HEVC. Skipping.")
                 if is_batch_mode: batch_bar.update(1)
                 continue
@@ -954,15 +990,23 @@ def main():
                 new_filename = generate_output_filename(base, is_remux_op, chapter_file_for_this_run is not None, is_normalize_enabled, rename_x264=do_x264_rename)
                 if args.out_dir:
                     relative_path = os.path.relpath(os.path.dirname(input_file), args.input if os.path.isdir(args.input) else os.path.dirname(input_file))
-                    output_dir = os.path.join(args.out_dir, relative_path); os.makedirs(output_dir, exist_ok=True)
+                    output_dir = os.path.join(args.out_dir, relative_path)
+                    if not args.dry_run:
+                        os.makedirs(output_dir, exist_ok=True)
                     final_output_file = os.path.join(output_dir, new_filename)
                 else: final_output_file = os.path.join(os.path.dirname(input_file), new_filename)
 
             if args.sync_filename:
-                try: os.makedirs(args.temp_dir, exist_ok=True)
-                except OSError as e: tqdm.write(f"Error: Could not create temp dir: {e}", file=sys.stderr); sys.exit(1)
+                if not args.dry_run:
+                    try: os.makedirs(args.temp_dir, exist_ok=True)
+                    except OSError as e: tqdm.write(f"Error: Could not create temp dir: {e}", file=sys.stderr); sys.exit(1)
                 working_output_file = os.path.join(args.temp_dir, os.path.basename(final_output_file))
                 if args.verbose: tqdm.write(f"Info: Using temp file '{working_output_file}'")
+                if not args.dry_run and os.path.abspath(final_output_file) == os.path.abspath(input_file) and not args.delete:
+                    tqdm.write("Error: --sync-filename would replace the source. Use --delete to confirm replacement.", file=sys.stderr)
+                    failed_files.append(input_file)
+                    if is_batch_mode: batch_bar.update(1)
+                    continue
             else:
                 working_output_file = final_output_file
                 if os.path.abspath(working_output_file) == os.path.abspath(input_file):
@@ -1013,7 +1057,7 @@ def main():
             temp_files_to_cleanup = []
             extracted_ts_subs = False
             
-            if input_file.lower().endswith('.ts'):
+            if input_file.lower().endswith('.ts') and not args.dry_run:
                 tqdm.write("Info: Checking for embedded EIA-608 closed captions...")
                 ts_srt_temp = f"/tmp/cc_extract_{os.getpid()}_{i}.srt"
                 ts_symlink_temp = f"/tmp/cc_link_{os.getpid()}_{i}.ts"
@@ -1054,7 +1098,7 @@ def main():
                 try:
                     for item in os.listdir(input_dir):
                         item_path = os.path.join(input_dir, item); item_base, item_ext = os.path.splitext(item)
-                        if item_ext.lower() in SUBTITLE_EXTENSIONS and item_base.startswith(input_base):
+                        if item_ext.lower() in SUBTITLE_EXTENSIONS and (item_base == input_base or item_base.startswith(f"{input_base}.")):
                             abs_item_path = os.path.abspath(item_path)
                             if abs_item_path not in external_sub_files: external_sub_files.append(abs_item_path)
                 except OSError: pass
@@ -1104,6 +1148,9 @@ def main():
             if is_normalize_enabled:
                 abs_input_file = os.path.abspath(input_file)
                 if abs_input_file in loudness_db: analysis_data = loudness_db[abs_input_file]; tqdm.write("Info: Found pre-analyzed data.")
+                elif args.dry_run:
+                    tqdm.write("Dry run: Skipping loudness analysis and using target values in the preview command.")
+                    analysis_data = {'i': TARGET_LOUDNESS, 'tp': TARGET_TRUE_PEAK, 'lra': TARGET_LRA, 'thresh': TARGET_LOUDNESS - 10.0}
                 else:
                     tqdm.write("Running audio normalization analysis...")
                     analysis_data, scan_time = run_loudnorm_analysis(input_file)
@@ -1151,9 +1198,9 @@ def main():
                 if map_original_subs: ffmpeg_cmd.extend(['-map', '0:s?'])
                 ffmpeg_cmd.extend(['-map', '0:d?', '-map', '0:t?'])
                 if external_sub_files:
-                    internal_sub_count = len([s for s in all_streams if s.get('codec_type') == 'subtitle'])
+                    internal_sub_count = len([s for s in all_streams if s.get('codec_type') == 'subtitle']) if map_original_subs else 0
                     for i, sub_file in enumerate(external_sub_files):
-                        ffmpeg_cmd.extend([f'-map', f'{i + 1}'])
+                        ffmpeg_cmd.extend(['-map', f'{i + 1}:s:0?'])
                         output_sub_index = internal_sub_count + i
                         ffmpeg_cmd.extend([f'-metadata:s:s:{output_sub_index}', f'language=eng'])
 
@@ -1173,7 +1220,7 @@ def main():
                 else:
                     tqdm.write("Info: Replacing audio stream 0 with normalized version.")
                     ffmpeg_cmd.extend([f'-c:a:0', 'aac', '-q:a:0', '4', f'-af:a:0', filter_string_for_simple])
-                    for i in range(1, len(audio_streams)): ffmpeg_cmd.extend([f'-c:a:{i}', 'aac', '-q:a:1', '5', f'-af:a:{i}', 'anull'])
+                    for i in range(1, len(audio_streams)): ffmpeg_cmd.extend([f'-c:a:{i}', 'aac', f'-q:a:{i}', '5', f'-af:a:{i}', 'anull'])
                     audio_normalized = True
 
             if not audio_normalized:
@@ -1202,7 +1249,8 @@ def main():
             if args.dry_run:
                 print_ffmpeg_command(ffmpeg_cmd)
             else:
-                success = run_ffmpeg_command(ffmpeg_cmd, input_file, args.delete, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
+                delete_during_processing = args.delete and not args.sync_filename
+                success = run_ffmpeg_command(ffmpeg_cmd, input_file, delete_during_processing, audio_normalized=audio_normalized, total_frames=total_frames, permissions=permissions_to_apply, chapter_file_to_embed=chapter_file_for_this_run, verbose=args.verbose, bar_position=inner_bar_pos, measured_loudness=m_loudness)
                 
                 perform_log_update = False
                 if not success:
@@ -1211,13 +1259,25 @@ def main():
                         try: os.remove(working_output_file)
                         except OSError: pass
                 else:
-                    if args.sync_filename and os.path.exists(working_output_file):
-                        try: 
-                            shutil.move(working_output_file, final_output_file)
-                            tqdm.write(f"Successfully replaced '{os.path.basename(final_output_file)}'.")
-                            perform_log_update = True
-                        except OSError as e: 
-                            tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
+                    if args.sync_filename:
+                        if os.path.exists(working_output_file):
+                            try:
+                                finalize_sync_output(working_output_file, final_output_file)
+                                tqdm.write(f"Successfully replaced '{os.path.basename(final_output_file)}'.")
+                                perform_log_update = True
+                                if args.delete and os.path.abspath(input_file) != os.path.abspath(final_output_file):
+                                    try:
+                                        os.remove(input_file)
+                                        tqdm.write(f"Successfully deleted: {input_file}")
+                                    except OSError as e:
+                                        tqdm.write(f"Error: Output was finalized, but source deletion failed: {e}", file=sys.stderr)
+                                        failed_files.append(input_file)
+                            except Exception as e:
+                                tqdm.write(f"Error: Could not move temp file: {e}", file=sys.stderr)
+                                failed_files.append(input_file)
+                        else:
+                            tqdm.write("Error: Verified temporary output disappeared before final placement.", file=sys.stderr)
+                            failed_files.append(input_file)
                     else:
                         perform_log_update = True
 
@@ -1248,6 +1308,7 @@ def main():
         tqdm.write(f"\n{RED}--- Failed Files ({len(failed_files)}) ---{RESET}")
         for f in failed_files:
             tqdm.write(f"{RED}  - {os.path.basename(f)}{RESET}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

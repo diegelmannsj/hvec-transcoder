@@ -175,11 +175,11 @@ Launch the interactive selector for a directory tree:
 
 `--delete`, `--profile upgrade`, and `--profile normalize` are destructive. The two profiles enable source deletion automatically. Review the selected files and ensure backups exist before using these options.
 
-With the current implementation, synchronization mode writes the output to the temporary directory and may delete the source before moving the temporary output to its final destination. If that final move fails, manual recovery from `--temp-dir` may be necessary.
+Synchronization mode verifies its temporary output and places it at the final destination before deleting a separately named source. If the final placement fails, the source is retained. When the synchronized output path is identical to the source path, `--delete` is required as explicit confirmation that the source may be replaced.
 
 ### Dry-run limitations
 
-`--dry-run` prevents execution of the principal transcode/remux command and prevents source deletion. It is not currently a completely read-only mode: preparation may create output or temporary directories, run FFprobe, update the probe cache, perform loudness analysis, or attempt `.ts` caption extraction.
+`--dry-run` prints the planned transcode/remux command without running FFmpeg, creating output directories, updating caches or logs, extracting captions, or deleting sources. It may run read-only FFprobe inspections to build the command. If normalization is requested without cached loudness data, the preview uses target values in place of a full loudness analysis.
 
 ### Automatic priority adjustment
 
